@@ -37,7 +37,7 @@ Designed to replace the abandoned official driver software with a clean, high-pe
   - **Ultra-Low Memory Footprint**: Uses `SetProcessWorkingSetSize` P/Invoke to aggressively compress working set memory to **~1.8 MB RAM** and **0.00% CPU** when idle.
   - **Instant Hotplug Persistence Across All Ports**: Intercepts native Win32 `WM_DEVICECHANGE` window messages in `< 50ms`. No matter how many times you unplug and replug the mouse, switch between USB 2.0/3.0 ports, or use USB hubs, your custom color and DPI are restored in `~300ms`.
   - **Cold-Boot & Sleep Persistence**: Starts silently on Windows login via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Survives system reboots and Modern Standby / S3 sleep.
-  - **Single-Instance IPC with UIPI Traversal**: Launching the `.exe` again automatically wakes the GUI control center without spawning duplicate background processes. Closing via `[X]` hides back into stealth mode. An explicit **"Exit App"** button is provided in the header if you ever want to stop the driver.
+  - **Single-Instance IPC with UIPI Traversal**: Launching the `.exe` again automatically wakes the GUI control center without spawning duplicate background processes. Simply closing via the Windows Close `[X]` button keeps your settings auto-applying silently in the background (~1.8 MB RAM). An explicit **"Exit App"** button (with confirmation) is provided if you ever want to completely terminate the background driver.
   - **3 Persistence Modes**:
     1. `🚀 Stealth Driver Watcher` (Invisible, No Tray Icon, ~1.8 MB RAM — Recommended)
     2. `📌 Tray Agent Mode` (~2.7 MB RAM, Quick Access System Tray Icon)

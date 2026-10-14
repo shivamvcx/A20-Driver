@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     1. `🚀 Stealth Driver Watcher` (Invisible, No Tray Icon, ~1.8 MB RAM — Recommended)
     2. `📌 Tray Agent Mode` (~2.7 MB RAM, Quick Access System Tray Icon)
     3. `○ Disabled` (RAM Only — reverts to default when mouse is unplugged)
-  - **Explicit Exit Controls**: Added an "Exit App" button in the header banner and an "Exit Driver" context menu item in tray mode.
+  - **Explicit Exit Controls & Safety Guardrails**: Added an "Exit App" button in the header banner and an "Exit Driver (Stop Persistence)" context menu item in tray mode. Features a prominent, high-visibility warning dialog explaining that exiting terminates background persistence, defaults to "No" to prevent accidental clicks, and explicitly recommends using the standard Windows Close [X] button to keep the silent persistence facility running.
 - **🎯 ⚠️ Experimental DPI Stage Switching**:
   - Implemented Command `0x09` (`[0x07, 0x09, 0x40 | Stage, 0x08, 0x3F, 0x00, 0x00, 0x00]`) to configure active DPI levels (Stages 0–5: 600, 1000, 1200, 1600, 2400, 3200 DPI).
   - Protected behind an opt-in checkbox with live RAM-only testing (`[ Test DPI (RAM) ]`).
