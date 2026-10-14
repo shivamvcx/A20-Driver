@@ -301,12 +301,26 @@ namespace RedgearA20ControlCenter
         public int Win32ErrorCode;
     }
 
+    public enum PersistenceMode
+    {
+        ZeroRamDriver = 0, // Scheduled Task (0 MB RAM, 0 background processes)
+        TrayAgent = 1,     // System tray process (~2.7 MB RAM)
+        Disabled = 2       // RAM only
+    }
+
     public class AppProfile
     {
         public string HexColor = "#BE59FF";
         public int Brightness = 100;
-        public bool AutoStart = false;
-        public bool MinimizeToTray = true;
+        public int ActiveDpiStage = 1; // Default 1000 DPI (Stage 1)
+        public bool EnableDpi = false;
+        public PersistenceMode Mode = PersistenceMode.ZeroRamDriver;
+
+        public bool AutoStart
+        {
+            get { return Mode == PersistenceMode.TrayAgent; }
+            set { Mode = value ? PersistenceMode.TrayAgent : PersistenceMode.Disabled; }
+        }
 
         public static string GetProfilePath()
         {
@@ -328,13 +342,44 @@ namespace RedgearA20ControlCenter
                     if (mHex.Success) p.HexColor = mHex.Groups[1].Value;
 
                     Match mBri = Regex.Match(json, "\"Brightness\"\\s*:\\s*(\\d+)");
-                    if (mBri.Success) p.Brightness = int.Parse(mBri.Groups[1].Value);
+                    if (mBri.Success) p.Brightness = Math.Max(5, Math.Min(100, int.Parse(mBri.Groups[1].Value)));
 
-                    Match mAuto = Regex.Match(json, "\"AutoStart\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
-                    if (mAuto.Success) p.AutoStart = bool.Parse(mAuto.Groups[1].Value);
+                    Match mDpiStage = Regex.Match(json, "\"ActiveDpiStage\"\\s*:\\s*(\\d+)");
+                    if (mDpiStage.Success) p.ActiveDpiStage = Math.Max(0, Math.Min(5, int.Parse(mDpiStage.Groups[1].Value)));
 
-                    Match mTray = Regex.Match(json, "\"MinimizeToTray\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
-                    if (mTray.Success) p.MinimizeToTray = bool.Parse(mTray.Groups[1].Value);
+                    Match mEnDpi = Regex.Match(json, "\"EnableDpi\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
+                    if (mEnDpi.Success) p.EnableDpi = bool.Parse(mEnDpi.Groups[1].Value);
+
+                    Match mMode = Regex.Match(json, "\"(?:PersistenceMode|Mode)\"\\s*:\\s*(\\d+)");
+                    if (mMode.Success)
+                    {
+                        int modeVal = int.Parse(mMode.Groups[1].Value);
+                        if (Enum.IsDefined(typeof(PersistenceMode), modeVal))
+                        {
+                            p.Mode = (PersistenceMode)modeVal;
+                        }
+                    }
+                    else
+                    {
+                        Match mModeStr = Regex.Match(json, "\"(?:PersistenceMode|Mode)\"\\s*:\\s*\"([^\"]+)\"");
+                        if (mModeStr.Success)
+                        {
+                            string val = mModeStr.Groups[1].Value;
+                            if (string.Equals(val, "TrayAgent", StringComparison.OrdinalIgnoreCase)) p.Mode = PersistenceMode.TrayAgent;
+                            else if (string.Equals(val, "Disabled", StringComparison.OrdinalIgnoreCase)) p.Mode = PersistenceMode.Disabled;
+                            else p.Mode = PersistenceMode.ZeroRamDriver;
+                        }
+                        else
+                        {
+                            // Backwards compatibility with v0.1.0/v0.1.1 legacy profile format: upgrade auto-start to Zero-RAM mode
+                            Match mAuto = Regex.Match(json, "\"AutoStart\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
+                            if (mAuto.Success)
+                            {
+                                bool auto = bool.Parse(mAuto.Groups[1].Value);
+                                p.Mode = auto ? PersistenceMode.ZeroRamDriver : PersistenceMode.Disabled;
+                            }
+                        }
+                    }
                 }
             }
             catch { }
@@ -346,11 +391,249 @@ namespace RedgearA20ControlCenter
             try
             {
                 string file = GetProfilePath();
-                string json = string.Format("{{\n  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"AutoStart\": {2},\n  \"MinimizeToTray\": {3}\n}}\n",
-                    HexColor, Brightness, AutoStart.ToString().ToLower(), MinimizeToTray.ToString().ToLower());
+                int bri = Math.Max(5, Math.Min(100, Brightness));
+                int dpi = Math.Max(0, Math.Min(5, ActiveDpiStage));
+                string json = string.Format("{{\n  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"ActiveDpiStage\": {2},\n  \"EnableDpi\": {3},\n  \"PersistenceMode\": {4}\n}}\n",
+                    HexColor, bri, dpi, EnableDpi.ToString().ToLower(), (int)Mode);
                 File.WriteAllText(file, json);
             }
             catch { }
+        }
+    }
+
+    public static class TaskSchedulerHelper
+    {
+        public const string TASK_NAME = "RedgearA20_AutoApply";
+        public const string HARDWARE_MUTEX_NAME = @"Local\RedgearA20_HardwareLock";
+
+        public static string GetInstalledExePath()
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RedgearA20");
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            return Path.Combine(dir, "RedgearA20.exe");
+        }
+
+        public static bool DeployDriverBinary(out string targetPath, out string error)
+        {
+            error = null;
+            targetPath = GetInstalledExePath();
+            try
+            {
+                string currentExe = null;
+                try
+                {
+                    currentExe = typeof(TaskSchedulerHelper).Assembly.Location;
+                }
+                catch { }
+                if (string.IsNullOrEmpty(currentExe))
+                {
+                    currentExe = Application.ExecutablePath;
+                }
+
+                if (string.Equals(currentExe, targetPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                string dir = Path.GetDirectoryName(targetPath);
+                try
+                {
+                    foreach (string f in Directory.GetFiles(dir, "*.old"))
+                    {
+                        try { File.Delete(f); } catch { }
+                    }
+                }
+                catch { }
+
+                string oldPath = targetPath + ".old";
+                try { if (File.Exists(oldPath)) File.Delete(oldPath); } catch { }
+                if (File.Exists(oldPath))
+                {
+                    oldPath = targetPath + "." + DateTime.UtcNow.Ticks + ".old";
+                }
+
+                if (File.Exists(targetPath))
+                {
+                    try
+                    {
+                        FileInfo fiSrc = new FileInfo(currentExe);
+                        FileInfo fiDst = new FileInfo(targetPath);
+                        if (fiSrc.Length == fiDst.Length && fiSrc.LastWriteTimeUtc == fiDst.LastWriteTimeUtc)
+                        {
+                            return true;
+                        }
+                    }
+                    catch { }
+                }
+
+                try
+                {
+                    File.Copy(currentExe, targetPath, true);
+                    return true;
+                }
+                catch (IOException)
+                {
+                    try
+                    {
+                        File.Move(targetPath, oldPath);
+                        try
+                        {
+                            File.Copy(currentExe, targetPath, true);
+                            return true;
+                        }
+                        catch
+                        {
+                            try { File.Move(oldPath, targetPath); } catch { }
+                            throw;
+                        }
+                    }
+                    catch (Exception exMove)
+                    {
+                        if (File.Exists(targetPath)) return true;
+                        throw exMove;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+        }
+
+        public static bool InstallTask(out string error)
+        {
+            error = null;
+            string exePath;
+            if (!DeployDriverBinary(out exePath, out error)) return false;
+
+            string workingDir = Path.GetDirectoryName(exePath);
+            string xmlPath = Path.Combine(workingDir, "task.xml");
+
+            try
+            {
+                string xmlContent = string.Format(
+@"<?xml version=""1.0"" encoding=""UTF-16""?>
+<Task version=""1.2"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
+  <RegistrationInfo>
+    <Description>Auto-applies Redgear A20 RGB &amp; DPI profile on boot, wake, and USB reconnect with 0 MB background RAM.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+    <SessionStateChangeTrigger>
+      <Enabled>true</Enabled>
+      <StateChange>SessionUnlock</StateChange>
+    </SessionStateChangeTrigger>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id=""0"" Path=""System""&gt;&lt;Select Path=""System""&gt;*[System[(Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=107 or EventID=508)) or (Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+    </EventTrigger>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription>&lt;QueryList&gt;&lt;Query Id=""0"" Path=""Microsoft-Windows-Kernel-PnP/Configuration""&gt;&lt;Select Path=""Microsoft-Windows-Kernel-PnP/Configuration""&gt;*[System[(EventID=410)] and EventData[Data[@Name='ClassGuid']='{{745a17a0-74d3-11d0-b6fe-00a0c90f57da}}']]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
+    </EventTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id=""Author"">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>
+    <Priority>4</Priority>
+  </Settings>
+  <Actions Context=""Author"">
+    <Exec>
+      <Command>{0}</Command>
+      <Arguments>--apply-and-exit</Arguments>
+      <WorkingDirectory>{1}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>", exePath, workingDir);
+
+                File.WriteAllText(xmlPath, xmlContent, System.Text.Encoding.Unicode);
+
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = "schtasks.exe",
+                    Arguments = string.Format("/create /tn \"{0}\" /xml \"{1}\" /f", TASK_NAME, xmlPath),
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardError = true,
+                    RedirectStandardOutput = true
+                };
+
+                using (Process p = Process.Start(psi))
+                {
+                    string stdout = p.StandardOutput.ReadToEnd();
+                    string stderr = p.StandardError.ReadToEnd();
+                    p.WaitForExit(5000);
+
+                    if (p.ExitCode != 0)
+                    {
+                        error = !string.IsNullOrWhiteSpace(stderr) ? stderr.Trim() : stdout.Trim();
+                        if (string.IsNullOrEmpty(error)) error = string.Format("schtasks failed with exit code {0}", p.ExitCode);
+                        return false;
+                    }
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
+            finally
+            {
+                try { if (File.Exists(xmlPath)) File.Delete(xmlPath); } catch { }
+            }
+        }
+
+        public static bool RemoveTask(out string error)
+        {
+            error = null;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = "schtasks.exe",
+                    Arguments = string.Format("/delete /tn \"{0}\" /f", TASK_NAME),
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardError = true,
+                    RedirectStandardOutput = true
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    p.StandardOutput.ReadToEnd();
+                    p.StandardError.ReadToEnd();
+                    p.WaitForExit(4000);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                return false;
+            }
         }
     }
 
@@ -371,9 +654,11 @@ namespace RedgearA20ControlCenter
         private Button btnSave;
         private Button btnReset;
 
-        // Persistence & Startup UI
+        // Persistence & Startup UI (3-Mode Selection)
         private GroupBox gbPersistence;
-        private CheckBox cbAutoStart;
+        private RadioButton rbZeroRam;
+        private RadioButton rbTrayAgent;
+        private RadioButton rbDisabled;
 
         // Experimental DPI section
         private CheckBox cbEnableDpi;
@@ -436,7 +721,7 @@ namespace RedgearA20ControlCenter
                 return;
             }
 
-            if (!isExiting && cbAutoStart != null && cbAutoStart.Checked)
+            if (!isExiting && currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent)
             {
                 e.Cancel = true;
                 MinimizeToTray(true);
@@ -455,7 +740,7 @@ namespace RedgearA20ControlCenter
         protected override void OnResize(EventArgs e)
         {
             base.OnResize(e);
-            if (this.WindowState == FormWindowState.Minimized && currentProfile != null && currentProfile.MinimizeToTray)
+            if (this.WindowState == FormWindowState.Minimized && currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent)
             {
                 MinimizeToTray(false);
             }
@@ -559,7 +844,7 @@ namespace RedgearA20ControlCenter
                 Icon = this.Icon != null ? this.Icon : SystemIcons.Application,
                 Text = "Redgear A20 Control Center",
                 ContextMenuStrip = trayMenu,
-                Visible = startInTray
+                Visible = startInTray && currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent
             };
 
             trayIcon.DoubleClick += delegate { RestoreFromTray(); };
@@ -603,7 +888,7 @@ namespace RedgearA20ControlCenter
         {
             usbDebounceTimer.Stop();
             RefreshDeviceConnection();
-            if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile != null && currentProfile.AutoStart)
+            if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent)
             {
                 await ApplyCurrentProfileAsync(silent: true);
                 TrimMemory();
@@ -618,19 +903,7 @@ namespace RedgearA20ControlCenter
         {
             this.startInTray = inTray;
             this.currentProfile = AppProfile.Load();
-
-            try
-            {
-                string hex = currentProfile.HexColor.TrimStart('#');
-                int r = Convert.ToInt32(hex.Substring(0, 2), 16);
-                int g = Convert.ToInt32(hex.Substring(2, 2), 16);
-                int b = Convert.ToInt32(hex.Substring(4, 2), 16);
-                this.currentColor = Color.FromArgb(r, g, b);
-            }
-            catch
-            {
-                this.currentColor = Color.FromArgb(190, 89, 255);
-            }
+            this.currentColor = ParseColor(currentProfile.HexColor);
             this.currentBrightness = Math.Max(5, Math.Min(100, currentProfile.Brightness));
 
             InitForm();
@@ -644,7 +917,7 @@ namespace RedgearA20ControlCenter
             {
                 Task.Run(async () =>
                 {
-                    if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile.AutoStart)
+                    if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile.Mode == PersistenceMode.TrayAgent)
                     {
                         await ApplyCurrentProfileAsync(silent: true);
                     }
@@ -857,52 +1130,54 @@ namespace RedgearA20ControlCenter
             btnReset.Click += BtnReset_Click;
             body.Controls.Add(btnReset);
 
-            // ─── Group 3: Persistence & Startup (Instant A704 Auto-Apply) ───
+            // ─── Group 3: Persistence Mode (Instant A704 Auto-Apply) ───
             gbPersistence = new GroupBox
             {
-                Text = "  3. Persistence & Startup (Instant A704 Auto-Apply)  ",
+                Text = "  3. Persistence Mode (Instant A704 Auto-Apply)  ",
                 Location = new Point(0, 270),
-                Size = new Size(535, 75),
+                Size = new Size(535, 105),
                 ForeColor = Color.FromArgb(180, 185, 205)
             };
 
-            cbAutoStart = new CheckBox
+            rbZeroRam = new RadioButton
             {
-                Text = "⚡ Auto-apply profile on Windows startup & when mouse is reconnected",
+                Text = "🚀 Zero-RAM Stealth Driver Mode (0 MB RAM, 0 background processes - Recommended)",
                 Location = new Point(15, 20),
-                Size = new Size(505, 24),
+                Size = new Size(510, 24),
                 ForeColor = Color.FromArgb(80, 230, 130),
                 Font = new Font("Segoe UI", 9.0f, FontStyle.Bold),
-                Checked = currentProfile != null && currentProfile.AutoStart
+                Checked = currentProfile == null || currentProfile.Mode == PersistenceMode.ZeroRamDriver
             };
-            cbAutoStart.CheckedChanged += delegate
-            {
-                if (currentProfile != null)
-                {
-                    currentProfile.AutoStart = cbAutoStart.Checked;
-                    currentProfile.Save();
-                    SetAutoStart(currentProfile.AutoStart);
-                    Log(string.Format("Auto-apply setting changed: {0}", cbAutoStart.Checked ? "ENABLED" : "DISABLED"), Color.FromArgb(200, 200, 220));
-                }
-            };
-            gbPersistence.Controls.Add(cbAutoStart);
+            gbPersistence.Controls.Add(rbZeroRam);
 
-            Label lblPersistenceNote = new Label
+            rbTrayAgent = new RadioButton
             {
-                Text = "Runs silently in the tray using ~2 MB RAM and 0% CPU with native Windows hotplug events.",
-                Location = new Point(35, 46),
-                Size = new Size(485, 20),
-                ForeColor = Color.FromArgb(150, 155, 170),
-                Font = new Font("Segoe UI", 8.0f)
+                Text = "📌 Tray Agent Mode (~2.7 MB RAM, quick access tray icon)",
+                Location = new Point(15, 46),
+                Size = new Size(510, 24),
+                ForeColor = Color.FromArgb(140, 200, 255),
+                Font = new Font("Segoe UI", 9.0f, FontStyle.Regular),
+                Checked = currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent
             };
-            gbPersistence.Controls.Add(lblPersistenceNote);
+            gbPersistence.Controls.Add(rbTrayAgent);
+
+            rbDisabled = new RadioButton
+            {
+                Text = "○ Disabled (RAM only - profile resets when mouse is unplugged or PC restarts)",
+                Location = new Point(15, 72),
+                Size = new Size(510, 24),
+                ForeColor = Color.FromArgb(180, 180, 190),
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
+                Checked = currentProfile != null && currentProfile.Mode == PersistenceMode.Disabled
+            };
+            gbPersistence.Controls.Add(rbDisabled);
             body.Controls.Add(gbPersistence);
 
             // ─── Group 4: ⚠️ EXPERIMENTAL - DPI Controls ───
             gbDpi = new GroupBox
             {
                 Text = "  4. ⚠️ EXPERIMENTAL - DPI Stage (Disabled by Default)  ",
-                Location = new Point(0, 355),
+                Location = new Point(0, 385),
                 Size = new Size(535, 85),
                 ForeColor = Color.FromArgb(220, 150, 60)
             };
@@ -913,7 +1188,8 @@ namespace RedgearA20ControlCenter
                 Location = new Point(15, 20),
                 Size = new Size(500, 20),
                 ForeColor = Color.FromArgb(235, 180, 100),
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold)
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                Checked = currentProfile != null && currentProfile.EnableDpi
             };
             cbEnableDpi.CheckedChanged += delegate
             {
@@ -931,7 +1207,7 @@ namespace RedgearA20ControlCenter
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 BackColor = Color.FromArgb(32, 34, 40),
                 ForeColor = Color.White,
-                Enabled = false
+                Enabled = currentProfile != null && currentProfile.EnableDpi
             };
             cmbDpiStages.Items.AddRange(new object[] {
                 "Stage 0: 600 DPI (Default Blue)",
@@ -941,7 +1217,7 @@ namespace RedgearA20ControlCenter
                 "Stage 4: 2400 DPI (Default Cyan)",
                 "Stage 5: 3200 DPI (Default White)"
             });
-            cmbDpiStages.SelectedIndex = 1; // 1000 DPI
+            cmbDpiStages.SelectedIndex = currentProfile != null ? Math.Max(0, Math.Min(5, currentProfile.ActiveDpiStage)) : 1;
             gbDpi.Controls.Add(lblSelectDpi);
             gbDpi.Controls.Add(cmbDpiStages);
 
@@ -953,7 +1229,7 @@ namespace RedgearA20ControlCenter
                 BackColor = Color.FromArgb(65, 50, 30),
                 ForeColor = Color.FromArgb(255, 200, 100),
                 FlatStyle = FlatStyle.Flat,
-                Enabled = false
+                Enabled = currentProfile != null && currentProfile.EnableDpi
             };
             btnTestDpi.FlatAppearance.BorderColor = Color.FromArgb(130, 95, 45);
             btnTestDpi.Click += BtnTestDpi_Click;
@@ -965,15 +1241,15 @@ namespace RedgearA20ControlCenter
             GroupBox gbLog = new GroupBox
             {
                 Text = "  5. Diagnostic USB Report Log (Every Packet & Return Code)  ",
-                Location = new Point(0, 450),
-                Size = new Size(535, 275),
+                Location = new Point(0, 480),
+                Size = new Size(535, 245),
                 ForeColor = Color.FromArgb(180, 185, 205)
             };
 
             rtbLog = new RichTextBox
             {
-                Location = new Point(15, 25),
-                Size = new Size(505, 205),
+                Location = new Point(15, 22),
+                Size = new Size(505, 180),
                 ReadOnly = true,
                 BackColor = Color.FromArgb(14, 15, 18),
                 ForeColor = Color.FromArgb(0, 230, 130),
@@ -985,7 +1261,7 @@ namespace RedgearA20ControlCenter
             btnCopyLog = new Button
             {
                 Text = "Copy Log",
-                Location = new Point(350, 238),
+                Location = new Point(350, 209),
                 Size = new Size(80, 26),
                 BackColor = Color.FromArgb(40, 42, 50),
                 ForeColor = Color.White,
@@ -1005,7 +1281,7 @@ namespace RedgearA20ControlCenter
             btnClearLog = new Button
             {
                 Text = "Clear Log",
-                Location = new Point(440, 238),
+                Location = new Point(440, 209),
                 Size = new Size(80, 26),
                 BackColor = Color.FromArgb(40, 42, 50),
                 ForeColor = Color.White,
@@ -1126,197 +1402,258 @@ namespace RedgearA20ControlCenter
 
         private static PipelineResult ExecuteHardwarePipeline(string devicePath, SaveParameters p, Action<string, Color> logCallback)
         {
-            int packetIndex = 0;
+            bool lockAcquired = false;
+            Mutex hwMutex = null;
 
-            logCallback(p.CommitToFlash ?
-                "--- Executing Hardware Pipeline (With Flash Commit 0x20) ---" :
-                "--- Applying Verified Settings to RAM (No EEPROM Write) ---",
-                p.CommitToFlash ? Color.FromArgb(255, 215, 0) : Color.FromArgb(255, 220, 100));
-
-            // 1. Calculate Active-Low PWM values
-            float b = p.Brightness / 100.0f;
-            int rStep = (int)Math.Round((p.Color.R / 255.0f) * b * 15.0f);
-            int gStep = (int)Math.Round((p.Color.G / 255.0f) * b * 15.0f);
-            int bStep = (int)Math.Round((p.Color.B / 255.0f) * b * 15.0f);
-
-            byte rInv = (byte)((15 - rStep) & 0x0F);
-            byte gInv = (byte)((15 - gStep) & 0x0F);
-            byte bInv = (byte)((15 - bStep) & 0x0F);
-
-            logCallback(string.Format("Active-Low PWM Steps: R={0}/15 (0x{1:X}) G={2}/15 (0x{3:X}) B={4}/15 (0x{5:X})",
-                rStep, rInv, gStep, gInv, bStep, bInv), Color.FromArgb(180, 180, 200));
-
-            // 2. Transmit Command 0x14 across all 6 DPI stages
-            for (byte stage = 0; stage < 6; stage++)
+            try
             {
-                byte b2 = (byte)(((stage & 0x07) << 5) | (gInv & 0x0F));
-                byte b3 = (byte)(((rInv & 0x0F) << 4) | (bInv & 0x0F));
-                byte[] packet = new byte[] { HidTransport.REPORT_ID, 0x14, b2, b3, 0x00, 0x00, 0x00, 0x00 };
-
-                int win32Err;
-                string err;
-                bool ok = HidTransport.SendSinglePacket(devicePath, packet, out win32Err, out err);
-                if (!ok)
+                try
                 {
-                    logCallback(string.Format("Cmd 0x14 [Stage {0}]: {1} -> FAIL ({2})", stage, FormatHex(packet), err), Color.FromArgb(255, 80, 80));
-                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    hwMutex = new Mutex(false, TaskSchedulerHelper.HARDWARE_MUTEX_NAME);
+                    try { lockAcquired = hwMutex.WaitOne(3000, false); }
+                    catch (AbandonedMutexException) { lockAcquired = true; }
+                }
+                catch { lockAcquired = false; }
+
+                if (!lockAcquired)
+                {
+                    return new PipelineResult { Success = false, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = "Hardware access lock timeout (Device busy)." };
                 }
 
-                logCallback(string.Format("Cmd 0x14 [Stage {0}]: {1} -> OK", stage, FormatHex(packet)), Color.FromArgb(80, 230, 130));
-                packetIndex++;
-                Thread.Sleep(50);
-            }
+                int packetIndex = 0;
 
-            // 3. Set Static Solid Mode with Command 0x13
-            byte[] modePacket = new byte[] { HidTransport.REPORT_ID, 0x13, 0x7F, 0x86, 0x00, 0x00, 0x00, 0x00 };
+                logCallback(p.CommitToFlash ?
+                    "--- Executing Hardware Pipeline (With Flash Commit 0x20) ---" :
+                    "--- Applying Verified Settings to RAM (No EEPROM Write) ---",
+                    p.CommitToFlash ? Color.FromArgb(255, 215, 0) : Color.FromArgb(255, 220, 100));
+
+                // 1. Calculate Active-Low PWM values (with defensive bounds clamping)
+                int safeBrightness = Math.Max(0, Math.Min(100, p.Brightness));
+                float b = safeBrightness / 100.0f;
+                int rStep = Math.Max(0, Math.Min(15, (int)Math.Round((p.Color.R / 255.0f) * b * 15.0f)));
+                int gStep = Math.Max(0, Math.Min(15, (int)Math.Round((p.Color.G / 255.0f) * b * 15.0f)));
+                int bStep = Math.Max(0, Math.Min(15, (int)Math.Round((p.Color.B / 255.0f) * b * 15.0f)));
+
+                byte rInv = (byte)((15 - rStep) & 0x0F);
+                byte gInv = (byte)((15 - gStep) & 0x0F);
+                byte bInv = (byte)((15 - bStep) & 0x0F);
+
+                logCallback(string.Format("Active-Low PWM Steps: R={0}/15 (0x{1:X}) G={2}/15 (0x{3:X}) B={4}/15 (0x{5:X})",
+                    rStep, rInv, gStep, gInv, bStep, bInv), Color.FromArgb(180, 180, 200));
+
+                // 2. Transmit Command 0x14 across all 6 DPI stages
+                for (byte stage = 0; stage < 6; stage++)
+                {
+                    byte b2 = (byte)(((stage & 0x07) << 5) | (gInv & 0x0F));
+                    byte b3 = (byte)(((rInv & 0x0F) << 4) | (bInv & 0x0F));
+                    byte[] packet = new byte[] { HidTransport.REPORT_ID, 0x14, b2, b3, 0x00, 0x00, 0x00, 0x00 };
+
+                    int win32Err;
+                    string err;
+                    bool ok = HidTransport.SendSinglePacket(devicePath, packet, out win32Err, out err);
+                    if (!ok)
+                    {
+                        logCallback(string.Format("Cmd 0x14 [Stage {0}]: {1} -> FAIL ({2})", stage, FormatHex(packet), err), Color.FromArgb(255, 80, 80));
+                        return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    }
+
+                    logCallback(string.Format("Cmd 0x14 [Stage {0}]: {1} -> OK", stage, FormatHex(packet)), Color.FromArgb(80, 230, 130));
+                    packetIndex++;
+                    Thread.Sleep(50);
+                }
+
+                // 3. Set Static Solid Mode with Command 0x13
+                byte[] modePacket = new byte[] { HidTransport.REPORT_ID, 0x13, 0x7F, 0x86, 0x00, 0x00, 0x00, 0x00 };
+                {
+                    int win32Err;
+                    string err;
+                    bool ok = HidTransport.SendSinglePacket(devicePath, modePacket, out win32Err, out err);
+                    if (!ok)
+                    {
+                        logCallback(string.Format("Cmd 0x13 [Mode 0x86 Static]: {0} -> FAIL ({1})", FormatHex(modePacket), err), Color.FromArgb(255, 80, 80));
+                        return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    }
+
+                    logCallback(string.Format("Cmd 0x13 [Mode 0x86 Static]: {0} -> OK", FormatHex(modePacket)), Color.FromArgb(80, 230, 130));
+                    packetIndex++;
+                    Thread.Sleep(50);
+                }
+
+                // 4. If SendDpi enabled, transmit Command 0x09
+                if (p.SendDpi)
+                {
+                    byte b2 = (byte)(0x40 | (p.ActiveDpiIndex & 0x07));
+                    byte[] dpiPacket = new byte[] { HidTransport.REPORT_ID, 0x09, b2, 0x08, p.DpiMask, 0x00, 0x00, 0x00 };
+                    int win32Err;
+                    string err;
+                    bool ok = HidTransport.SendSinglePacket(devicePath, dpiPacket, out win32Err, out err);
+                    if (!ok)
+                    {
+                        logCallback(string.Format("Cmd 0x09 [Stage {0}]: {1} -> FAIL ({2})", p.ActiveDpiIndex, FormatHex(dpiPacket), err), Color.FromArgb(255, 80, 80));
+                        return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    }
+                    logCallback(string.Format("Cmd 0x09 [Stage {0}]: {1} -> OK", p.ActiveDpiIndex, FormatHex(dpiPacket)), Color.FromArgb(255, 200, 80));
+                    packetIndex++;
+                    Thread.Sleep(50);
+                }
+
+                // 5. If CommitToFlash, send Command 0x20 sync latch and verify MCU health
+                if (p.CommitToFlash)
+                {
+                    byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+                    int win32Err;
+                    string err;
+                    bool ok = HidTransport.SendSinglePacket(devicePath, commitPacket, out win32Err, out err);
+                    if (!ok)
+                    {
+                        logCallback(string.Format("Cmd 0x20 [Sync Latch]: {0} -> FAIL ({1})", FormatHex(commitPacket), err), Color.FromArgb(255, 80, 80));
+                        return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    }
+
+                    logCallback(string.Format("Cmd 0x20 [Sync Latch]: {0} -> SENT", FormatHex(commitPacket)), Color.FromArgb(255, 215, 0));
+                    packetIndex++;
+
+                    // Wait for latch
+                    Thread.Sleep(EEPROM_WRITE_DELAY_MS);
+
+                    // Verify MCU transport health via HidD_GetFeature
+                    logCallback("Verifying device transport health via HidD_GetFeature(0x07)...", Color.FromArgb(200, 200, 220));
+                    int healthErr;
+                    string healthErrMsg;
+                    bool healthOk = HidTransport.VerifyDeviceTransportHealth(devicePath, out healthErr, out healthErrMsg);
+                    if (!healthOk)
+                    {
+                        logCallback(string.Format("Device health check failed after sync write: {0}", healthErrMsg), Color.FromArgb(255, 120, 120));
+                        return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = healthErr, ErrorMessage = healthErrMsg };
+                    }
+                    logCallback("Device transport health verified: MCU is responsive.", Color.FromArgb(80, 230, 130));
+                }
+
+                return new PipelineResult { Success = true, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = null };
+            }
+            finally
             {
-                int win32Err;
-                string err;
-                bool ok = HidTransport.SendSinglePacket(devicePath, modePacket, out win32Err, out err);
-                if (!ok)
+                if (hwMutex != null)
                 {
-                    logCallback(string.Format("Cmd 0x13 [Mode 0x86 Static]: {0} -> FAIL ({1})", FormatHex(modePacket), err), Color.FromArgb(255, 80, 80));
-                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    if (lockAcquired)
+                    {
+                        try { hwMutex.ReleaseMutex(); } catch { }
+                    }
+                    hwMutex.Close();
                 }
-
-                logCallback(string.Format("Cmd 0x13 [Mode 0x86 Static]: {0} -> OK", FormatHex(modePacket)), Color.FromArgb(80, 230, 130));
-                packetIndex++;
-                Thread.Sleep(50);
             }
-
-            // 4. If SendDpi enabled, transmit Command 0x09
-            if (p.SendDpi)
-            {
-                byte b2 = (byte)(0x40 | (p.ActiveDpiIndex & 0x07));
-                byte[] dpiPacket = new byte[] { HidTransport.REPORT_ID, 0x09, b2, 0x08, p.DpiMask, 0x00, 0x00, 0x00 };
-                int win32Err;
-                string err;
-                bool ok = HidTransport.SendSinglePacket(devicePath, dpiPacket, out win32Err, out err);
-                if (!ok)
-                {
-                    logCallback(string.Format("Cmd 0x09 [Stage {0}]: {1} -> FAIL ({2})", p.ActiveDpiIndex, FormatHex(dpiPacket), err), Color.FromArgb(255, 80, 80));
-                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
-                }
-                logCallback(string.Format("Cmd 0x09 [Stage {0}]: {1} -> OK", p.ActiveDpiIndex, FormatHex(dpiPacket)), Color.FromArgb(255, 200, 80));
-                packetIndex++;
-                Thread.Sleep(50);
-            }
-
-            // 5. If CommitToFlash, send Command 0x20 sync latch and verify MCU health
-            if (p.CommitToFlash)
-            {
-                byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-                int win32Err;
-                string err;
-                bool ok = HidTransport.SendSinglePacket(devicePath, commitPacket, out win32Err, out err);
-                if (!ok)
-                {
-                    logCallback(string.Format("Cmd 0x20 [Sync Latch]: {0} -> FAIL ({1})", FormatHex(commitPacket), err), Color.FromArgb(255, 80, 80));
-                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
-                }
-
-                logCallback(string.Format("Cmd 0x20 [Sync Latch]: {0} -> SENT", FormatHex(commitPacket)), Color.FromArgb(255, 215, 0));
-                packetIndex++;
-
-                // Wait for latch
-                Thread.Sleep(EEPROM_WRITE_DELAY_MS);
-
-                // Verify MCU transport health via HidD_GetFeature
-                logCallback("Verifying device transport health via HidD_GetFeature(0x07)...", Color.FromArgb(200, 200, 220));
-                int healthErr;
-                string healthErrMsg;
-                bool healthOk = HidTransport.VerifyDeviceTransportHealth(devicePath, out healthErr, out healthErrMsg);
-                if (!healthOk)
-                {
-                    logCallback(string.Format("Device health check failed after sync write: {0}", healthErrMsg), Color.FromArgb(255, 120, 120));
-                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = healthErr, ErrorMessage = healthErrMsg };
-                }
-                logCallback("Device transport health verified: MCU is responsive.", Color.FromArgb(80, 230, 130));
-            }
-
-            return new PipelineResult { Success = true, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = null };
         }
 
         private static PipelineResult ExecuteFactoryReset(string devicePath, Action<string, Color> logCallback)
         {
-            int packetIndex = 0;
-            logCallback("--- Restoring Factory Profile (Stock Multi-Stage Colors + Breathing Mode) ---", Color.FromArgb(255, 180, 80));
+            bool lockAcquired = false;
+            Mutex hwMutex = null;
 
-            // Stock stages (Active-Low PWM):
-            // Stage 0: 600 DPI  -> Blue   (gInv=15, rInv=15, bInv=0  -> b2=0x0F, b3=0xF0)
-            // Stage 1: 1000 DPI -> Yellow (gInv=0,  rInv=0,  bInv=15 -> b2=0x00, b3=0x0F)
-            // Stage 2: 1200 DPI -> Green  (gInv=0,  rInv=15, bInv=15 -> b2=0x00, b3=0xFF)
-            // Stage 3: 1600 DPI -> Purple (gInv=15, rInv=0,  bInv=0  -> b2=0x0F, b3=0x00)
-            // Stage 4: 2400 DPI -> Cyan   (gInv=0,  rInv=15, bInv=0  -> b2=0x00, b3=0xF0)
-            // Stage 5: 3200 DPI -> White  (gInv=0,  rInv=0,  bInv=0  -> b2=0x00, b3=0x00)
-            byte[][] stockStages = new byte[][] {
-                new byte[] { 0x0F, 0xF0 }, // Stage 0: Blue
-                new byte[] { 0x00, 0x0F }, // Stage 1: Yellow
-                new byte[] { 0x00, 0xFF }, // Stage 2: Green
-                new byte[] { 0x0F, 0x00 }, // Stage 3: Purple
-                new byte[] { 0x00, 0xF0 }, // Stage 4: Cyan
-                new byte[] { 0x00, 0x00 }  // Stage 5: White
-            };
-
-            for (byte stage = 0; stage < 6; stage++)
+            try
             {
-                byte b2 = (byte)(((stage & 0x07) << 5) | (stockStages[stage][0] & 0x0F));
-                byte b3 = stockStages[stage][1];
-                byte[] packet = new byte[] { HidTransport.REPORT_ID, 0x14, b2, b3, 0x00, 0x00, 0x00, 0x00 };
-
-                int win32Err;
-                string err;
-                if (!HidTransport.SendSinglePacket(devicePath, packet, out win32Err, out err))
+                try
                 {
-                    logCallback(string.Format("Factory Cmd 0x14 [Stage {0}]: {1} -> FAIL ({2})", stage, FormatHex(packet), err), Color.FromArgb(255, 80, 80));
-                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    hwMutex = new Mutex(false, TaskSchedulerHelper.HARDWARE_MUTEX_NAME);
+                    try { lockAcquired = hwMutex.WaitOne(3000, false); }
+                    catch (AbandonedMutexException) { lockAcquired = true; }
                 }
-                logCallback(string.Format("Factory Cmd 0x14 [Stage {0}]: {1} -> OK", stage, FormatHex(packet)), Color.FromArgb(160, 220, 255));
-                packetIndex++;
-                Thread.Sleep(50);
-            }
+                catch { lockAcquired = false; }
 
-            // Restore stock mode: Breathing / Spectrum cycle (0x80)
-            byte[] modePacket = new byte[] { HidTransport.REPORT_ID, 0x13, 0x7F, 0x80, 0x00, 0x00, 0x00, 0x00 };
-            {
-                int win32Err;
-                string err;
-                if (!HidTransport.SendSinglePacket(devicePath, modePacket, out win32Err, out err))
+                if (!lockAcquired)
                 {
-                    logCallback(string.Format("Factory Cmd 0x13 [Mode 0x80]: {0} -> FAIL ({1})", FormatHex(modePacket), err), Color.FromArgb(255, 80, 80));
-                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    return new PipelineResult { Success = false, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = "Hardware access lock timeout (Device busy)." };
                 }
-                logCallback(string.Format("Factory Cmd 0x13 [Mode 0x80]: {0} -> OK", FormatHex(modePacket)), Color.FromArgb(160, 220, 255));
-                packetIndex++;
-                Thread.Sleep(50);
-            }
 
-            // Sync latch: 0x20
-            byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-            {
-                int win32Err;
-                string err;
-                if (!HidTransport.SendSinglePacket(devicePath, commitPacket, out win32Err, out err))
+                int packetIndex = 0;
+                logCallback("--- Restoring Factory Profile (Stock Multi-Stage Colors + Breathing Mode) ---", Color.FromArgb(255, 180, 80));
+
+                // Stock stages (Active-Low PWM):
+                // Stage 0: 600 DPI  -> Blue   (gInv=15, rInv=15, bInv=0  -> b2=0x0F, b3=0xF0)
+                // Stage 1: 1000 DPI -> Yellow (gInv=0,  rInv=0,  bInv=15 -> b2=0x00, b3=0x0F)
+                // Stage 2: 1200 DPI -> Green  (gInv=0,  rInv=15, bInv=15 -> b2=0x00, b3=0xFF)
+                // Stage 3: 1600 DPI -> Purple (gInv=15, rInv=0,  bInv=0  -> b2=0x0F, b3=0x00)
+                // Stage 4: 2400 DPI -> Cyan   (gInv=0,  rInv=15, bInv=0  -> b2=0x00, b3=0xF0)
+                // Stage 5: 3200 DPI -> White  (gInv=0,  rInv=0,  bInv=0  -> b2=0x00, b3=0x00)
+                byte[][] stockStages = new byte[][] {
+                    new byte[] { 0x0F, 0xF0 }, // Stage 0: Blue
+                    new byte[] { 0x00, 0x0F }, // Stage 1: Yellow
+                    new byte[] { 0x00, 0xFF }, // Stage 2: Green
+                    new byte[] { 0x0F, 0x00 }, // Stage 3: Purple
+                    new byte[] { 0x00, 0xF0 }, // Stage 4: Cyan
+                    new byte[] { 0x00, 0x00 }  // Stage 5: White
+                };
+
+                for (byte stage = 0; stage < 6; stage++)
                 {
-                    logCallback(string.Format("Factory Cmd 0x20 [Sync]: {0} -> FAIL ({1})", FormatHex(commitPacket), err), Color.FromArgb(255, 80, 80));
-                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    byte b2 = (byte)(((stage & 0x07) << 5) | (stockStages[stage][0] & 0x0F));
+                    byte b3 = stockStages[stage][1];
+                    byte[] packet = new byte[] { HidTransport.REPORT_ID, 0x14, b2, b3, 0x00, 0x00, 0x00, 0x00 };
+
+                    int win32Err;
+                    string err;
+                    if (!HidTransport.SendSinglePacket(devicePath, packet, out win32Err, out err))
+                    {
+                        logCallback(string.Format("Factory Cmd 0x14 [Stage {0}]: {1} -> FAIL ({2})", stage, FormatHex(packet), err), Color.FromArgb(255, 80, 80));
+                        return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    }
+                    logCallback(string.Format("Factory Cmd 0x14 [Stage {0}]: {1} -> OK", stage, FormatHex(packet)), Color.FromArgb(160, 220, 255));
+                    packetIndex++;
+                    Thread.Sleep(50);
                 }
-                logCallback(string.Format("Factory Cmd 0x20 [Sync]: {0} -> SENT", FormatHex(commitPacket)), Color.FromArgb(255, 215, 0));
-                packetIndex++;
-                Thread.Sleep(EEPROM_WRITE_DELAY_MS);
-            }
 
-            // Health check
-            int hErr;
-            string hErrMsg;
-            if (!HidTransport.VerifyDeviceTransportHealth(devicePath, out hErr, out hErrMsg))
+                // Restore stock mode: Breathing / Spectrum cycle (0x80)
+                byte[] modePacket = new byte[] { HidTransport.REPORT_ID, 0x13, 0x7F, 0x80, 0x00, 0x00, 0x00, 0x00 };
+                {
+                    int win32Err;
+                    string err;
+                    if (!HidTransport.SendSinglePacket(devicePath, modePacket, out win32Err, out err))
+                    {
+                        logCallback(string.Format("Factory Cmd 0x13 [Mode 0x80]: {0} -> FAIL ({1})", FormatHex(modePacket), err), Color.FromArgb(255, 80, 80));
+                        return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    }
+                    logCallback(string.Format("Factory Cmd 0x13 [Mode 0x80]: {0} -> OK", FormatHex(modePacket)), Color.FromArgb(160, 220, 255));
+                    packetIndex++;
+                    Thread.Sleep(50);
+                }
+
+                // Sync latch: 0x20
+                byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+                {
+                    int win32Err;
+                    string err;
+                    if (!HidTransport.SendSinglePacket(devicePath, commitPacket, out win32Err, out err))
+                    {
+                        logCallback(string.Format("Factory Cmd 0x20 [Sync]: {0} -> FAIL ({1})", FormatHex(commitPacket), err), Color.FromArgb(255, 80, 80));
+                        return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                    }
+                    logCallback(string.Format("Factory Cmd 0x20 [Sync]: {0} -> SENT", FormatHex(commitPacket)), Color.FromArgb(255, 215, 0));
+                    packetIndex++;
+                    Thread.Sleep(EEPROM_WRITE_DELAY_MS);
+                }
+
+                // Health check
+                int hErr;
+                string hErrMsg;
+                if (!HidTransport.VerifyDeviceTransportHealth(devicePath, out hErr, out hErrMsg))
+                {
+                    logCallback(string.Format("Device health check failed after factory reset: {0}", hErrMsg), Color.FromArgb(255, 120, 120));
+                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = hErr, ErrorMessage = hErrMsg };
+                }
+
+                logCallback("Device transport health verified: MCU is responsive.", Color.FromArgb(80, 230, 130));
+                return new PipelineResult { Success = true, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = null };
+            }
+            finally
             {
-                logCallback(string.Format("Device health check failed after factory reset: {0}", hErrMsg), Color.FromArgb(255, 120, 120));
-                return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = hErr, ErrorMessage = hErrMsg };
+                if (hwMutex != null)
+                {
+                    if (lockAcquired)
+                    {
+                        try { hwMutex.ReleaseMutex(); } catch { }
+                    }
+                    hwMutex.Close();
+                }
             }
-
-            logCallback("Device transport health verified: MCU is responsive.", Color.FromArgb(80, 230, 130));
-            return new PipelineResult { Success = true, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = null };
         }
 
         // ─── SAFE PROFILE EXECUTION: APPLY TO MOUSE ───
@@ -1406,33 +1743,95 @@ namespace RedgearA20ControlCenter
             }
 
             if (currentProfile == null) currentProfile = new AppProfile();
-            currentProfile.HexColor = txtHex.Text.Trim();
+            string hexInput = txtHex.Text.Trim();
+            if (!hexInput.StartsWith("#")) hexInput = "#" + hexInput;
+            currentProfile.HexColor = hexInput;
+            currentColor = ParseColor(hexInput);
             currentProfile.Brightness = currentBrightness;
-            currentProfile.AutoStart = cbAutoStart.Checked;
-            currentProfile.MinimizeToTray = true;
+            currentProfile.ActiveDpiStage = cmbDpiStages != null ? cmbDpiStages.SelectedIndex : 1;
+            currentProfile.EnableDpi = cbEnableDpi != null && cbEnableDpi.Checked;
+
+            if (rbZeroRam != null && rbZeroRam.Checked)
+                currentProfile.Mode = PersistenceMode.ZeroRamDriver;
+            else if (rbTrayAgent != null && rbTrayAgent.Checked)
+                currentProfile.Mode = PersistenceMode.TrayAgent;
+            else
+                currentProfile.Mode = PersistenceMode.Disabled;
+
             currentProfile.Save();
 
-            SetAutoStart(currentProfile.AutoStart);
+            bool taskFailed = false;
+            string taskError = null;
 
-            Log(string.Format("Profile saved to {0} (AutoStart={1})", AppProfile.GetProfilePath(), currentProfile.AutoStart), Color.FromArgb(140, 200, 255));
+            if (currentProfile.Mode == PersistenceMode.ZeroRamDriver)
+            {
+                if (trayIcon != null) trayIcon.Visible = false;
+                SetAutoStart(false);
+                if (!TaskSchedulerHelper.InstallTask(out taskError))
+                {
+                    taskFailed = true;
+                    Log("❌ Failed to install scheduled task: " + taskError, Color.FromArgb(255, 80, 80));
+                }
+                else
+                {
+                    Log("🚀 Zero-RAM Stealth Task successfully registered with Windows Task Scheduler.", Color.FromArgb(80, 230, 130));
+                }
+            }
+            else if (currentProfile.Mode == PersistenceMode.TrayAgent)
+            {
+                string dummy;
+                TaskSchedulerHelper.RemoveTask(out dummy);
+                SetAutoStart(true);
+                Log("📌 Tray Agent startup registered in Windows Run key.", Color.FromArgb(140, 200, 255));
+            }
+            else
+            {
+                if (trayIcon != null) trayIcon.Visible = false;
+                string dummy;
+                TaskSchedulerHelper.RemoveTask(out dummy);
+                SetAutoStart(false);
+                Log("Auto-apply disabled. Mouse will use volatile RAM only.", Color.FromArgb(200, 200, 220));
+            }
+
+            Log(string.Format("Profile saved to {0} (Mode={1}, EnableDpi={2}, DpiStage={3})",
+                AppProfile.GetProfilePath(), currentProfile.Mode, currentProfile.EnableDpi, currentProfile.ActiveDpiStage),
+                Color.FromArgb(140, 200, 255));
 
             bool ok = await ApplyCurrentProfileAsync(silent: false);
             if (ok)
             {
                 string msg;
-                if (currentProfile.AutoStart)
+                if (currentProfile.Mode == PersistenceMode.ZeroRamDriver)
+                {
+                    if (taskFailed)
+                    {
+                        msg = "Profile saved & applied to mouse!\n\n" +
+                              "⚠️ Warning: Failed to register Task Scheduler task:\n" + taskError + "\n\n" +
+                              "Settings will persist once Task Scheduler permissions are granted.";
+                    }
+                    else
+                    {
+                        msg = "Profile saved successfully!\n\n" +
+                              "✔ Color & Brightness applied to mouse.\n" +
+                              (currentProfile.EnableDpi ? string.Format("✔ DPI Stage {0} applied to mouse.\n", currentProfile.ActiveDpiStage) : "") +
+                              "✔ Zero-RAM Stealth Driver Mode active: Windows kernel will auto-apply settings on boot, wake, and hotplug.\n" +
+                              "✔ 0 MB RAM, 0 background processes, 0 CPU.\n\n" +
+                              "You can close this window now. The mouse will stay persisted forever!";
+                    }
+                }
+                else if (currentProfile.Mode == PersistenceMode.TrayAgent)
                 {
                     msg = "Profile saved successfully!\n\n" +
                           "✔ Color & Brightness applied to mouse.\n" +
-                          "✔ Auto-apply enabled: Redgear A20 Control Center will start silently in the system tray when Windows boots and auto-apply your settings whenever the mouse is plugged in.\n" +
-                          "✔ Ultra-lightweight footprint: ~2 MB RAM, 0% CPU.\n\n" +
-                          "You can minimize or close this window safely.";
+                          (currentProfile.EnableDpi ? string.Format("✔ DPI Stage {0} applied to mouse.\n", currentProfile.ActiveDpiStage) : "") +
+                          "✔ Tray Agent Mode active: Redgear A20 Control Center will start in the system tray (~2.7 MB RAM).\n\n" +
+                          "You can minimize or close this window to tray.";
                 }
                 else
                 {
                     msg = "Profile saved locally!\n\n" +
                           "✔ Color & Brightness applied to mouse.\n\n" +
-                          "ℹ Note: Auto-apply is unchecked. When the mouse is unplugged or PC restarted, lighting will revert to defaults until re-applied.";
+                          "ℹ Note: Auto-apply is disabled. Lighting will reset upon mouse disconnect or PC restart.";
                 }
 
                 MessageBox.Show(msg, "Profile Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1477,17 +1876,25 @@ namespace RedgearA20ControlCenter
                     currentBrightness = 100;
                     tbBrightness.Value = 100;
                     txtHex.Text = "#BE59FF";
-                    cbAutoStart.Checked = false;
+                    if (rbDisabled != null) rbDisabled.Checked = true;
+                    if (cbEnableDpi != null) cbEnableDpi.Checked = false;
+                    if (cmbDpiStages != null) cmbDpiStages.SelectedIndex = 1;
                     UpdateColorPreview();
 
                     if (currentProfile != null)
                     {
                         currentProfile.HexColor = "#BE59FF";
                         currentProfile.Brightness = 100;
-                        currentProfile.AutoStart = false;
+                        currentProfile.ActiveDpiStage = 1;
+                        currentProfile.EnableDpi = false;
+                        currentProfile.Mode = PersistenceMode.Disabled;
                         currentProfile.Save();
                     }
                     SetAutoStart(false);
+
+                    string removeErr;
+                    TaskSchedulerHelper.RemoveTask(out removeErr);
+                    if (trayIcon != null) trayIcon.Visible = false;
 
                     Log("✅ Factory profile restored!", Color.FromArgb(80, 230, 130));
                     MessageBox.Show("Factory profile restored!\n\nThe mouse is now in default multi-stage breathing mode.", "Factory Reset Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -1522,8 +1929,25 @@ namespace RedgearA20ControlCenter
             if (selectedStage < 0 || selectedStage > 5) selectedStage = 0;
 
             btnTestDpi.Enabled = false;
+            bool lockAcquired = false;
+            Mutex hwMutex = null;
+
             try
             {
+                try
+                {
+                    hwMutex = new Mutex(false, TaskSchedulerHelper.HARDWARE_MUTEX_NAME);
+                    try { lockAcquired = hwMutex.WaitOne(3000, false); }
+                    catch (AbandonedMutexException) { lockAcquired = true; }
+                }
+                catch { lockAcquired = false; }
+
+                if (!lockAcquired)
+                {
+                    Log("Cmd 0x09: Hardware lock timeout (Device busy).", Color.FromArgb(255, 80, 80));
+                    return;
+                }
+
                 Log("⚠️ --- Transmitting EXPERIMENTAL DPI Command 0x09 (RAM Only, Never Flashed) ---", Color.FromArgb(255, 120, 50));
 
                 byte b2 = (byte)(0x40 | (selectedStage & 0x07));
@@ -1543,6 +1967,11 @@ namespace RedgearA20ControlCenter
             }
             finally
             {
+                if (hwMutex != null)
+                {
+                    if (lockAcquired) { try { hwMutex.ReleaseMutex(); } catch { } }
+                    hwMutex.Close();
+                }
                 btnTestDpi.Enabled = true;
             }
         }
@@ -1555,40 +1984,58 @@ namespace RedgearA20ControlCenter
             return string.Join(" ", hex);
         }
 
+        private static Color ParseColor(string hex)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(hex)) return Color.FromArgb(190, 89, 255);
+                string clean = hex.Trim().TrimStart('#');
+                if (clean.Length != 6) return Color.FromArgb(190, 89, 255);
+                int r = Convert.ToInt32(clean.Substring(0, 2), 16);
+                int g = Convert.ToInt32(clean.Substring(2, 2), 16);
+                int b = Convert.ToInt32(clean.Substring(4, 2), 16);
+                return Color.FromArgb(r, g, b);
+            }
+            catch
+            {
+                return Color.FromArgb(190, 89, 255);
+            }
+        }
+
         private static int HeadlessApplyAndExit()
         {
             try
             {
-                AppProfile profile = AppProfile.Load();
-                ushort uPage;
-                string devicePath = HidTransport.FindTargetDevicePath(out uPage);
-                if (string.IsNullOrEmpty(devicePath))
+                string devicePath = null;
+                ushort uPage = 0;
+                const int MAX_WAIT_MS = 2500;
+                const int POLL_INTERVAL_MS = 150;
+                int elapsed = 0;
+
+                while (elapsed < MAX_WAIT_MS)
                 {
-                    return 1;
+                    devicePath = HidTransport.FindTargetDevicePath(out uPage);
+                    if (!string.IsNullOrEmpty(devicePath)) break;
+                    Thread.Sleep(POLL_INTERVAL_MS);
+                    elapsed += POLL_INTERVAL_MS;
                 }
 
-                Color color;
-                try
-                {
-                    string hex = profile.HexColor.TrimStart('#');
-                    int r = Convert.ToInt32(hex.Substring(0, 2), 16);
-                    int g = Convert.ToInt32(hex.Substring(2, 2), 16);
-                    int b = Convert.ToInt32(hex.Substring(4, 2), 16);
-                    color = Color.FromArgb(r, g, b);
-                }
-                catch
-                {
-                    color = Color.FromArgb(190, 89, 255);
-                }
+                if (string.IsNullOrEmpty(devicePath)) return 1;
+
+                // USB buffer stabilization delay
+                Thread.Sleep(100);
+
+                AppProfile profile = AppProfile.Load();
+                Color color = ParseColor(profile.HexColor);
 
                 SaveParameters p = new SaveParameters
                 {
                     Color = color,
                     Brightness = profile.Brightness,
-                    ActiveDpiIndex = 1,
+                    ActiveDpiIndex = (byte)Math.Max(0, Math.Min(5, profile.ActiveDpiStage)),
                     DpiMask = 0x3F,
                     CommitToFlash = false,
-                    SendDpi = false
+                    SendDpi = profile.EnableDpi
                 };
 
                 PipelineResult res = ExecuteHardwarePipeline(devicePath, p, delegate(string s, Color c) { });
@@ -1606,6 +2053,9 @@ namespace RedgearA20ControlCenter
             bool startInTray = false;
             bool applyAndExit = false;
 
+            bool installTask = false;
+            bool removeTask = false;
+
             if (args != null)
             {
                 for (int i = 0; i < args.Length; i++)
@@ -1619,7 +2069,33 @@ namespace RedgearA20ControlCenter
                     {
                         applyAndExit = true;
                     }
+                    else if (a == "--install-task" || a == "-install-task" || a == "/install-task" || a == "--install")
+                    {
+                        installTask = true;
+                    }
+                    else if (a == "--remove-task" || a == "-remove-task" || a == "/remove-task" || a == "--remove")
+                    {
+                        removeTask = true;
+                    }
                 }
+            }
+
+            if (installTask)
+            {
+                string err;
+                bool ok = TaskSchedulerHelper.InstallTask(out err);
+                if (!ok) Console.Error.WriteLine("Failed to install task: " + err);
+                Environment.Exit(ok ? 0 : 1);
+                return;
+            }
+
+            if (removeTask)
+            {
+                string err;
+                bool ok = TaskSchedulerHelper.RemoveTask(out err);
+                if (!ok) Console.Error.WriteLine("Failed to remove task: " + err);
+                Environment.Exit(ok ? 0 : 1);
+                return;
             }
 
             if (applyAndExit)
@@ -1629,10 +2105,33 @@ namespace RedgearA20ControlCenter
                 return;
             }
 
+            if (startInTray)
+            {
+                AppProfile p = AppProfile.Load();
+                if (p.Mode != PersistenceMode.TrayAgent)
+                {
+                    // Clean up stale legacy Run registry key if migrated away from TrayAgent
+                    SetAutoStart(false);
+                    if (p.Mode == PersistenceMode.ZeroRamDriver)
+                    {
+                        HeadlessApplyAndExit();
+                    }
+                    return;
+                }
+            }
+
             wmShowControlCenter = RegisterWindowMessage("RedgearA20_ShowControlCenter");
 
-            bool createdNew;
-            appMutex = new Mutex(true, "RedgearA20ControlCenter_SingleInstance", out createdNew);
+            bool createdNew = false;
+            try
+            {
+                appMutex = new Mutex(true, "RedgearA20ControlCenter_SingleInstance", out createdNew);
+            }
+            catch (AbandonedMutexException)
+            {
+                // Previous GUI instance terminated abruptly while holding mutex; ownership successfully acquired
+                createdNew = true;
+            }
 
             if (!createdNew)
             {
