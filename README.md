@@ -1,10 +1,11 @@
 # 🖱️ Redgear A20 Control Center
 
+[![Download Executable](https://img.shields.io/github/v/release/shivamvcx/A20-Driver?include_prereleases&label=Download%20.exe&color=success)](https://github.com/shivamvcx/A20-Driver/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Windows x64](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20(64--bit)-0078D6.svg)](https://microsoft.com)
 [![Architecture: C# WinForms](https://img.shields.io/badge/Architecture-C%23%20WinForms-239120.svg)](src/Program.cs)
-[![Executable Size](https://img.shields.io/badge/Binary%20Size-~25%20KB-orange.svg)](#build-from-source)
-[![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(Pure%20Win32)-success.svg)](#architecture)
+[![Executable Size](https://img.shields.io/badge/Binary%20Size-~25%20KB-orange.svg)](#-download--quick-start-recommended)
+[![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(Pure%20Win32)-success.svg)](#-system--hardware-compatibility)
 
 A standalone, zero-bloat, open-source Windows driver and hardware control application for the **Redgear A20 RGB Gaming Mouse** (`VID: 0x18F8 & PID: 0x0FC0`).
 
@@ -76,33 +77,38 @@ Packet Structure: [0x07, Command, Param1, Param2, Param3, Param4, Param5, Param6
 
 ---
 
-## 🛠️ Build from Source
+## 🚀 Download & Quick Start (Recommended)
 
-This project compiles with the built-in Microsoft C# compiler (`csc.exe`) included with Windows. **No Visual Studio, SDK, or toolchain installation is required.**
+No installer or runtime dependencies required. It is a portable standalone utility for 64-bit Windows 10 and 11.
+
+1. **[Download Latest Release (`RedgearA20-win-x64.exe`)](https://github.com/shivamvcx/A20-Driver/releases)** from the GitHub Releases page.
+2. Plug in your **Redgear A20** mouse.
+3. Double-click **`RedgearA20-win-x64.exe`** to launch.
+4. Verify the top status bar confirms:
+   `● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0xFF01)`
+5. Pick your color using the visual picker or type a custom `#RRGGBB` hex code, adjust brightness, and click **`[ ▶ Apply to Mouse (RAM Only) ]`**.
+6. *(Optional)* Click **`[ 💾 Save to Mouse Memory (0x20) ]`** if you wish to test saving settings to onboard hardware memory.
+
+---
+
+## 🛠️ Build from Source (Optional / For Developers)
+
+If you prefer to audit the source code and compile the standalone executable yourself:
+
+> **Note**: This project compiles directly using Microsoft's built-in C# compiler (`csc.exe`) included with Windows. **No Visual Studio, SDK, or toolchain installation is needed.**
 
 1. Clone the repository:
    ```cmd
    git clone https://github.com/shivamvcx/A20-Driver.git
    cd A20-Driver
    ```
-2. Run the automated build script:
+2. Run the 1-click build script:
    ```cmd
    build.bat
    ```
-3. The standalone 64-bit executable and its SHA256 checksum will be generated in the `release/` directory:
+3. The executable and SHA256 checksum will be generated in `release\`:
    - `release\RedgearA20-win-x64.exe`
    - `release\RedgearA20-win-x64.sha256`
-
----
-
-## 🎮 How to Use
-
-1. Run `release\RedgearA20-win-x64.exe`.
-2. Check the top status bar: it will confirm `● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0xFF01)`.
-3. Select your desired color using the **Color Picker**, presets, or by typing a custom `#RRGGBB` hex code.
-4. Adjust the **Brightness** slider.
-5. Click **`[ ▶ Apply to Mouse (RAM Only) ]`**. The mouse LED will immediately switch to your color with a steady, non-breathing glow.
-6. *(Optional)* If you wish to test saving permanently to onboard memory, click **`[ 💾 Save to Mouse Memory (0x20) ]`**. Otherwise, your settings will revert cleanly when the mouse is unplugged.
 
 ---
 
