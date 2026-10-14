@@ -30,7 +30,7 @@ Designed to replace the abandoned official driver software with a clean, high-pe
 
 ---
 
-## ✨ Features (v0.1.0 Scope)
+## ✨ Features (v0.1.1 Scope)
 
 * **🎨 4,096-Color True Precision Engine**:
   - Full 12-bit RGB color control ($16 \times 16 \times 16$ levels per channel).
@@ -43,14 +43,17 @@ Designed to replace the abandoned official driver software with a clean, high-pe
   - Hardware mode `0x86` forces the microcontroller to display permanent, non-fading solid light, eliminating the default unchangeable rainbow breathing cycle.
   - *Note: Additional customizable RGB effects (custom breathing speeds, cyclic spectrum, and dynamic lighting) will be added in future updates — see [docs/roadmap.md](docs/roadmap.md).*
 * **🛡️ Hardened Safety Architecture**:
-  - **Apply to RAM Only**: Live changes are applied to volatile memory first; unsaved settings revert cleanly upon unplugging the mouse.
-  - **Decoupled EEPROM Save**: Flashing onboard memory (`0x20`) is isolated behind an explicit confirmation button.
+  - **Apply to RAM Only**: Live changes can be applied to volatile memory first (`[ ▶ Apply (RAM) ]`); unsaved settings revert cleanly upon unplugging the mouse.
+  - **Cold-Boot EEPROM Persistence**: Saving to onboard memory (`[ 💾 Save to Mouse (0x20) ]`) synchronizes all 6 DPI stages and commits using verified unlock key `0x5A 0xA5`, persisting permanently across unplugging and cold reboots.
+  - **↺ Factory Profile Reset**: Restores verified stock per-stage DPI indicator colors and default breathing cycle mode.
+  - **Asynchronous Execution & UI Locking**: Background worker execution prevents GUI stuttering; locks UI controls and window closing during flash writes.
+  - **Post-Write Health Check**: Automatic `HidD_GetFeature` bus interrogation verifies microcontroller responsiveness after EEPROM programming.
   - **Zero Slider Spamming**: Sliders only update local UI preview; zero USB packets are transmitted while dragging.
   - **Mandatory 50ms Delays**: Safe inter-packet delay prevents 8-bit MCU buffer overruns.
 * **🔍 Live Monospace Diagnostic Log**:
   - Embedded console displaying every 8-byte Feature Report sent and its Win32 return status, with one-click clipboard export.
 * **⚡ Ultra-Light Portable Executable**:
-  - Standalone $\approx 25\text{ KB}$ 64-bit executable (`RedgearA20-win-x64.exe`). No installer, no background services, no electron bloat.
+  - Standalone $\approx 37\text{ KB}$ 64-bit executable (`RedgearA20-win-x64.exe`). No installer, no background services, no electron bloat.
 
 ---
 
@@ -66,7 +69,7 @@ Packet Structure: [0x07, Command, Param1, Param2, Param3, Param4, Param5, Param6
 | :---: | :---: | :--- | :--- | :---: |
 | **`0x14`** | DPI Stage RGB | `[07 14 (Stage<<5)\|Green_Inv (Red_Inv<<4)\|Blue_Inv 00 00 00 00]` | 4-bit Active-Low PWM color per stage | ✅ **VERIFIED** |
 | **`0x13`** | LED Mode | `[07 13 7F ModeByte 00 00 00 00]` | `0x86` = Solid Static, `0x80` = Breathing, `0x87` = Off | ✅ **VERIFIED** |
-| **`0x20`** | Flash Memory | `[07 20 00 00 00 00 00 00]` | Commits active settings to onboard EEPROM | ⚠️ In Progress |
+| **`0x20`** | Flash Memory | `[07 20 5A A5 00 00 00 00]` | Commits active settings to onboard EEPROM | ✅ **VERIFIED (v0.1.1)** |
 | **`0x09`** | Sensor DPI | `[07 09 (0x40\|Stage) 08 EnabledMask 00 00 00]` | Active stage & 6-bit enabled mask | ⚠️ Experimental |
 
 > 📚 **Project Documentation & Guides**:

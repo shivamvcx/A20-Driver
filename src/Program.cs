@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32.SafeHandles;
 
@@ -12,8 +13,8 @@ using Microsoft.Win32.SafeHandles;
 [assembly: AssemblyDescription("Open-Source Hardware Control Utility for Redgear A20")]
 [assembly: AssemblyProduct("Redgear A20 Control Center")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Redgear A20 Open Driver Project Contributors")]
-[assembly: AssemblyVersion("0.1.0.0")]
-[assembly: AssemblyFileVersion("0.1.0.0")]
+[assembly: AssemblyVersion("0.1.1.0")]
+[assembly: AssemblyFileVersion("0.1.1.0")]
 
 namespace RedgearA20ControlCenter
 {
@@ -100,6 +101,9 @@ namespace RedgearA20ControlCenter
 
         [DllImport("hid.dll", SetLastError = true)]
         public static extern bool HidD_SetFeature(SafeFileHandle hDevice, byte[] reportBuffer, uint reportBufferLength);
+
+        [DllImport("hid.dll", SetLastError = true)]
+        public static extern bool HidD_GetFeature(SafeFileHandle hDevice, byte[] reportBuffer, uint reportBufferLength);
 
         [DllImport("hid.dll", SetLastError = true)]
         public static extern bool HidD_FlushQueue(SafeFileHandle hDevice);
@@ -205,9 +209,10 @@ namespace RedgearA20ControlCenter
             return null;
         }
 
-        public static bool SendSinglePacket(string path, byte[] packet, out string error)
+        public static bool SendSinglePacket(string path, byte[] packet, out int win32Err, out string error)
         {
             error = null;
+            win32Err = 0;
             if (packet == null || packet.Length != 8)
             {
                 error = "Packet must be exactly 8 bytes.";
@@ -217,8 +222,8 @@ namespace RedgearA20ControlCenter
             SafeFileHandle hFile = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
             if (hFile.IsInvalid)
             {
-                int errCode = Marshal.GetLastWin32Error();
-                error = string.Format("Failed to open device handle (Win32 Error: {0})", errCode);
+                win32Err = Marshal.GetLastWin32Error();
+                error = string.Format("Failed to open device handle (Win32 Error: {0})", win32Err);
                 return false;
             }
 
@@ -227,8 +232,8 @@ namespace RedgearA20ControlCenter
                 bool success = HidD_SetFeature(hFile, packet, 8);
                 if (!success)
                 {
-                    int errCode = Marshal.GetLastWin32Error();
-                    error = string.Format("HidD_SetFeature failed (Win32 Error: {0})", errCode);
+                    win32Err = Marshal.GetLastWin32Error();
+                    error = string.Format("HidD_SetFeature failed (Win32 Error: {0})", win32Err);
                     return false;
                 }
                 HidD_FlushQueue(hFile);
@@ -240,6 +245,58 @@ namespace RedgearA20ControlCenter
                 hFile.Dispose();
             }
         }
+
+        public static bool SendSinglePacket(string path, byte[] packet, out string error)
+        {
+            int win32Err;
+            return SendSinglePacket(path, packet, out win32Err, out error);
+        }
+
+        public static bool VerifyDeviceTransportHealth(string path, out int win32Err, out string error)
+        {
+            error = null;
+            win32Err = 0;
+            SafeFileHandle hFile = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+            if (hFile.IsInvalid)
+            {
+                win32Err = Marshal.GetLastWin32Error();
+                error = string.Format("Device handle unavailable after flash write (Win32 Error: {0})", win32Err);
+                return false;
+            }
+
+            using (hFile)
+            {
+                byte[] buf = new byte[32];
+                buf[0] = REPORT_ID; // Report ID 0x07 must be byte 0
+                bool ok = HidD_GetFeature(hFile, buf, (uint)buf.Length);
+                if (!ok)
+                {
+                    win32Err = Marshal.GetLastWin32Error();
+                    error = string.Format("Device non-responsive after flash write (Win32 Error: {0})", win32Err);
+                    return false;
+                }
+                HidD_FlushQueue(hFile);
+                return true;
+            }
+        }
+    }
+
+    public struct SaveParameters
+    {
+        public Color Color;
+        public int Brightness;
+        public byte ActiveDpiIndex;
+        public byte DpiMask;
+        public bool CommitToFlash;
+        public bool SendDpi;
+    }
+
+    public class PipelineResult
+    {
+        public bool Success;
+        public string ErrorMessage;
+        public int FailingPacketIndex;
+        public int Win32ErrorCode;
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -248,6 +305,7 @@ namespace RedgearA20ControlCenter
     public class MainForm : Form
     {
         // UI Controls
+        private Panel body;
         private Label lblStatus;
         private Panel pnlColorPreview;
         private TextBox txtHex;
@@ -274,6 +332,19 @@ namespace RedgearA20ControlCenter
         private int currentBrightness = 100;
         private string cachedDevicePath = null;
         private ushort cachedUsagePage = 0;
+        private volatile bool isSavingInProgress = false;
+        private const int EEPROM_WRITE_DELAY_MS = 300;
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (isSavingInProgress)
+            {
+                MessageBox.Show("Please wait until the onboard memory write completes before exiting.", "Save in Progress", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                e.Cancel = true;
+                return;
+            }
+            base.OnFormClosing(e);
+        }
 
         public MainForm()
         {
@@ -284,7 +355,7 @@ namespace RedgearA20ControlCenter
 
         private void InitForm()
         {
-            this.Text = "Redgear A20 Control Center v0.1.0";
+            this.Text = "Redgear A20 Control Center v0.1.1";
             this.Size = new Size(580, 780);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -321,7 +392,7 @@ namespace RedgearA20ControlCenter
             this.Controls.Add(pnlHeader);
 
             // Container Panel
-            Panel body = new Panel { Location = new Point(15, 55), Size = new Size(535, 675) };
+            body = new Panel { Location = new Point(15, 55), Size = new Size(535, 675) };
 
             // ─── Group 1: Colour Selection ───
             GroupBox gbColor = new GroupBox
@@ -445,9 +516,9 @@ namespace RedgearA20ControlCenter
             // ─── Action Buttons (Safe Decoupled Architecture) ───
             btnApply = new Button
             {
-                Text = "▶ Apply to Mouse (RAM Only)",
+                Text = "▶ Apply (RAM)",
                 Location = new Point(0, 230),
-                Size = new Size(210, 38),
+                Size = new Size(170, 38),
                 BackColor = Color.FromArgb(130, 60, 220),
                 ForeColor = Color.White,
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
@@ -459,9 +530,9 @@ namespace RedgearA20ControlCenter
 
             btnSave = new Button
             {
-                Text = "💾 Save to Mouse Memory (0x20)",
-                Location = new Point(220, 230),
-                Size = new Size(210, 38),
+                Text = "💾 Save to Mouse (0x20)",
+                Location = new Point(178, 230),
+                Size = new Size(205, 38),
                 BackColor = Color.FromArgb(38, 120, 75),
                 ForeColor = Color.White,
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
@@ -473,11 +544,12 @@ namespace RedgearA20ControlCenter
 
             btnReset = new Button
             {
-                Text = "Reset",
-                Location = new Point(440, 230),
-                Size = new Size(95, 38),
+                Text = "↺ Factory Reset",
+                Location = new Point(390, 230),
+                Size = new Size(145, 38),
                 BackColor = Color.FromArgb(48, 52, 62),
                 ForeColor = Color.FromArgb(220, 220, 230),
+                Font = new Font("Segoe UI", 9.0f, FontStyle.Regular),
                 FlatStyle = FlatStyle.Flat
             };
             btnReset.FlatAppearance.BorderSize = 0;
@@ -687,9 +759,228 @@ namespace RedgearA20ControlCenter
             }
         }
 
-        // ─── VERIFIED COMMAND EXECUTION: APPLY (RAM ONLY) ───
-        private void BtnApply_Click(object sender, EventArgs e)
+        private static string TranslateWin32Error(int errCode)
         {
+            switch (errCode)
+            {
+                case 0:
+                    return "Operation succeeded.";
+                case 5:
+                    return "Access denied (ERROR_ACCESS_DENIED). Another process (e.g. Gaming Mouse 2.0.exe) may be holding the HID endpoint.";
+                case 6:
+                    return "Invalid handle (ERROR_INVALID_HANDLE). Device communication handle was closed or invalidated.";
+                case 31:
+                    return "A device attached to the system is not functioning (ERROR_GEN_FAILURE). Microcontroller may have stalled.";
+                case 87:
+                    return "The parameter is incorrect (ERROR_INVALID_PARAMETER). USB report buffer length or Report ID mismatch.";
+                case 1167:
+                    return "The device is not connected (ERROR_DEVICE_NOT_CONNECTED). Mouse was physically disconnected.";
+                default:
+                    return string.Format("System error code {0}", errCode);
+            }
+        }
+
+        private static PipelineResult ExecuteHardwarePipeline(string devicePath, SaveParameters p, Action<string, Color> logCallback)
+        {
+            int packetIndex = 0;
+
+            logCallback(p.CommitToFlash ?
+                "--- Executing Hardware Pipeline (With Flash Commit 0x20) ---" :
+                "--- Applying Verified Settings to RAM (No EEPROM Write) ---",
+                p.CommitToFlash ? Color.FromArgb(255, 215, 0) : Color.FromArgb(255, 220, 100));
+
+            // 1. Calculate Active-Low PWM values
+            float b = p.Brightness / 100.0f;
+            int rStep = (int)Math.Round((p.Color.R / 255.0f) * b * 15.0f);
+            int gStep = (int)Math.Round((p.Color.G / 255.0f) * b * 15.0f);
+            int bStep = (int)Math.Round((p.Color.B / 255.0f) * b * 15.0f);
+
+            byte rInv = (byte)((15 - rStep) & 0x0F);
+            byte gInv = (byte)((15 - gStep) & 0x0F);
+            byte bInv = (byte)((15 - bStep) & 0x0F);
+
+            logCallback(string.Format("Active-Low PWM Steps: R={0}/15 (0x{1:X}) G={2}/15 (0x{3:X}) B={4}/15 (0x{5:X})",
+                rStep, rInv, gStep, gInv, bStep, bInv), Color.FromArgb(180, 180, 200));
+
+            // 2. Transmit Command 0x14 across all 6 DPI stages
+            for (byte stage = 0; stage < 6; stage++)
+            {
+                byte b2 = (byte)(((stage & 0x07) << 5) | (gInv & 0x0F));
+                byte b3 = (byte)(((rInv & 0x0F) << 4) | (bInv & 0x0F));
+                byte[] packet = new byte[] { HidTransport.REPORT_ID, 0x14, b2, b3, 0x00, 0x00, 0x00, 0x00 };
+
+                int win32Err;
+                string err;
+                bool ok = HidTransport.SendSinglePacket(devicePath, packet, out win32Err, out err);
+                if (!ok)
+                {
+                    logCallback(string.Format("Cmd 0x14 [Stage {0}]: {1} -> FAIL ({2})", stage, FormatHex(packet), err), Color.FromArgb(255, 80, 80));
+                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                }
+
+                logCallback(string.Format("Cmd 0x14 [Stage {0}]: {1} -> OK", stage, FormatHex(packet)), Color.FromArgb(80, 230, 130));
+                packetIndex++;
+                Thread.Sleep(50);
+            }
+
+            // 3. Set Static Solid Mode with Command 0x13
+            byte[] modePacket = new byte[] { HidTransport.REPORT_ID, 0x13, 0x7F, 0x86, 0x00, 0x00, 0x00, 0x00 };
+            {
+                int win32Err;
+                string err;
+                bool ok = HidTransport.SendSinglePacket(devicePath, modePacket, out win32Err, out err);
+                if (!ok)
+                {
+                    logCallback(string.Format("Cmd 0x13 [Mode 0x86 Static]: {0} -> FAIL ({1})", FormatHex(modePacket), err), Color.FromArgb(255, 80, 80));
+                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                }
+
+                logCallback(string.Format("Cmd 0x13 [Mode 0x86 Static]: {0} -> OK", FormatHex(modePacket)), Color.FromArgb(80, 230, 130));
+                packetIndex++;
+                Thread.Sleep(50);
+            }
+
+            // 4. If SendDpi enabled, transmit Command 0x09
+            if (p.SendDpi)
+            {
+                byte b2 = (byte)(0x40 | (p.ActiveDpiIndex & 0x07));
+                byte[] dpiPacket = new byte[] { HidTransport.REPORT_ID, 0x09, b2, 0x08, p.DpiMask, 0x00, 0x00, 0x00 };
+                int win32Err;
+                string err;
+                bool ok = HidTransport.SendSinglePacket(devicePath, dpiPacket, out win32Err, out err);
+                if (!ok)
+                {
+                    logCallback(string.Format("Cmd 0x09 [Stage {0}]: {1} -> FAIL ({2})", p.ActiveDpiIndex, FormatHex(dpiPacket), err), Color.FromArgb(255, 80, 80));
+                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                }
+                logCallback(string.Format("Cmd 0x09 [Stage {0}]: {1} -> OK", p.ActiveDpiIndex, FormatHex(dpiPacket)), Color.FromArgb(255, 200, 80));
+                packetIndex++;
+                Thread.Sleep(50);
+            }
+
+            // 5. If CommitToFlash, send Command 0x20 with 0x5A 0xA5 and verify MCU health
+            if (p.CommitToFlash)
+            {
+                byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x5A, 0xA5, 0x00, 0x00, 0x00, 0x00 };
+                int win32Err;
+                string err;
+                bool ok = HidTransport.SendSinglePacket(devicePath, commitPacket, out win32Err, out err);
+                if (!ok)
+                {
+                    logCallback(string.Format("Cmd 0x20 [Commit Flash]: {0} -> FAIL ({1})", FormatHex(commitPacket), err), Color.FromArgb(255, 80, 80));
+                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                }
+
+                logCallback(string.Format("Cmd 0x20 [Commit Flash]: {0} -> SENT", FormatHex(commitPacket)), Color.FromArgb(255, 215, 0));
+                packetIndex++;
+
+                // Wait for internal MCU EEPROM flash cycle
+                logCallback(string.Format("Pausing {0}ms for EEPROM flash cycle completion...", EEPROM_WRITE_DELAY_MS), Color.FromArgb(200, 200, 220));
+                Thread.Sleep(EEPROM_WRITE_DELAY_MS);
+
+                // Verify MCU transport health via HidD_GetFeature
+                logCallback("Verifying device transport health via HidD_GetFeature(0x07)...", Color.FromArgb(200, 200, 220));
+                int healthErr;
+                string healthErrMsg;
+                bool healthOk = HidTransport.VerifyDeviceTransportHealth(devicePath, out healthErr, out healthErrMsg);
+                if (!healthOk)
+                {
+                    logCallback(string.Format("Device health check failed after flash write: {0}", healthErrMsg), Color.FromArgb(255, 120, 120));
+                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = healthErr, ErrorMessage = healthErrMsg };
+                }
+                logCallback("Device transport health verified: MCU is responsive.", Color.FromArgb(80, 230, 130));
+            }
+
+            return new PipelineResult { Success = true, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = null };
+        }
+
+        private static PipelineResult ExecuteFactoryReset(string devicePath, Action<string, Color> logCallback)
+        {
+            int packetIndex = 0;
+            logCallback("--- Restoring Factory Profile (Stock Multi-Stage Colors + Breathing Mode) ---", Color.FromArgb(255, 180, 80));
+
+            // Stock stages (Active-Low PWM):
+            // Stage 0: 600 DPI  -> Blue   (gInv=15, rInv=15, bInv=0  -> b2=0x0F, b3=0xF0)
+            // Stage 1: 1000 DPI -> Yellow (gInv=0,  rInv=0,  bInv=15 -> b2=0x00, b3=0x0F)
+            // Stage 2: 1200 DPI -> Green  (gInv=0,  rInv=15, bInv=15 -> b2=0x00, b3=0xFF)
+            // Stage 3: 1600 DPI -> Purple (gInv=15, rInv=0,  bInv=0  -> b2=0x0F, b3=0x00)
+            // Stage 4: 2400 DPI -> Cyan   (gInv=0,  rInv=15, bInv=0  -> b2=0x00, b3=0xF0)
+            // Stage 5: 3200 DPI -> White  (gInv=0,  rInv=0,  bInv=0  -> b2=0x00, b3=0x00)
+            byte[][] stockStages = new byte[][] {
+                new byte[] { 0x0F, 0xF0 }, // Stage 0: Blue
+                new byte[] { 0x00, 0x0F }, // Stage 1: Yellow
+                new byte[] { 0x00, 0xFF }, // Stage 2: Green
+                new byte[] { 0x0F, 0x00 }, // Stage 3: Purple
+                new byte[] { 0x00, 0xF0 }, // Stage 4: Cyan
+                new byte[] { 0x00, 0x00 }  // Stage 5: White
+            };
+
+            for (byte stage = 0; stage < 6; stage++)
+            {
+                byte b2 = (byte)(((stage & 0x07) << 5) | (stockStages[stage][0] & 0x0F));
+                byte b3 = stockStages[stage][1];
+                byte[] packet = new byte[] { HidTransport.REPORT_ID, 0x14, b2, b3, 0x00, 0x00, 0x00, 0x00 };
+
+                int win32Err;
+                string err;
+                if (!HidTransport.SendSinglePacket(devicePath, packet, out win32Err, out err))
+                {
+                    logCallback(string.Format("Factory Cmd 0x14 [Stage {0}]: {1} -> FAIL ({2})", stage, FormatHex(packet), err), Color.FromArgb(255, 80, 80));
+                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                }
+                logCallback(string.Format("Factory Cmd 0x14 [Stage {0}]: {1} -> OK", stage, FormatHex(packet)), Color.FromArgb(160, 220, 255));
+                packetIndex++;
+                Thread.Sleep(50);
+            }
+
+            // Restore stock mode: Breathing / Spectrum cycle (0x80)
+            byte[] modePacket = new byte[] { HidTransport.REPORT_ID, 0x13, 0x7F, 0x80, 0x00, 0x00, 0x00, 0x00 };
+            {
+                int win32Err;
+                string err;
+                if (!HidTransport.SendSinglePacket(devicePath, modePacket, out win32Err, out err))
+                {
+                    logCallback(string.Format("Factory Cmd 0x13 [Mode 0x80]: {0} -> FAIL ({1})", FormatHex(modePacket), err), Color.FromArgb(255, 80, 80));
+                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                }
+                logCallback(string.Format("Factory Cmd 0x13 [Mode 0x80]: {0} -> OK", FormatHex(modePacket)), Color.FromArgb(160, 220, 255));
+                packetIndex++;
+                Thread.Sleep(50);
+            }
+
+            // Flash commit: 0x20 with 0x5A 0xA5
+            byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x5A, 0xA5, 0x00, 0x00, 0x00, 0x00 };
+            {
+                int win32Err;
+                string err;
+                if (!HidTransport.SendSinglePacket(devicePath, commitPacket, out win32Err, out err))
+                {
+                    logCallback(string.Format("Factory Cmd 0x20 [Commit]: {0} -> FAIL ({1})", FormatHex(commitPacket), err), Color.FromArgb(255, 80, 80));
+                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                }
+                logCallback(string.Format("Factory Cmd 0x20 [Commit]: {0} -> SENT", FormatHex(commitPacket)), Color.FromArgb(255, 215, 0));
+                packetIndex++;
+                Thread.Sleep(EEPROM_WRITE_DELAY_MS);
+            }
+
+            // Health check
+            int hErr;
+            string hErrMsg;
+            if (!HidTransport.VerifyDeviceTransportHealth(devicePath, out hErr, out hErrMsg))
+            {
+                logCallback(string.Format("Device health check failed after factory reset: {0}", hErrMsg), Color.FromArgb(255, 120, 120));
+                return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = hErr, ErrorMessage = hErrMsg };
+            }
+
+            logCallback("Device transport health verified: MCU is responsive.", Color.FromArgb(80, 230, 130));
+            return new PipelineResult { Success = true, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = null };
+        }
+
+        // ─── VERIFIED COMMAND EXECUTION: APPLY (RAM ONLY) ───
+        private async void BtnApply_Click(object sender, EventArgs e)
+        {
+            if (isSavingInProgress) return;
+
             if (string.IsNullOrEmpty(cachedDevicePath))
             {
                 RefreshDeviceConnection();
@@ -700,150 +991,161 @@ namespace RedgearA20ControlCenter
                 }
             }
 
-            btnApply.Enabled = false;
+            SaveParameters p = new SaveParameters
+            {
+                Color = currentColor,
+                Brightness = currentBrightness,
+                ActiveDpiIndex = (byte)Math.Max(0, Math.Min(5, cmbDpiStages.SelectedIndex)),
+                DpiMask = 0x3F,
+                CommitToFlash = false,
+                SendDpi = false
+            };
+
+            string targetPath = cachedDevicePath;
+            body.Enabled = false;
+
             try
             {
-                Log("--- Applying Verified Settings to RAM (No EEPROM Write) ---", Color.FromArgb(255, 220, 100));
-
-                // 1. Calculate active-low PWM registers
-                float b = currentBrightness / 100.0f;
-                int rStep = (int)Math.Round((currentColor.R / 255.0f) * b * 15.0f);
-                int gStep = (int)Math.Round((currentColor.G / 255.0f) * b * 15.0f);
-                int bStep = (int)Math.Round((currentColor.B / 255.0f) * b * 15.0f);
-
-                byte rInv = (byte)((15 - rStep) & 0x0F);
-                byte gInv = (byte)((15 - gStep) & 0x0F);
-                byte bInv = (byte)((15 - bStep) & 0x0F);
-
-                Log(string.Format("Active-Low PWM Steps: R={0}/15 (0x{1:X}) G={2}/15 (0x{3:X}) B={4}/15 (0x{5:X})", rStep, rInv, gStep, gInv, bStep, bInv), Color.FromArgb(180, 180, 200));
-
-                // 2. Program 6 DPI stages with VERIFIED Command 0x14
-                for (byte stage = 0; stage < 6; stage++)
+                PipelineResult res = await Task.Run(() => ExecuteHardwarePipeline(targetPath, p, Log));
+                if (res.Success)
                 {
-                    byte b2 = (byte)(((stage & 0x07) << 5) | (gInv & 0x0F));
-                    byte b3 = (byte)(((rInv & 0x0F) << 4) | (bInv & 0x0F));
-                    byte[] packet = new byte[] { HidTransport.REPORT_ID, 0x14, b2, b3, 0x00, 0x00, 0x00, 0x00 };
-
-                    string err;
-                    bool ok = HidTransport.SendSinglePacket(cachedDevicePath, packet, out err);
-                    if (ok)
-                    {
-                        Log(string.Format("Cmd 0x14 [Stage {0}]: {1} -> OK", stage, FormatHex(packet)), Color.FromArgb(80, 230, 130));
-                    }
-                    else
-                    {
-                        Log(string.Format("Cmd 0x14 [Stage {0}]: {1} -> FAIL ({2})", stage, FormatHex(packet), err), Color.FromArgb(255, 80, 80));
-                        return;
-                    }
-                    Thread.Sleep(50); // Mandatory 50ms MCU safety delay
-                }
-
-                // 3. Set Static Solid Mode with VERIFIED Command 0x13
-                byte[] modePacket = new byte[] { HidTransport.REPORT_ID, 0x13, 0x7F, 0x86, 0x00, 0x00, 0x00, 0x00 };
-                string modeErr;
-                bool modeOk = HidTransport.SendSinglePacket(cachedDevicePath, modePacket, out modeErr);
-                if (modeOk)
-                {
-                    Log(string.Format("Cmd 0x13 [Mode 0x86 Static]: {0} -> OK", FormatHex(modePacket)), Color.FromArgb(80, 230, 130));
+                    Log("✅ Applied to RAM successfully! (Unsaved changes will revert on replug).", Color.FromArgb(140, 240, 255));
                 }
                 else
                 {
-                    Log(string.Format("Cmd 0x13: {0} -> FAIL ({1})", FormatHex(modePacket), modeErr), Color.FromArgb(255, 80, 80));
+                    string friendlyMsg = TranslateWin32Error(res.Win32ErrorCode);
+                    Log(string.Format("❌ Apply to RAM failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
+                    MessageBox.Show(string.Format("Failed to apply settings to RAM at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
-
-                Log("✅ Applied to RAM successfully! (Unsaved changes will revert on replug).", Color.FromArgb(140, 240, 255));
             }
             finally
             {
-                btnApply.Enabled = true;
+                body.Enabled = true;
             }
         }
 
         // ─── VERIFIED COMMAND EXECUTION: SAVE TO EEPROM (0x20) ───
-        private void BtnSave_Click(object sender, EventArgs e)
+        private async void BtnSave_Click(object sender, EventArgs e)
         {
+            if (isSavingInProgress) return;
+
             if (string.IsNullOrEmpty(cachedDevicePath))
             {
-                MessageBox.Show("Redgear A20 is not connected.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
+                RefreshDeviceConnection();
+                if (string.IsNullOrEmpty(cachedDevicePath))
+                {
+                    MessageBox.Show("Redgear A20 is not connected.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
             }
 
             DialogResult dr = MessageBox.Show(
-                "This will permanently write your current colour and brightness settings into the mouse's onboard EEPROM flash chip (Command 0x20).\n\nSettings will persist even after computer reboots and replugging.\n\nProceed?",
+                "Saving to onboard memory will set all DPI stages to this color and mode.\nStock DPI stage indicator colors will be overwritten.\n\nProceed?",
                 "Confirm Save to Onboard Memory",
                 MessageBoxButtons.YesNo,
-                MessageBoxIcon.Question
+                MessageBoxIcon.Warning
             );
 
             if (dr != DialogResult.Yes) return;
 
-            btnSave.Enabled = false;
+            SaveParameters p = new SaveParameters
+            {
+                Color = currentColor,
+                Brightness = currentBrightness,
+                ActiveDpiIndex = (byte)Math.Max(0, Math.Min(5, cmbDpiStages.SelectedIndex)),
+                DpiMask = 0x3F,
+                CommitToFlash = true,
+                SendDpi = cbEnableDpi.Checked
+            };
+
+            string targetPath = cachedDevicePath;
+            body.Enabled = false;
+            isSavingInProgress = true;
+            lblStatus.Text = "⏳ Writing to EEPROM flash... Do not disconnect mouse.";
+            lblStatus.ForeColor = Color.FromArgb(255, 200, 80);
+
             try
             {
-                byte[] savePacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
-                string err;
-                bool ok = HidTransport.SendSinglePacket(cachedDevicePath, savePacket, out err);
-                if (ok)
+                PipelineResult res = await Task.Run(() => ExecuteHardwarePipeline(targetPath, p, Log));
+                if (res.Success)
                 {
-                    Log(string.Format("Cmd 0x20 [Save to Flash]: {0} -> COMMITTED TO EEPROM", FormatHex(savePacket)), Color.FromArgb(255, 215, 0));
-                    MessageBox.Show("Settings successfully saved to onboard mouse memory!", "Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    Log("✅ Onboard flash commit completed and transport verified!", Color.FromArgb(80, 230, 130));
+                    MessageBox.Show("Settings successfully committed to onboard memory!\n\nPlease unplug and reconnect the mouse to verify cold-boot persistence.", "Save Completed", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 else
                 {
-                    Log(string.Format("Cmd 0x20 [Save to Flash]: {0} -> FAIL ({1})", FormatHex(savePacket), err), Color.FromArgb(255, 80, 80));
+                    string friendlyMsg = TranslateWin32Error(res.Win32ErrorCode);
+                    Log(string.Format("❌ Flash commit failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
+                    MessageBox.Show(string.Format("Flash write failed at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Write Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
             finally
             {
-                btnSave.Enabled = true;
+                isSavingInProgress = false;
+                body.Enabled = true;
+                lblStatus.Text = string.Format("● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0x{0:X4})", cachedUsagePage);
+                lblStatus.ForeColor = Color.FromArgb(80, 230, 130);
             }
         }
 
-        // ─── VERIFIED COMMAND EXECUTION: RESET TO DEFAULT ───
-        private void BtnReset_Click(object sender, EventArgs e)
+        // ─── VERIFIED COMMAND EXECUTION: FACTORY PROFILE RESET ───
+        private async void BtnReset_Click(object sender, EventArgs e)
         {
+            if (isSavingInProgress) return;
+
             if (string.IsNullOrEmpty(cachedDevicePath))
             {
-                MessageBox.Show("Redgear A20 is not connected.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
+                RefreshDeviceConnection();
+                if (string.IsNullOrEmpty(cachedDevicePath))
+                {
+                    MessageBox.Show("Redgear A20 is not connected.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
             }
 
-            btnReset.Enabled = false;
+            DialogResult dr = MessageBox.Show(
+                "This will restore the mouse to factory defaults (stock per-stage DPI colors and breathing mode) and commit them to onboard EEPROM memory.\n\nProceed?",
+                "Confirm Factory Profile Reset",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning
+            );
+
+            if (dr != DialogResult.Yes) return;
+
+            string targetPath = cachedDevicePath;
+            body.Enabled = false;
+            isSavingInProgress = true;
+            lblStatus.Text = "⏳ Restoring factory defaults... Do not disconnect mouse.";
+            lblStatus.ForeColor = Color.FromArgb(255, 200, 80);
+
             try
             {
-                Log("--- Resetting to Default Verified Settings (Cyan, 100% Brightness, Static) ---", Color.FromArgb(255, 180, 80));
-
-                // Reset local UI
-                currentColor = Color.FromArgb(0, 255, 255); // Cyan
-                currentBrightness = 100;
-                tbBrightness.Value = 100;
-                txtHex.Text = "#00FFFF";
-                UpdateColorPreview();
-
-                // Send 100% Cyan (Active-low: R=15, G=0, B=0) across 6 stages
-                for (byte stage = 0; stage < 6; stage++)
+                PipelineResult res = await Task.Run(() => ExecuteFactoryReset(targetPath, Log));
+                if (res.Success)
                 {
-                    byte b2 = (byte)(((stage & 0x07) << 5) | 0x00); // Green=0 (Full ON)
-                    byte b3 = (byte)((0x0F << 4) | 0x00);           // Red=15 (OFF), Blue=0 (Full ON)
-                    byte[] packet = new byte[] { HidTransport.REPORT_ID, 0x14, b2, b3, 0x00, 0x00, 0x00, 0x00 };
+                    // Reset local UI controls to default
+                    currentColor = Color.FromArgb(190, 89, 255);
+                    currentBrightness = 100;
+                    tbBrightness.Value = 100;
+                    txtHex.Text = "#BE59FF";
+                    UpdateColorPreview();
 
-                    string err;
-                    HidTransport.SendSinglePacket(cachedDevicePath, packet, out err);
-                    Log(string.Format("Reset 0x14 [Stage {0}]: {1}", stage, FormatHex(packet)), Color.FromArgb(160, 220, 255));
-                    Thread.Sleep(50);
+                    Log("✅ Factory profile restored and committed to EEPROM!", Color.FromArgb(80, 230, 130));
+                    MessageBox.Show("Factory profile restored and committed to memory!\n\nPlease replug the mouse to verify default breathing mode.", "Factory Reset Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
-
-                // Set static mode
-                byte[] modePacket = new byte[] { HidTransport.REPORT_ID, 0x13, 0x7F, 0x86, 0x00, 0x00, 0x00, 0x00 };
-                string mErr;
-                HidTransport.SendSinglePacket(cachedDevicePath, modePacket, out mErr);
-                Log(string.Format("Reset 0x13: {0}", FormatHex(modePacket)), Color.FromArgb(160, 220, 255));
-
-                Log("✅ Reset applied to RAM. (Does NOT modify DPI or button mapping).", Color.FromArgb(80, 230, 130));
+                else
+                {
+                    string friendlyMsg = TranslateWin32Error(res.Win32ErrorCode);
+                    Log(string.Format("❌ Factory reset failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
+                    MessageBox.Show(string.Format("Factory reset failed at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Reset Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
             }
             finally
             {
-                btnReset.Enabled = true;
+                isSavingInProgress = false;
+                body.Enabled = true;
+                lblStatus.Text = string.Format("● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0x{0:X4})", cachedUsagePage);
+                lblStatus.ForeColor = Color.FromArgb(80, 230, 130);
             }
         }
 

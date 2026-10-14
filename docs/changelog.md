@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.1.1] - 2026-10-14
+
+### Fixed
+- **EEPROM Flash Persistence Bug**:
+  - Resolved issue where saving settings (e.g. Lavender `#BE59FF`) reverted to factory defaults upon USB unplug/replug or cold restart.
+  - Implemented full hardware write sequence: dispatches Command `0x14` across all 6 DPI stages, locks permanent solid mode with Command `0x13`, and transmits Command `0x20` with the verified flash commit unlock key `[0x07, 0x20, 0x5A, 0xA5, 0x00, 0x00, 0x00, 0x00]`.
+  - Added user disclosure warning informing that saving custom color to mouse memory synchronizes and overwrites stock per-stage DPI indicator colors.
+
+### Added
+- **Asynchronous Non-Blocking Hardware Pipeline**:
+  - Migrated hardware USB dispatch to background workers (`Task.Run` with `async`/`await`) to eliminate GUI stutter and UI thread freezes during multi-packet operations.
+  - Implemented immutable `SaveParameters` state snapshotting to protect against mid-save slider drags or preset changes.
+  - Added container-level UI locking (`body.Enabled = false`) during flash writes with real-time status banner updates (`⏳ Writing to EEPROM flash... Do not disconnect mouse.`).
+  - Added `OnFormClosing` safety interlock to block accidental window closure while flash write is in progress.
+- **Post-Write MCU Transport Health Verification**:
+  - Enforced mandatory `300ms` EEPROM programming delay (`EEPROM_WRITE_DELAY_MS`) following Command `0x20`.
+  - Interfaced `HidD_GetFeature` (Report ID `0x07`, 32 bytes) to verify microcontroller bus responsiveness and health after flash programming.
+- **Factory Profile Reset (`↺ Factory Reset`)**:
+  - Added dedicated one-click factory reset feature restoring verified stock multi-stage DPI colors (Blue, Yellow, Green, Purple, Cyan, White) and default breathing cycle mode (`0x80`), followed by EEPROM commit.
+- **Human-Readable Win32 Error Translation**:
+  - Integrated symbolic and descriptive error messages for common Win32 codes (`ERROR_ACCESS_DENIED`, `ERROR_GEN_FAILURE`, `ERROR_INVALID_PARAMETER`, `ERROR_DEVICE_NOT_CONNECTED`).
+
+---
+
 ## [0.1.0] - 2026-10-14
 
 ### Added
