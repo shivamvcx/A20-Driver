@@ -1,0 +1,36 @@
+name: "Build & Release CI"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Build x64 Executable
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Compile via build.bat
+      run: |
+        .\build.bat
+
+    - name: Verify Artifact Existence
+      run: |
+        if (!(Test-Path "release\RedgearA20-win-x64.exe")) {
+          throw "Build output release\RedgearA20-win-x64.exe was not created."
+        }
+        if (!(Test-Path "release\RedgearA20-win-x64.sha256")) {
+          throw "Checksum file release\RedgearA20-win-x64.sha256 was not created."
+        }
+        Write-Host "Build verification passed!"
+
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: RedgearA20-win-x64-v0.1.0
+        path: release/
