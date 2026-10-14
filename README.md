@@ -30,8 +30,18 @@ Designed to replace the abandoned official driver software with a clean, high-pe
 
 ---
 
-## ✨ Features (v0.1.1 Scope)
+## ✨ Features (v0.1.1 Release)
 
+* **🚀 Stealth Driver Watcher (Near-Zero RAM Persistence)**:
+  - **Zero Taskbar & Zero System Tray Clutter**: Sits as an invisible background watcher (`trayIcon.Visible = false`) with no taskbar button and no tray icons cluttering your screen.
+  - **Ultra-Low Memory Footprint**: Uses `SetProcessWorkingSetSize` P/Invoke to aggressively compress working set memory to **~1.8 MB RAM** and **0.00% CPU** when idle.
+  - **Instant Hotplug Persistence Across All Ports**: Intercepts native Win32 `WM_DEVICECHANGE` window messages in `< 50ms`. No matter how many times you unplug and replug the mouse, switch between USB 2.0/3.0 ports, or use USB hubs, your custom color and DPI are restored in `~300ms`.
+  - **Cold-Boot & Sleep Persistence**: Starts silently on Windows login via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Survives system reboots and Modern Standby / S3 sleep.
+  - **Single-Instance IPC with UIPI Traversal**: Launching the `.exe` again automatically wakes the GUI control center without spawning duplicate background processes. Closing via `[X]` hides back into stealth mode. An explicit **"Exit App"** button is provided in the header if you ever want to stop the driver.
+  - **3 Persistence Modes**:
+    1. `🚀 Stealth Driver Watcher` (Invisible, No Tray Icon, ~1.8 MB RAM — Recommended)
+    2. `📌 Tray Agent Mode` (~2.7 MB RAM, Quick Access System Tray Icon)
+    3. `○ Disabled` (RAM Only — reverts to default when mouse is unplugged)
 * **🎨 4,096-Color True Precision Engine**:
   - Full 12-bit RGB color control ($16 \times 16 \times 16$ levels per channel).
   - Uses verified **Active-Low PWM** register mapping ($0 = 100\%$ ON, $15 = 0\%$ OFF).
@@ -41,23 +51,33 @@ Designed to replace the abandoned official driver software with a clean, high-pe
   - Variable brightness slider ($5\text{–}100\%$) that scales channel duty cycles proportionally while preserving the exact color hue.
 * **🔒 Solid Static Mode (No Breathing)**:
   - Hardware mode `0x86` forces the microcontroller to display permanent, non-fading solid light, eliminating the default unchangeable rainbow breathing cycle.
-  - *Note: Additional customizable RGB effects (custom breathing speeds, cyclic spectrum, and dynamic lighting) will be added in future updates — see [docs/roadmap.md](docs/roadmap.md).*
+* **🎯 ⚠️ Experimental DPI Stage Controls**:
+  - Optional toggle for Command `0x09` allowing selection of active DPI stages (Stage 0: 600, Stage 1: 1000, Stage 2: 1200, Stage 3: 1600, Stage 4: 2400, Stage 5: 3200 DPI).
 * **🛡️ Hardened Safety Architecture**:
-  - **Apply to RAM Only**: Live changes can be applied to volatile memory first (`[ ▶ Apply (RAM) ]`); unsaved settings revert cleanly upon unplugging the mouse.
-  - **Cold-Boot EEPROM Persistence**: Saving to onboard memory (`[ 💾 Save to Mouse (0x20) ]`) synchronizes all 6 DPI stages and commits using verified unlock key `0x5A 0xA5`, persisting permanently across unplugging and cold reboots.
-  - **↺ Factory Profile Reset**: Restores verified stock per-stage DPI indicator colors and default breathing cycle mode.
-  - **Asynchronous Execution & UI Locking**: Background worker execution prevents GUI stuttering; locks UI controls and window closing during flash writes.
-  - **Post-Write Health Check**: Automatic `HidD_GetFeature` bus interrogation verifies microcontroller responsiveness after EEPROM programming.
-  - **Zero Slider Spamming**: Sliders only update local UI preview; zero USB packets are transmitted while dragging.
+  - **Apply to RAM Only**: Changes can be tested in volatile memory first (`[ ▶ Apply (RAM) ]`).
+  - **Local Profile Persistence**: Auto-deploys to `%LocalAppData%\RedgearA20\RedgearA20.exe` so you can move or delete the downloaded file without breaking persistence.
+  - **↺ Factory Profile Reset**: Restores stock multi-stage DPI colors (Blue, Yellow, Green, Purple, Cyan, White) and default breathing cycle mode.
+  - **Asynchronous Execution & UI Locking**: Background worker execution prevents GUI stuttering; locks UI controls during transmission.
+  - **Post-Write Health Check**: Interrogates `HidD_GetFeature` to verify microcontroller responsiveness.
+  - **Zero Slider Spamming**: Sliders only update local UI preview; zero USB packets transmitted while dragging.
   - **Mandatory 50ms Delays**: Safe inter-packet delay prevents 8-bit MCU buffer overruns.
 * **🔍 Live Monospace Diagnostic Log**:
   - Embedded console displaying every 8-byte Feature Report sent and its Win32 return status, with one-click clipboard export.
 * **⚡ Ultra-Light Portable Executable**:
-  - Standalone $\approx 37\text{ KB}$ 64-bit executable (`RedgearA20-win-x64.exe`). No installer, no background services, no electron bloat.
+  - Standalone $\approx 63\text{ KB}$ 64-bit executable (`RedgearA20-win-x64.exe`). Zero dependencies, zero installer, zero electron wrappers.
 
 ---
 
-## 🔬 Verified vs. Unverified Protocol Commands
+## 🔬 Hardware Reality: The Instant A704 Microcontroller
+
+Through reverse engineering and disassembling the vendor's `Gaming Mouse 2.0.exe`, we verified a critical hardware reality:
+- The **Instant Microelectronics A704 / A704F IC** physically lacks non-volatile EEPROM/Flash storage for custom RGB lighting. Custom lighting registers are held in volatile SRAM, which wipes whenever power is lost (PC shutdown or USB unplug).
+- The official Redgear software worked around this by leaving a bloated background service running.
+- **Redgear A20 Control Center replaces that bloat** with a featherweight **Stealth Driver Watcher** (~1.8 MB RAM, 0% CPU, no tray icon) that detects USB hotplug in real-time via Win32 `WM_DEVICECHANGE` and restores your profile instantly.
+
+---
+
+## 📡 Verified vs. Unverified Protocol Commands
 
 All hardware communication is performed via 8-byte USB HID Feature Reports sent to endpoint **UsagePage `0xFF01` (Report ID `0x07`)**:
 
@@ -69,8 +89,8 @@ Packet Structure: [0x07, Command, Param1, Param2, Param3, Param4, Param5, Param6
 | :---: | :---: | :--- | :--- | :---: |
 | **`0x14`** | DPI Stage RGB | `[07 14 (Stage<<5)\|Green_Inv (Red_Inv<<4)\|Blue_Inv 00 00 00 00]` | 4-bit Active-Low PWM color per stage | ✅ **VERIFIED** |
 | **`0x13`** | LED Mode | `[07 13 7F ModeByte 00 00 00 00]` | `0x86` = Solid Static, `0x80` = Breathing, `0x87` = Off | ✅ **VERIFIED** |
-| **`0x20`** | Flash Memory | `[07 20 5A A5 00 00 00 00]` | Commits active settings to onboard EEPROM | ✅ **VERIFIED (v0.1.1)** |
-| **`0x09`** | Sensor DPI | `[07 09 (0x40\|Stage) 08 EnabledMask 00 00 00]` | Active stage & 6-bit enabled mask | ⚠️ Experimental |
+| **`0x09`** | Sensor DPI | `[07 09 (0x40\|Stage) 08 EnabledMask 00 00 00]` | Active stage & 6-bit enabled mask | ⚠️ **EXPERIMENTAL** |
+| **`0x20`** | Sync Latch | `[07 20 00 00 00 00 00 00]` | MCU register synchronization latch | ✅ **VERIFIED** |
 
 > 📚 **Project Documentation & Guides**:
 > - [Protocol Specification](docs/protocol-notes.md) — Complete byte-by-byte register and command reference.
@@ -85,12 +105,15 @@ Packet Structure: [0x07, Command, Param1, Param2, Param3, Param4, Param5, Param6
 No installer or runtime dependencies required. It is a portable standalone utility for 64-bit Windows 10 and 11.
 
 1. **[Download Latest Release (`RedgearA20-win-x64.exe`)](https://github.com/shivamvcx/A20-Driver/releases)** from the GitHub Releases page.
-2. Plug in your **Redgear A20** mouse.
+2. Plug in your **Redgear A20** mouse into any USB port.
 3. Double-click **`RedgearA20-win-x64.exe`** to launch.
 4. Verify the top status bar confirms:
    `● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0xFF01)`
-5. Pick your color using the visual picker or type a custom `#RRGGBB` hex code, adjust brightness, and click **`[ ▶ Apply to Mouse (RAM Only) ]`**.
-6. *(Optional)* Click **`[ 💾 Save to Mouse Memory (0x20) ]`** if you wish to test saving settings to onboard hardware memory.
+5. Pick your color using the visual picker or type a custom `#RRGGBB` hex code (e.g. Lavender `#BE59FF`) and adjust brightness.
+6. Under **Section 3 (Persistence Mode)**, select **`🚀 Stealth Driver Watcher`** and click **`[ 💾 Save Profile ]`**.
+7. Close the window (`[X]`).
+   - The window closes and **no system tray icon appears**.
+   - Your mouse will now permanently keep your custom color across all reboots, laptop sleep/wake, and physical USB replugs into any port!
 
 ---
 

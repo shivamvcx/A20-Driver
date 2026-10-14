@@ -77,14 +77,14 @@ Controls the lighting animation mode and spectrum cycle permissions.
 
 ---
 
-### Command `0x20` — Commit to Onboard Memory (EEPROM)
-Instructs the microcontroller to write active RAM settings into its non-volatile memory block.
+### Command `0x20` — Commit to Hardware Registers (Latching)
+Instructs the microcontroller to synchronize and latch active RAM lighting and configuration settings into internal hardware registers.
 
 ```
 [0x07, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 ```
 
-* *Note*: On certain hardware revisions of the A20, this command executes cleanly but requires further protocol analysis for cold-reboot persistence.
+* **Hardware Architecture Note**: The Instant Microelectronics A704 / A704F IC physically utilizes **volatile SRAM** for custom user RGB values rather than onboard non-volatile EEPROM/Flash. Command `0x20` successfully commits registers during active runtime, but cold electrical power loss (unplugging the USB cable or PC power-off) resets the MCU to hardcoded ROM/OTP defaults. Multi-port hotplug and reboot persistence is therefore managed seamlessly at the driver level by the Stealth Driver Watcher (`WM_DEVICECHANGE`).
 
 ---
 

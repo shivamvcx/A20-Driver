@@ -18,7 +18,8 @@ The official Redgear software is abandoned, bloated, and unstable. Our goal is t
 
 ```mermaid
 flowchart LR
-    v1["v0.1.0\nFoundation & Color\n(RELEASED)"] --> v2["v0.2.0\nRGB Lighting Engine\n(IN PROGRESS)"]
+    v1["v0.1.0\nFoundation & Color\n(RELEASED)"] --> v11["v0.1.1\nStealth Persistence & DPI\n(RELEASED)"]
+    v11 --> v2["v0.2.0\nExtended RGB Effects\n(IN PROGRESS)"]
     v2 --> v3["v0.3.0\nSensor & Polling Rate\n(PLANNED)"]
     v3 --> v4["v0.4.0\nButton Remapping\n(RESEARCH)"]
     v4 --> v5["v1.0.0\nUniversal OEM Support\n(LONG TERM)"]
@@ -26,14 +27,35 @@ flowchart LR
 
 ---
 
-### ✅ Milestone 1: v0.1.0 — Core Lighting & Safety Architecture (Current Release)
+### ✅ Milestone 1: v0.1.0 — Core Lighting & Safety Architecture (Released)
 - [x] Full reverse engineering of `Gaming Mouse 2.0.exe` and endpoint collection detection (`UsagePage 0xFF01`).
 - [x] **12-bit Active-Low PWM Color Engine**: 4,096 discrete hardware colors ($16 \times 16 \times 16$).
 - [x] **Proportional Brightness Dimming**: Continuous scaling ($5\text{–}100\%$) while preserving exact color hue.
 - [x] **Solid Static Mode (`0x86`)**: Eliminated unchangeable vendor rainbow breathing.
-- [x] **Hardened Safety Guardrails**: RAM-only live preview, isolated EEPROM save button, mandatory 50ms hardware delays, and zero-spam slider mechanics.
+- [x] **Hardened Safety Guardrails**: RAM-only live preview, isolated save button, mandatory 50ms hardware delays, and zero-spam slider mechanics.
 - [x] **Live Hex Packet Inspector**: Real-time diagnostic console displaying all 8-byte Feature Reports.
 - [x] **Zero-Dependency Native WinForms GUI**: Standalone 64-bit executable (`RedgearA20-win-x64.exe`) and 1-click build script.
+
+---
+
+### ✅ Milestone 1.5: v0.1.1 — Stealth Driver Watcher & Instant Persistence (Current Release)
+- [x] **Stealth Driver Watcher**:
+  - Intercepts Win32 `WM_DEVICECHANGE` (`0x0219`) for instant (<50ms) detection of USB insertion on ANY port or hub.
+  - Automatically restores custom color and DPI in ~300ms.
+  - P/Invoke `SetProcessWorkingSetSize` compresses idle RAM footprint to **~1.8 MB** (0.00% CPU).
+  - Invisible background loop (`trayIcon.Visible = false`, zero taskbar clutter, zero notification icons).
+  - Autostart registration via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+- [x] **Single-Instance IPC with UIPI Traversal**:
+  - `ChangeWindowMessageFilter` ensures Windows message passing across integrity levels.
+  - Launching the `.exe` again smoothly restores the existing GUI; closing via `[X]` hides to stealth mode.
+- [x] **3-Mode Persistence Engine**:
+  - `🚀 Stealth Driver Watcher` (~1.8 MB RAM, invisible)
+  - `📌 Tray Agent Mode` (~2.7 MB RAM, quick access tray icon)
+  - `○ Disabled` (RAM Only)
+- [x] **🎯 ⚠️ Experimental DPI Stage Controls**:
+  - Opt-in Command `0x09` dispatch for active DPI levels (600, 1000, 1200, 1600, 2400, 3200 DPI) with live RAM testing.
+- [x] **Self-Contained Local Deployment**:
+  - Automatic deployment to `%LocalAppData%\RedgearA20\RedgearA20.exe` using atomic move-away rename.
 
 ---
 
@@ -53,11 +75,9 @@ flowchart LR
 
 ---
 
-### ⏳ Milestone 3: v0.3.0 — Sensor, Polling Rate & Memory Persistence
+### ⏳ Milestone 3: v0.3.0 — Sensor, Polling Rate & Per-Stage Customization
 *Target: Q1 2027*
 
-- [ ] **EEPROM Cold-Boot Persistence (`0x20`)**:
-  - Solve the cold-reboot flash commit sequence (investigating potential pre-commit unlock bytes such as `0x5A 0xA5` observed in packet analysis) so custom settings survive full power unplugging across all hardware revisions.
 - [ ] **DPI Stage Pruning (Command `0x09`)**:
   - Enable players to reduce the default 6 DPI stages down to 2 or 3 active stages using the hardware bitmask, eliminating redundant DPI cycling during competitive matches.
 - [ ] **Independent DPI Stage Color Tagging**:

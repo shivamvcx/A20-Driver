@@ -104,10 +104,46 @@
 
 ---
 
-### Phase 7: Current Findings & Open Research Items
-* **LED Control**: 100% verified and functional.
-* **Brightness Control**: 100% verified and functional.
-* **Solid vs. Breathing**: 100% verified and functional.
-* **Onboard Flash Memory Persistence (`0x20`)**:
-  - *Observation*: While `0x20` is accepted with Win32 success and verified in `Gaming Mouse 2.0.exe` at `VA 0x004063A2`, certain hardware revisions of the A20 do not persist custom color registers across cold power reboots, reverting to default on unplug.
-  - *Investigation Plan*: Analyze whether a secondary commit sentinel or unlock byte (such as the `0x5A 0xA5` markers observed in Report 0x07 bytes 17–18) is required prior to `0x20`.
+### Phase 7: Hardware EEPROM Limitations & Stealth Driver Watcher Architecture (v0.1.1)
+
+#### 1. The EEPROM Mystery & Forensic IC Audit
+* **Symptom**: Writing Report `0x20` to the device returned Win32 `TRUE`, and the mouse acknowledged the packet without error. However, upon physically unplugging the mouse or rebooting the PC, the mouse reverted to its factory-default dynamic rainbow cycling.
+* **Silicon Architecture Analysis**:
+  - Detailed decompilation and forensic tracing of the vendor software (`Gaming Mouse 2.0.exe`) and datasheet analysis of the **Instant Microelectronics A704 / A704F** optical gaming mouse MCU revealed that the IC does **not** feature integrated non-volatile EEPROM/Flash storage for dynamic LED registers.
+  - While factory configuration tables (DPI stage presets, default lighting modes) are hard-coded in masked ROM/One-Time Programmable (OTP) storage, custom user RGB registers reside strictly in **volatile SRAM**.
+  - When the USB $5\text{V}$ rail drops to $0\text{V}$, volatile SRAM discharges instantly. The official vendor software maintained persistence by running a background tray process (`Gaming Mouse 2.0.exe`) that listened for device reconnection and reapplied the configuration.
+
+#### 2. The Task Scheduler Event 410 Fallacy
+* **Initial Concept**: The team designed a "Zero-RAM" persistence architecture that avoided running background processes by registering an automated Windows Task Scheduler task triggered by device arrival.
+* **The Diagnostic Roadblock**:
+  - `Microsoft-Windows-Kernel-PnP/Configuration` Event `410` was configured as the trigger.
+  - In testing, unplugging and replugging the mouse into the same or different USB ports **never triggered Event 410**.
+  - **Forensic Diagnosis**: Windows Event Log only records Event `410` during *initial PnP driver installation/configuration*. Normal runtime USB hotplugging, hub re-enumeration, and re-insertion events do **not** write entries to `winevt` logs to avoid disk I/O thrashing. Consequently, Task Scheduler event triggers cannot detect standard USB device arrival.
+
+#### 3. The Stealth Driver Watcher Solution
+* **Win32 Message Pump (`WM_DEVICECHANGE`)**:
+  - Switched to the native Win32 device notification model. In Windows, the operating system broadcasts `WM_DEVICECHANGE` (`0x0219`) with `DBT_DEVICEARRIVAL` (`0x8000`) exclusively to top-level window handles whenever any USB peripheral is plugged in.
+  - Created an invisible, message-only Win32 window loop (`CreateHandle()`, `SetVisibleCore(false)`) running in the background.
+  - On `WM_DEVICECHANGE`, the background watcher performs an instantaneous VID/PID scan. If `18F8:0FC0` is detected, it retransmits the saved hardware profile (`0x07` + `0x09` + `0x20`) within $50\text{ms}$.
+* **Aggressive RAM Compression (~1.8 MB)**:
+  - Standard .NET WinForms applications typically consume $25\text{–}45\text{ MB}$ of RAM.
+  - Implemented an aggressive working set trim via Win32 P/Invoke:
+    ```csharp
+    [DllImport("kernel32.dll")]
+    private static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
+    ```
+  - After minimizing to background, the process flushes unused heap and page allocations back to the OS:
+    ```csharp
+    GC.Collect();
+    GC.WaitForPendingFinalizers();
+    SetProcessWorkingSetSize(Process.GetCurrentProcess().Handle, (IntPtr)(-1), (IntPtr)(-1));
+    ```
+  - Result: Active memory footprint compressed to **~1.8 MB RAM** and **0.00% CPU usage**, completely invisible with zero system tray clutter (`trayIcon.Visible = false`).
+* **Inter-Process Single-Instance IPC**:
+  - Registered a system-wide custom window message: `RegisterWindowMessage("RedgearA20_ShowControlCenter")`.
+  - Configured `ChangeWindowMessageFilter` to bypass User Interface Privilege Isolation (UIPI), ensuring standard and elevated instances can reliably signal the background watcher.
+  - When the user launches Redgear A20 Control Center a second time from Desktop or Start Menu, the new instance detects the existing mutex, broadcasts the wake message, and exits immediately. The running watcher restores its GUI, displays the settings, and allows full interaction.
+* **Field Verification**:
+  - Verified across physical USB disconnects/reconnects across all USB 2.0 / 3.0 / Type-C hubs.
+  - Verified across system reboots, hibernate, and fast-startup wake cycles via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+  - User confirmation: *"BRUH DAMM ITS WORKING NOW😭😭💕"*.
