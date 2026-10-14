@@ -853,12 +853,24 @@ namespace RedgearA20ControlCenter
 
             trayMenu.Items.Add(new ToolStripSeparator());
 
-            ToolStripMenuItem miExit = new ToolStripMenuItem("Exit Driver");
+            ToolStripMenuItem miExit = new ToolStripMenuItem("Exit Driver (Stop Persistence)");
             miExit.Click += delegate
             {
-                isExiting = true;
-                if (trayIcon != null) trayIcon.Visible = false;
-                Application.Exit();
+                DialogResult dr = MessageBox.Show(
+                    "⚠️ WARNING: This will completely stop the background driver!\n\n" +
+                    "• Your mouse settings will NOT persist across USB unplugs or PC restarts.\n\n" +
+                    "Are you sure you want to exit and stop persistence?",
+                    "Exit Driver Confirmation",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2
+                );
+                if (dr == DialogResult.Yes)
+                {
+                    isExiting = true;
+                    if (trayIcon != null) trayIcon.Visible = false;
+                    Application.Exit();
+                }
             };
             trayMenu.Items.Add(miExit);
 
@@ -1019,14 +1031,26 @@ namespace RedgearA20ControlCenter
                 FlatStyle = FlatStyle.Flat
             };
             btnExit.FlatAppearance.BorderSize = 0;
+            ToolTip tipExit = new ToolTip();
+            tipExit.SetToolTip(btnExit, "Completely stops the driver and background persistence.\nTo close this window while keeping persistence active, click the [X] button.");
             btnExit.Click += delegate
             {
+                string warningText =
+                    "⚠️ WARNING: This will completely SHUT DOWN Redgear A20 Control Center AND STOP the background persistence watcher!\n\n" +
+                    "• If you terminate the driver, your mouse settings will NOT persist across USB unplugs, port switches, or system reboots.\n\n" +
+                    "💡 RECOMMENDED ACTION:\n" +
+                    "If you only want to close this window and keep auto-apply persistence running silently in the background (~1.8 MB RAM, 0% CPU):\n" +
+                    "👉 Click 'No' and simply close this window using the Windows Close [X] button in the top-right corner.\n\n" +
+                    "Are you sure you want to completely exit and STOP the persistence facility?";
+
                 DialogResult dr = MessageBox.Show(
-                    "Do you want to completely exit Redgear A20 Control Center and stop the background watcher?",
-                    "Exit Confirmation",
+                    warningText,
+                    "⚠️ Stop Driver Persistence & Exit?",
                     MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Question
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2
                 );
+
                 if (dr == DialogResult.Yes)
                 {
                     isExiting = true;
@@ -1878,7 +1902,7 @@ namespace RedgearA20ControlCenter
                           "   • Completely invisible in background (~1.8 MB RAM, 0% CPU).\n" +
                           "   • No taskbar or system tray icons.\n" +
                           "   • Auto-applies your settings on reboot, wake, and USB replug on ANY port.\n\n" +
-                          "You can safely close this window now. Your settings will persist!";
+                          "👉 You can safely close this window now using the Windows Close [X] button. Your settings will persist in the background!";
                 }
                 else if (currentProfile.Mode == PersistenceMode.TrayAgent)
                 {
@@ -1886,7 +1910,7 @@ namespace RedgearA20ControlCenter
                           "✔ Color & Brightness applied to mouse.\n" +
                           (currentProfile.EnableDpi ? string.Format("✔ DPI Stage {0} applied to mouse.\n", currentProfile.ActiveDpiStage) : "") +
                           "✔ Tray Agent Mode active: Redgear A20 Control Center will start in the system tray (~2.7 MB RAM).\n\n" +
-                          "You can minimize or close this window to tray.";
+                          "👉 You can safely close this window using the Windows Close [X] button to minimize to tray.";
                 }
                 else
                 {
