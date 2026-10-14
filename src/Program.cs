@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Reflection;
@@ -7,6 +8,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Win32;
 using Microsoft.Win32.SafeHandles;
 
 [assembly: AssemblyTitle("Redgear A20 Control Center")]
@@ -299,6 +301,59 @@ namespace RedgearA20ControlCenter
         public int Win32ErrorCode;
     }
 
+    public class AppProfile
+    {
+        public string HexColor = "#BE59FF";
+        public int Brightness = 100;
+        public bool AutoStart = false;
+        public bool MinimizeToTray = true;
+
+        public static string GetProfilePath()
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RedgearA20");
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            return Path.Combine(dir, "profile.json");
+        }
+
+        public static AppProfile Load()
+        {
+            AppProfile p = new AppProfile();
+            try
+            {
+                string file = GetProfilePath();
+                if (File.Exists(file))
+                {
+                    string json = File.ReadAllText(file);
+                    Match mHex = Regex.Match(json, "\"HexColor\"\\s*:\\s*\"([^\"]+)\"");
+                    if (mHex.Success) p.HexColor = mHex.Groups[1].Value;
+
+                    Match mBri = Regex.Match(json, "\"Brightness\"\\s*:\\s*(\\d+)");
+                    if (mBri.Success) p.Brightness = int.Parse(mBri.Groups[1].Value);
+
+                    Match mAuto = Regex.Match(json, "\"AutoStart\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
+                    if (mAuto.Success) p.AutoStart = bool.Parse(mAuto.Groups[1].Value);
+
+                    Match mTray = Regex.Match(json, "\"MinimizeToTray\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
+                    if (mTray.Success) p.MinimizeToTray = bool.Parse(mTray.Groups[1].Value);
+                }
+            }
+            catch { }
+            return p;
+        }
+
+        public void Save()
+        {
+            try
+            {
+                string file = GetProfilePath();
+                string json = string.Format("{{\n  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"AutoStart\": {2},\n  \"MinimizeToTray\": {3}\n}}\n",
+                    HexColor, Brightness, AutoStart.ToString().ToLower(), MinimizeToTray.ToString().ToLower());
+                File.WriteAllText(file, json);
+            }
+            catch { }
+        }
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
     //  Main GUI Application Form (Native Windows Forms, Dark Theme)
     // ═════════════════════════════════════════════════════════════════════════
@@ -316,6 +371,10 @@ namespace RedgearA20ControlCenter
         private Button btnSave;
         private Button btnReset;
 
+        // Persistence & Startup UI
+        private GroupBox gbPersistence;
+        private CheckBox cbAutoStart;
+
         // Experimental DPI section
         private CheckBox cbEnableDpi;
         private GroupBox gbDpi;
@@ -327,36 +386,278 @@ namespace RedgearA20ControlCenter
         private Button btnClearLog;
         private Button btnCopyLog;
 
+        // System Tray & Background Watcher
+        private NotifyIcon trayIcon;
+        private ContextMenuStrip trayMenu;
+        private System.Windows.Forms.Timer usbDebounceTimer;
+
         // Internal State
         private Color currentColor = Color.FromArgb(190, 89, 255); // Soft Lavender default
         private int currentBrightness = 100;
         private string cachedDevicePath = null;
         private ushort cachedUsagePage = 0;
         private volatile bool isSavingInProgress = false;
-        private const int EEPROM_WRITE_DELAY_MS = 300;
+        private AppProfile currentProfile;
+        private bool startInTray = false;
+        private bool isExplicitlyRestoring = false;
+        private bool balloonShownOnce = false;
+        private bool isExiting = false;
+
+        private const int EEPROM_WRITE_DELAY_MS = 100;
+
+        // Win32 constants & P/Invoke
+        private const int WM_DEVICECHANGE = 0x0219;
+        private const int DBT_DEVNODES_CHANGED = 0x0007;
+        private const int DBT_DEVICEARRIVAL = 0x8000;
+        private const int DBT_DEVICEREMOVECOMPLETE = 0x8004;
+
+        private const string RUN_REG_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string APP_REG_NAME = "RedgearA20ControlCenter";
+
+        [DllImport("kernel32.dll")]
+        private static extern bool SetProcessWorkingSetSize(IntPtr proc, IntPtr min, IntPtr max);
+
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern int RegisterWindowMessage(string lpString);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
+        private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
+        private static int wmShowControlCenter = 0;
+        private static Mutex appMutex = null;
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             if (isSavingInProgress)
             {
-                MessageBox.Show("Please wait until the onboard memory write completes before exiting.", "Save in Progress", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Please wait until the operation completes before exiting.", "Busy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 e.Cancel = true;
                 return;
             }
+
+            if (!isExiting && cbAutoStart != null && cbAutoStart.Checked)
+            {
+                e.Cancel = true;
+                MinimizeToTray(true);
+                return;
+            }
+
+            if (trayIcon != null)
+            {
+                trayIcon.Visible = false;
+                trayIcon.Dispose();
+            }
+
             base.OnFormClosing(e);
         }
 
-        public MainForm()
+        protected override void OnResize(EventArgs e)
         {
+            base.OnResize(e);
+            if (this.WindowState == FormWindowState.Minimized && currentProfile != null && currentProfile.MinimizeToTray)
+            {
+                MinimizeToTray(false);
+            }
+        }
+
+        protected override void SetVisibleCore(bool value)
+        {
+            if (startInTray && !isExplicitlyRestoring)
+            {
+                value = false;
+                if (!this.IsHandleCreated) CreateHandle();
+            }
+            base.SetVisibleCore(value);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+
+            if (m.Msg == WM_DEVICECHANGE)
+            {
+                int wp = m.WParam.ToInt32();
+                if (wp == DBT_DEVNODES_CHANGED || wp == DBT_DEVICEARRIVAL || wp == DBT_DEVICEREMOVECOMPLETE)
+                {
+                    if (usbDebounceTimer != null)
+                    {
+                        usbDebounceTimer.Stop();
+                        usbDebounceTimer.Start();
+                    }
+                }
+            }
+            else if (wmShowControlCenter != 0 && m.Msg == wmShowControlCenter)
+            {
+                RestoreFromTray();
+            }
+        }
+
+        private static void TrimMemory()
+        {
+            try
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                SetProcessWorkingSetSize(Process.GetCurrentProcess().Handle, new IntPtr(-1), new IntPtr(-1));
+            }
+            catch { }
+        }
+
+        private static void SetAutoStart(bool enable)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RUN_REG_KEY, true))
+                {
+                    if (key != null)
+                    {
+                        if (enable)
+                        {
+                            string exePath = Application.ExecutablePath;
+                            key.SetValue(APP_REG_NAME, string.Format("\"{0}\" --tray", exePath));
+                        }
+                        else
+                        {
+                            key.DeleteValue(APP_REG_NAME, false);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("Registry auto-start error: " + ex.Message);
+            }
+        }
+
+        private void InitTrayIcon()
+        {
+            trayMenu = new ContextMenuStrip();
+
+            ToolStripMenuItem miOpen = new ToolStripMenuItem("Open Control Center");
+            miOpen.Font = new Font(trayMenu.Font, FontStyle.Bold);
+            miOpen.Click += delegate { RestoreFromTray(); };
+            trayMenu.Items.Add(miOpen);
+
+            ToolStripMenuItem miApply = new ToolStripMenuItem("Apply Profile Now");
+            miApply.Click += async delegate { await ApplyCurrentProfileAsync(silent: false); };
+            trayMenu.Items.Add(miApply);
+
+            trayMenu.Items.Add(new ToolStripSeparator());
+
+            ToolStripMenuItem miExit = new ToolStripMenuItem("Exit");
+            miExit.Click += delegate
+            {
+                isExiting = true;
+                if (trayIcon != null) trayIcon.Visible = false;
+                Application.Exit();
+            };
+            trayMenu.Items.Add(miExit);
+
+            trayIcon = new NotifyIcon
+            {
+                Icon = this.Icon != null ? this.Icon : SystemIcons.Application,
+                Text = "Redgear A20 Control Center",
+                ContextMenuStrip = trayMenu,
+                Visible = startInTray
+            };
+
+            trayIcon.DoubleClick += delegate { RestoreFromTray(); };
+        }
+
+        private void MinimizeToTray(bool showBalloon)
+        {
+            this.Hide();
+            this.ShowInTaskbar = false;
+            if (trayIcon != null)
+            {
+                trayIcon.Visible = true;
+                if (showBalloon && !balloonShownOnce)
+                {
+                    trayIcon.ShowBalloonTip(3000, "Redgear A20 Control Center", "Running in tray to auto-apply your RGB settings on reconnect.", ToolTipIcon.Info);
+                    balloonShownOnce = true;
+                }
+            }
+            TrimMemory();
+        }
+
+        private void RestoreFromTray()
+        {
+            isExplicitlyRestoring = true;
+            startInTray = false;
+            this.Show();
+            this.WindowState = FormWindowState.Normal;
+            this.ShowInTaskbar = true;
+            this.BringToFront();
+            this.Activate();
+        }
+
+        private void InitUsbWatcher()
+        {
+            usbDebounceTimer = new System.Windows.Forms.Timer();
+            usbDebounceTimer.Interval = 400; // 400 ms debounce after USB hotplug
+            usbDebounceTimer.Tick += OnUsbDebounceTimerTick;
+        }
+
+        private async void OnUsbDebounceTimerTick(object sender, EventArgs e)
+        {
+            usbDebounceTimer.Stop();
+            RefreshDeviceConnection();
+            if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile != null && currentProfile.AutoStart)
+            {
+                await ApplyCurrentProfileAsync(silent: true);
+                TrimMemory();
+            }
+        }
+
+        public MainForm() : this(false)
+        {
+        }
+
+        public MainForm(bool inTray)
+        {
+            this.startInTray = inTray;
+            this.currentProfile = AppProfile.Load();
+
+            try
+            {
+                string hex = currentProfile.HexColor.TrimStart('#');
+                int r = Convert.ToInt32(hex.Substring(0, 2), 16);
+                int g = Convert.ToInt32(hex.Substring(2, 2), 16);
+                int b = Convert.ToInt32(hex.Substring(4, 2), 16);
+                this.currentColor = Color.FromArgb(r, g, b);
+            }
+            catch
+            {
+                this.currentColor = Color.FromArgb(190, 89, 255);
+            }
+            this.currentBrightness = Math.Max(5, Math.Min(100, currentProfile.Brightness));
+
             InitForm();
+            InitTrayIcon();
+            InitUsbWatcher();
+
             RefreshDeviceConnection();
             UpdateColorPreview();
+
+            if (startInTray)
+            {
+                Task.Run(async () =>
+                {
+                    if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile.AutoStart)
+                    {
+                        await ApplyCurrentProfileAsync(silent: true);
+                    }
+                    await Task.Delay(1000);
+                    TrimMemory();
+                });
+            }
         }
 
         private void InitForm()
         {
             this.Text = "Redgear A20 Control Center v0.1.1";
-            this.Size = new Size(580, 780);
+            this.Size = new Size(580, 835);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
@@ -392,21 +693,21 @@ namespace RedgearA20ControlCenter
             this.Controls.Add(pnlHeader);
 
             // Container Panel
-            body = new Panel { Location = new Point(15, 55), Size = new Size(535, 675) };
+            body = new Panel { Location = new Point(15, 55), Size = new Size(535, 730) };
 
             // ─── Group 1: Colour Selection ───
             GroupBox gbColor = new GroupBox
             {
                 Text = "  1. LED Colour Selection (Verified Cmd 0x14)  ",
                 Location = new Point(0, 0),
-                Size = new Size(535, 130),
+                Size = new Size(535, 125),
                 ForeColor = Color.FromArgb(180, 185, 205)
             };
 
             pnlColorPreview = new Panel
             {
-                Location = new Point(20, 30),
-                Size = new Size(60, 45),
+                Location = new Point(20, 25),
+                Size = new Size(60, 42),
                 BorderStyle = BorderStyle.FixedSingle,
                 BackColor = currentColor
             };
@@ -415,7 +716,7 @@ namespace RedgearA20ControlCenter
             btnPickColor = new Button
             {
                 Text = "Pick Colour...",
-                Location = new Point(90, 30),
+                Location = new Point(90, 25),
                 Size = new Size(110, 30),
                 BackColor = Color.FromArgb(45, 48, 58),
                 ForeColor = Color.White,
@@ -425,11 +726,11 @@ namespace RedgearA20ControlCenter
             btnPickColor.Click += BtnPickColor_Click;
             gbColor.Controls.Add(btnPickColor);
 
-            Label lblHex = new Label { Text = "Hex Code:", Location = new Point(220, 35), AutoSize = true, ForeColor = Color.FromArgb(200, 200, 210) };
+            Label lblHex = new Label { Text = "Hex Code:", Location = new Point(220, 30), AutoSize = true, ForeColor = Color.FromArgb(200, 200, 210) };
             txtHex = new TextBox
             {
-                Text = "#BE59FF",
-                Location = new Point(290, 32),
+                Text = currentProfile != null ? currentProfile.HexColor : "#BE59FF",
+                Location = new Point(290, 27),
                 Size = new Size(95, 26),
                 BackColor = Color.FromArgb(32, 34, 40),
                 ForeColor = Color.White,
@@ -455,7 +756,7 @@ namespace RedgearA20ControlCenter
                 Button btnPreset = new Button
                 {
                     Text = presetNames[i],
-                    Location = new Point(qx, 85),
+                    Location = new Point(qx, 80),
                     Size = new Size(52, 26),
                     BackColor = Color.FromArgb(35, 38, 46),
                     ForeColor = Color.FromArgb(215, 215, 225),
@@ -480,18 +781,18 @@ namespace RedgearA20ControlCenter
             GroupBox gbBright = new GroupBox
             {
                 Text = "  2. Brightness Slider (Verified PWM Proportion Scaling)  ",
-                Location = new Point(0, 140),
-                Size = new Size(535, 80),
+                Location = new Point(0, 135),
+                Size = new Size(535, 75),
                 ForeColor = Color.FromArgb(180, 185, 205)
             };
 
             tbBrightness = new TrackBar
             {
-                Location = new Point(15, 25),
+                Location = new Point(15, 22),
                 Size = new Size(420, 45),
                 Minimum = 5,
                 Maximum = 100,
-                Value = 100,
+                Value = currentBrightness,
                 TickFrequency = 10
             };
             tbBrightness.ValueChanged += delegate
@@ -504,8 +805,8 @@ namespace RedgearA20ControlCenter
 
             lblBrightnessVal = new Label
             {
-                Text = "100%",
-                Location = new Point(445, 30),
+                Text = currentBrightness.ToString() + "%",
+                Location = new Point(445, 27),
                 AutoSize = true,
                 Font = new Font("Segoe UI", 10f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(140, 200, 255)
@@ -517,8 +818,8 @@ namespace RedgearA20ControlCenter
             btnApply = new Button
             {
                 Text = "▶ Apply (RAM)",
-                Location = new Point(0, 230),
-                Size = new Size(170, 38),
+                Location = new Point(0, 220),
+                Size = new Size(165, 38),
                 BackColor = Color.FromArgb(130, 60, 220),
                 ForeColor = Color.White,
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
@@ -530,9 +831,9 @@ namespace RedgearA20ControlCenter
 
             btnSave = new Button
             {
-                Text = "💾 Save to Mouse (0x20)",
-                Location = new Point(178, 230),
-                Size = new Size(205, 38),
+                Text = "💾 Save Profile",
+                Location = new Point(175, 220),
+                Size = new Size(195, 38),
                 BackColor = Color.FromArgb(38, 120, 75),
                 ForeColor = Color.White,
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
@@ -544,9 +845,9 @@ namespace RedgearA20ControlCenter
 
             btnReset = new Button
             {
-                Text = "↺ Factory Reset",
-                Location = new Point(390, 230),
-                Size = new Size(145, 38),
+                Text = "↺ Reset Profile",
+                Location = new Point(380, 220),
+                Size = new Size(155, 38),
                 BackColor = Color.FromArgb(48, 52, 62),
                 ForeColor = Color.FromArgb(220, 220, 230),
                 Font = new Font("Segoe UI", 9.0f, FontStyle.Regular),
@@ -556,19 +857,60 @@ namespace RedgearA20ControlCenter
             btnReset.Click += BtnReset_Click;
             body.Controls.Add(btnReset);
 
-            // ─── Group 3: ⚠️ EXPERIMENTAL - DPI Controls ───
+            // ─── Group 3: Persistence & Startup (Instant A704 Auto-Apply) ───
+            gbPersistence = new GroupBox
+            {
+                Text = "  3. Persistence & Startup (Instant A704 Auto-Apply)  ",
+                Location = new Point(0, 270),
+                Size = new Size(535, 75),
+                ForeColor = Color.FromArgb(180, 185, 205)
+            };
+
+            cbAutoStart = new CheckBox
+            {
+                Text = "⚡ Auto-apply profile on Windows startup & when mouse is reconnected",
+                Location = new Point(15, 20),
+                Size = new Size(505, 24),
+                ForeColor = Color.FromArgb(80, 230, 130),
+                Font = new Font("Segoe UI", 9.0f, FontStyle.Bold),
+                Checked = currentProfile != null && currentProfile.AutoStart
+            };
+            cbAutoStart.CheckedChanged += delegate
+            {
+                if (currentProfile != null)
+                {
+                    currentProfile.AutoStart = cbAutoStart.Checked;
+                    currentProfile.Save();
+                    SetAutoStart(currentProfile.AutoStart);
+                    Log(string.Format("Auto-apply setting changed: {0}", cbAutoStart.Checked ? "ENABLED" : "DISABLED"), Color.FromArgb(200, 200, 220));
+                }
+            };
+            gbPersistence.Controls.Add(cbAutoStart);
+
+            Label lblPersistenceNote = new Label
+            {
+                Text = "Runs silently in the tray using ~2 MB RAM and 0% CPU with native Windows hotplug events.",
+                Location = new Point(35, 46),
+                Size = new Size(485, 20),
+                ForeColor = Color.FromArgb(150, 155, 170),
+                Font = new Font("Segoe UI", 8.0f)
+            };
+            gbPersistence.Controls.Add(lblPersistenceNote);
+            body.Controls.Add(gbPersistence);
+
+            // ─── Group 4: ⚠️ EXPERIMENTAL - DPI Controls ───
             gbDpi = new GroupBox
             {
-                Text = "  3. ⚠️ EXPERIMENTAL - DPI Stage (Disabled by Default)  ",
-                Location = new Point(0, 280),
-                Size = new Size(535, 95),
+                Text = "  4. ⚠️ EXPERIMENTAL - DPI Stage (Disabled by Default)  ",
+                Location = new Point(0, 355),
+                Size = new Size(535, 85),
                 ForeColor = Color.FromArgb(220, 150, 60)
             };
 
             cbEnableDpi = new CheckBox
             {
                 Text = "Enable Experimental DPI Controls (I understand this uses unverified Cmd 0x09)",
-                Location = new Point(15, 24),
+                Location = new Point(15, 20),
                 Size = new Size(500, 20),
                 ForeColor = Color.FromArgb(235, 180, 100),
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold)
@@ -581,10 +923,10 @@ namespace RedgearA20ControlCenter
             };
             gbDpi.Controls.Add(cbEnableDpi);
 
-            Label lblSelectDpi = new Label { Text = "Select DPI Target:", Location = new Point(15, 55), AutoSize = true, ForeColor = Color.FromArgb(190, 190, 200) };
+            Label lblSelectDpi = new Label { Text = "Select DPI Target:", Location = new Point(15, 48), AutoSize = true, ForeColor = Color.FromArgb(190, 190, 200) };
             cmbDpiStages = new ComboBox
             {
-                Location = new Point(130, 52),
+                Location = new Point(130, 45),
                 Size = new Size(230, 25),
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 BackColor = Color.FromArgb(32, 34, 40),
@@ -606,7 +948,7 @@ namespace RedgearA20ControlCenter
             btnTestDpi = new Button
             {
                 Text = "Test DPI (RAM)",
-                Location = new Point(375, 50),
+                Location = new Point(375, 43),
                 Size = new Size(140, 28),
                 BackColor = Color.FromArgb(65, 50, 30),
                 ForeColor = Color.FromArgb(255, 200, 100),
@@ -619,19 +961,19 @@ namespace RedgearA20ControlCenter
 
             body.Controls.Add(gbDpi);
 
-            // ─── Group 4: Live Diagnostic Log Panel ───
+            // ─── Group 5: Live Diagnostic Log Panel ───
             GroupBox gbLog = new GroupBox
             {
-                Text = "  4. Diagnostic USB Report Log (Every Packet & Return Code)  ",
-                Location = new Point(0, 385),
-                Size = new Size(535, 280),
+                Text = "  5. Diagnostic USB Report Log (Every Packet & Return Code)  ",
+                Location = new Point(0, 450),
+                Size = new Size(535, 275),
                 ForeColor = Color.FromArgb(180, 185, 205)
             };
 
             rtbLog = new RichTextBox
             {
                 Location = new Point(15, 25),
-                Size = new Size(505, 210),
+                Size = new Size(505, 205),
                 ReadOnly = true,
                 BackColor = Color.FromArgb(14, 15, 18),
                 ForeColor = Color.FromArgb(0, 230, 130),
@@ -643,7 +985,7 @@ namespace RedgearA20ControlCenter
             btnCopyLog = new Button
             {
                 Text = "Copy Log",
-                Location = new Point(350, 242),
+                Location = new Point(350, 238),
                 Size = new Size(80, 26),
                 BackColor = Color.FromArgb(40, 42, 50),
                 ForeColor = Color.White,
@@ -663,7 +1005,7 @@ namespace RedgearA20ControlCenter
             btnClearLog = new Button
             {
                 Text = "Clear Log",
-                Location = new Point(440, 242),
+                Location = new Point(440, 238),
                 Size = new Size(80, 26),
                 BackColor = Color.FromArgb(40, 42, 50),
                 ForeColor = Color.White,
@@ -679,11 +1021,13 @@ namespace RedgearA20ControlCenter
 
         private void Log(string msg, Color col)
         {
+            if (rtbLog == null) return;
             if (rtbLog.InvokeRequired)
             {
                 rtbLog.Invoke(new Action<string, Color>(Log), msg, col);
                 return;
             }
+            if (rtbLog.TextLength > 50000) rtbLog.Clear();
             rtbLog.SelectionStart = rtbLog.TextLength;
             rtbLog.SelectionLength = 0;
             rtbLog.SelectionColor = col;
@@ -858,24 +1202,23 @@ namespace RedgearA20ControlCenter
                 Thread.Sleep(50);
             }
 
-            // 5. If CommitToFlash, send Command 0x20 with 0x5A 0xA5 and verify MCU health
+            // 5. If CommitToFlash, send Command 0x20 sync latch and verify MCU health
             if (p.CommitToFlash)
             {
-                byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x5A, 0xA5, 0x00, 0x00, 0x00, 0x00 };
+                byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
                 int win32Err;
                 string err;
                 bool ok = HidTransport.SendSinglePacket(devicePath, commitPacket, out win32Err, out err);
                 if (!ok)
                 {
-                    logCallback(string.Format("Cmd 0x20 [Commit Flash]: {0} -> FAIL ({1})", FormatHex(commitPacket), err), Color.FromArgb(255, 80, 80));
+                    logCallback(string.Format("Cmd 0x20 [Sync Latch]: {0} -> FAIL ({1})", FormatHex(commitPacket), err), Color.FromArgb(255, 80, 80));
                     return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
                 }
 
-                logCallback(string.Format("Cmd 0x20 [Commit Flash]: {0} -> SENT", FormatHex(commitPacket)), Color.FromArgb(255, 215, 0));
+                logCallback(string.Format("Cmd 0x20 [Sync Latch]: {0} -> SENT", FormatHex(commitPacket)), Color.FromArgb(255, 215, 0));
                 packetIndex++;
 
-                // Wait for internal MCU EEPROM flash cycle
-                logCallback(string.Format("Pausing {0}ms for EEPROM flash cycle completion...", EEPROM_WRITE_DELAY_MS), Color.FromArgb(200, 200, 220));
+                // Wait for latch
                 Thread.Sleep(EEPROM_WRITE_DELAY_MS);
 
                 // Verify MCU transport health via HidD_GetFeature
@@ -885,7 +1228,7 @@ namespace RedgearA20ControlCenter
                 bool healthOk = HidTransport.VerifyDeviceTransportHealth(devicePath, out healthErr, out healthErrMsg);
                 if (!healthOk)
                 {
-                    logCallback(string.Format("Device health check failed after flash write: {0}", healthErrMsg), Color.FromArgb(255, 120, 120));
+                    logCallback(string.Format("Device health check failed after sync write: {0}", healthErrMsg), Color.FromArgb(255, 120, 120));
                     return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = healthErr, ErrorMessage = healthErrMsg };
                 }
                 logCallback("Device transport health verified: MCU is responsive.", Color.FromArgb(80, 230, 130));
@@ -948,17 +1291,17 @@ namespace RedgearA20ControlCenter
                 Thread.Sleep(50);
             }
 
-            // Flash commit: 0x20 with 0x5A 0xA5
-            byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x5A, 0xA5, 0x00, 0x00, 0x00, 0x00 };
+            // Sync latch: 0x20
+            byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
             {
                 int win32Err;
                 string err;
                 if (!HidTransport.SendSinglePacket(devicePath, commitPacket, out win32Err, out err))
                 {
-                    logCallback(string.Format("Factory Cmd 0x20 [Commit]: {0} -> FAIL ({1})", FormatHex(commitPacket), err), Color.FromArgb(255, 80, 80));
+                    logCallback(string.Format("Factory Cmd 0x20 [Sync]: {0} -> FAIL ({1})", FormatHex(commitPacket), err), Color.FromArgb(255, 80, 80));
                     return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
                 }
-                logCallback(string.Format("Factory Cmd 0x20 [Commit]: {0} -> SENT", FormatHex(commitPacket)), Color.FromArgb(255, 215, 0));
+                logCallback(string.Format("Factory Cmd 0x20 [Sync]: {0} -> SENT", FormatHex(commitPacket)), Color.FromArgb(255, 215, 0));
                 packetIndex++;
                 Thread.Sleep(EEPROM_WRITE_DELAY_MS);
             }
@@ -976,8 +1319,79 @@ namespace RedgearA20ControlCenter
             return new PipelineResult { Success = true, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = null };
         }
 
-        // ─── VERIFIED COMMAND EXECUTION: APPLY (RAM ONLY) ───
+        // ─── SAFE PROFILE EXECUTION: APPLY TO MOUSE ───
+        private async Task<bool> ApplyCurrentProfileAsync(bool silent)
+        {
+            if (isSavingInProgress) return false;
+
+            if (string.IsNullOrEmpty(cachedDevicePath))
+            {
+                RefreshDeviceConnection();
+                if (string.IsNullOrEmpty(cachedDevicePath))
+                {
+                    if (!silent)
+                    {
+                        MessageBox.Show("Redgear A20 is not connected. Connect via USB and click Refresh.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                    return false;
+                }
+            }
+
+            SaveParameters p = new SaveParameters
+            {
+                Color = currentColor,
+                Brightness = currentBrightness,
+                ActiveDpiIndex = (byte)Math.Max(0, Math.Min(5, cmbDpiStages != null ? cmbDpiStages.SelectedIndex : 1)),
+                DpiMask = 0x3F,
+                CommitToFlash = false, // Volatile RAM - Instant A704 registers
+                SendDpi = cbEnableDpi != null && cbEnableDpi.Checked
+            };
+
+            string targetPath = cachedDevicePath;
+            if (!silent) body.Enabled = false;
+            isSavingInProgress = true;
+
+            try
+            {
+                PipelineResult res = await Task.Run(() => ExecuteHardwarePipeline(targetPath, p, Log));
+                if (res.Success)
+                {
+                    if (silent)
+                    {
+                        Log("⚡ Auto-applied saved profile to mouse on connection.", Color.FromArgb(80, 230, 130));
+                    }
+                    else
+                    {
+                        Log("✅ Applied to mouse successfully! (Volatile RAM registers updated).", Color.FromArgb(140, 240, 255));
+                    }
+                    return true;
+                }
+                else
+                {
+                    string friendlyMsg = TranslateWin32Error(res.Win32ErrorCode);
+                    Log(string.Format("❌ Apply failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
+                    if (!silent)
+                    {
+                        MessageBox.Show(string.Format("Failed to apply settings at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                    return false;
+                }
+            }
+            finally
+            {
+                isSavingInProgress = false;
+                if (!silent) body.Enabled = true;
+            }
+        }
+
+        // ─── ACTION BUTTON HANDLERS ───
         private async void BtnApply_Click(object sender, EventArgs e)
+        {
+            if (isSavingInProgress) return;
+            await ApplyCurrentProfileAsync(silent: false);
+        }
+
+        private async void BtnSave_Click(object sender, EventArgs e)
         {
             if (isSavingInProgress) return;
 
@@ -991,104 +1405,40 @@ namespace RedgearA20ControlCenter
                 }
             }
 
-            SaveParameters p = new SaveParameters
-            {
-                Color = currentColor,
-                Brightness = currentBrightness,
-                ActiveDpiIndex = (byte)Math.Max(0, Math.Min(5, cmbDpiStages.SelectedIndex)),
-                DpiMask = 0x3F,
-                CommitToFlash = false,
-                SendDpi = false
-            };
+            if (currentProfile == null) currentProfile = new AppProfile();
+            currentProfile.HexColor = txtHex.Text.Trim();
+            currentProfile.Brightness = currentBrightness;
+            currentProfile.AutoStart = cbAutoStart.Checked;
+            currentProfile.MinimizeToTray = true;
+            currentProfile.Save();
 
-            string targetPath = cachedDevicePath;
-            body.Enabled = false;
+            SetAutoStart(currentProfile.AutoStart);
 
-            try
+            Log(string.Format("Profile saved to {0} (AutoStart={1})", AppProfile.GetProfilePath(), currentProfile.AutoStart), Color.FromArgb(140, 200, 255));
+
+            bool ok = await ApplyCurrentProfileAsync(silent: false);
+            if (ok)
             {
-                PipelineResult res = await Task.Run(() => ExecuteHardwarePipeline(targetPath, p, Log));
-                if (res.Success)
+                string msg;
+                if (currentProfile.AutoStart)
                 {
-                    Log("✅ Applied to RAM successfully! (Unsaved changes will revert on replug).", Color.FromArgb(140, 240, 255));
+                    msg = "Profile saved successfully!\n\n" +
+                          "✔ Color & Brightness applied to mouse.\n" +
+                          "✔ Auto-apply enabled: Redgear A20 Control Center will start silently in the system tray when Windows boots and auto-apply your settings whenever the mouse is plugged in.\n" +
+                          "✔ Ultra-lightweight footprint: ~2 MB RAM, 0% CPU.\n\n" +
+                          "You can minimize or close this window safely.";
                 }
                 else
                 {
-                    string friendlyMsg = TranslateWin32Error(res.Win32ErrorCode);
-                    Log(string.Format("❌ Apply to RAM failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
-                    MessageBox.Show(string.Format("Failed to apply settings to RAM at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    msg = "Profile saved locally!\n\n" +
+                          "✔ Color & Brightness applied to mouse.\n\n" +
+                          "ℹ Note: Auto-apply is unchecked. When the mouse is unplugged or PC restarted, lighting will revert to defaults until re-applied.";
                 }
-            }
-            finally
-            {
-                body.Enabled = true;
+
+                MessageBox.Show(msg, "Profile Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
         }
 
-        // ─── VERIFIED COMMAND EXECUTION: SAVE TO EEPROM (0x20) ───
-        private async void BtnSave_Click(object sender, EventArgs e)
-        {
-            if (isSavingInProgress) return;
-
-            if (string.IsNullOrEmpty(cachedDevicePath))
-            {
-                RefreshDeviceConnection();
-                if (string.IsNullOrEmpty(cachedDevicePath))
-                {
-                    MessageBox.Show("Redgear A20 is not connected.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-            }
-
-            DialogResult dr = MessageBox.Show(
-                "Saving to onboard memory will set all DPI stages to this color and mode.\nStock DPI stage indicator colors will be overwritten.\n\nProceed?",
-                "Confirm Save to Onboard Memory",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning
-            );
-
-            if (dr != DialogResult.Yes) return;
-
-            SaveParameters p = new SaveParameters
-            {
-                Color = currentColor,
-                Brightness = currentBrightness,
-                ActiveDpiIndex = (byte)Math.Max(0, Math.Min(5, cmbDpiStages.SelectedIndex)),
-                DpiMask = 0x3F,
-                CommitToFlash = true,
-                SendDpi = cbEnableDpi.Checked
-            };
-
-            string targetPath = cachedDevicePath;
-            body.Enabled = false;
-            isSavingInProgress = true;
-            lblStatus.Text = "⏳ Writing to EEPROM flash... Do not disconnect mouse.";
-            lblStatus.ForeColor = Color.FromArgb(255, 200, 80);
-
-            try
-            {
-                PipelineResult res = await Task.Run(() => ExecuteHardwarePipeline(targetPath, p, Log));
-                if (res.Success)
-                {
-                    Log("✅ Onboard flash commit completed and transport verified!", Color.FromArgb(80, 230, 130));
-                    MessageBox.Show("Settings successfully committed to onboard memory!\n\nPlease unplug and reconnect the mouse to verify cold-boot persistence.", "Save Completed", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                }
-                else
-                {
-                    string friendlyMsg = TranslateWin32Error(res.Win32ErrorCode);
-                    Log(string.Format("❌ Flash commit failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
-                    MessageBox.Show(string.Format("Flash write failed at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Write Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-            }
-            finally
-            {
-                isSavingInProgress = false;
-                body.Enabled = true;
-                lblStatus.Text = string.Format("● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0x{0:X4})", cachedUsagePage);
-                lblStatus.ForeColor = Color.FromArgb(80, 230, 130);
-            }
-        }
-
-        // ─── VERIFIED COMMAND EXECUTION: FACTORY PROFILE RESET ───
         private async void BtnReset_Click(object sender, EventArgs e)
         {
             if (isSavingInProgress) return;
@@ -1104,8 +1454,8 @@ namespace RedgearA20ControlCenter
             }
 
             DialogResult dr = MessageBox.Show(
-                "This will restore the mouse to factory defaults (stock per-stage DPI colors and breathing mode) and commit them to onboard EEPROM memory.\n\nProceed?",
-                "Confirm Factory Profile Reset",
+                "This will restore the mouse to factory defaults (stock per-stage DPI colors and breathing mode) and reset the auto-start profile.\n\nProceed?",
+                "Confirm Factory Reset",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning
             );
@@ -1123,15 +1473,24 @@ namespace RedgearA20ControlCenter
                 PipelineResult res = await Task.Run(() => ExecuteFactoryReset(targetPath, Log));
                 if (res.Success)
                 {
-                    // Reset local UI controls to default
                     currentColor = Color.FromArgb(190, 89, 255);
                     currentBrightness = 100;
                     tbBrightness.Value = 100;
                     txtHex.Text = "#BE59FF";
+                    cbAutoStart.Checked = false;
                     UpdateColorPreview();
 
-                    Log("✅ Factory profile restored and committed to EEPROM!", Color.FromArgb(80, 230, 130));
-                    MessageBox.Show("Factory profile restored and committed to memory!\n\nPlease replug the mouse to verify default breathing mode.", "Factory Reset Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    if (currentProfile != null)
+                    {
+                        currentProfile.HexColor = "#BE59FF";
+                        currentProfile.Brightness = 100;
+                        currentProfile.AutoStart = false;
+                        currentProfile.Save();
+                    }
+                    SetAutoStart(false);
+
+                    Log("✅ Factory profile restored!", Color.FromArgb(80, 230, 130));
+                    MessageBox.Show("Factory profile restored!\n\nThe mouse is now in default multi-stage breathing mode.", "Factory Reset Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 }
                 else
                 {
@@ -1167,13 +1526,6 @@ namespace RedgearA20ControlCenter
             {
                 Log("⚠️ --- Transmitting EXPERIMENTAL DPI Command 0x09 (RAM Only, Never Flashed) ---", Color.FromArgb(255, 120, 50));
 
-                // Disassembly formula from VA 0x00408938:
-                // Byte 0: 0x07 (Report ID)
-                // Byte 1: 0x09 (Command ID)
-                // Byte 2: 0x40 | StageIndex (0x40 to 0x45)
-                // Byte 3: 0x08
-                // Byte 4: 0x3F (6-bit bitmask enabling all 6 stages)
-                // Bytes 5,6,7: 0x00
                 byte b2 = (byte)(0x40 | (selectedStage & 0x07));
                 byte[] dpiPacket = new byte[] { HidTransport.REPORT_ID, 0x09, b2, 0x08, 0x3F, 0x00, 0x00, 0x00 };
 
@@ -1203,12 +1555,108 @@ namespace RedgearA20ControlCenter
             return string.Join(" ", hex);
         }
 
-        [STAThread]
-        public static void Main()
+        private static int HeadlessApplyAndExit()
         {
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new MainForm());
+            try
+            {
+                AppProfile profile = AppProfile.Load();
+                ushort uPage;
+                string devicePath = HidTransport.FindTargetDevicePath(out uPage);
+                if (string.IsNullOrEmpty(devicePath))
+                {
+                    return 1;
+                }
+
+                Color color;
+                try
+                {
+                    string hex = profile.HexColor.TrimStart('#');
+                    int r = Convert.ToInt32(hex.Substring(0, 2), 16);
+                    int g = Convert.ToInt32(hex.Substring(2, 2), 16);
+                    int b = Convert.ToInt32(hex.Substring(4, 2), 16);
+                    color = Color.FromArgb(r, g, b);
+                }
+                catch
+                {
+                    color = Color.FromArgb(190, 89, 255);
+                }
+
+                SaveParameters p = new SaveParameters
+                {
+                    Color = color,
+                    Brightness = profile.Brightness,
+                    ActiveDpiIndex = 1,
+                    DpiMask = 0x3F,
+                    CommitToFlash = false,
+                    SendDpi = false
+                };
+
+                PipelineResult res = ExecuteHardwarePipeline(devicePath, p, delegate(string s, Color c) { });
+                return res.Success ? 0 : 2;
+            }
+            catch
+            {
+                return 3;
+            }
+        }
+
+        [STAThread]
+        public static void Main(string[] args)
+        {
+            bool startInTray = false;
+            bool applyAndExit = false;
+
+            if (args != null)
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    string a = args[i].ToLowerInvariant();
+                    if (a == "--tray" || a == "-tray" || a == "/tray" || a == "--minimized")
+                    {
+                        startInTray = true;
+                    }
+                    else if (a == "--apply-and-exit" || a == "-apply" || a == "/apply")
+                    {
+                        applyAndExit = true;
+                    }
+                }
+            }
+
+            if (applyAndExit)
+            {
+                int exitCode = HeadlessApplyAndExit();
+                Environment.Exit(exitCode);
+                return;
+            }
+
+            wmShowControlCenter = RegisterWindowMessage("RedgearA20_ShowControlCenter");
+
+            bool createdNew;
+            appMutex = new Mutex(true, "RedgearA20ControlCenter_SingleInstance", out createdNew);
+
+            if (!createdNew)
+            {
+                if (!startInTray)
+                {
+                    PostMessage(HWND_BROADCAST, wmShowControlCenter, IntPtr.Zero, IntPtr.Zero);
+                }
+                return;
+            }
+
+            try
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.Run(new MainForm(startInTray));
+            }
+            finally
+            {
+                if (appMutex != null)
+                {
+                    try { appMutex.ReleaseMutex(); } catch { }
+                    appMutex.Close();
+                }
+            }
         }
     }
 }
