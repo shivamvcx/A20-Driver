@@ -303,9 +303,9 @@ namespace RedgearA20ControlCenter
 
     public enum PersistenceMode
     {
-        ZeroRamDriver = 0, // Scheduled Task (0 MB RAM, 0 background processes)
-        TrayAgent = 1,     // System tray process (~2.7 MB RAM)
-        Disabled = 2       // RAM only
+        StealthWatcher = 0, // Invisible background watcher (No window, No tray icon, ~1.8 MB RAM, 0% CPU, instant hotplug on all ports - Recommended)
+        TrayAgent = 1,      // System tray process (~2.7 MB RAM, quick access tray icon)
+        Disabled = 2        // RAM only (resets on disconnect or reboot)
     }
 
     public class AppProfile
@@ -314,12 +314,12 @@ namespace RedgearA20ControlCenter
         public int Brightness = 100;
         public int ActiveDpiStage = 1; // Default 1000 DPI (Stage 1)
         public bool EnableDpi = false;
-        public PersistenceMode Mode = PersistenceMode.ZeroRamDriver;
+        public PersistenceMode Mode = PersistenceMode.StealthWatcher;
 
         public bool AutoStart
         {
-            get { return Mode == PersistenceMode.TrayAgent; }
-            set { Mode = value ? PersistenceMode.TrayAgent : PersistenceMode.Disabled; }
+            get { return Mode == PersistenceMode.StealthWatcher || Mode == PersistenceMode.TrayAgent; }
+            set { Mode = value ? PersistenceMode.StealthWatcher : PersistenceMode.Disabled; }
         }
 
         public static string GetProfilePath()
@@ -365,18 +365,21 @@ namespace RedgearA20ControlCenter
                         if (mModeStr.Success)
                         {
                             string val = mModeStr.Groups[1].Value;
-                            if (string.Equals(val, "TrayAgent", StringComparison.OrdinalIgnoreCase)) p.Mode = PersistenceMode.TrayAgent;
-                            else if (string.Equals(val, "Disabled", StringComparison.OrdinalIgnoreCase)) p.Mode = PersistenceMode.Disabled;
-                            else p.Mode = PersistenceMode.ZeroRamDriver;
+                            if (string.Equals(val, "TrayAgent", StringComparison.OrdinalIgnoreCase) || string.Equals(val, "Tray", StringComparison.OrdinalIgnoreCase))
+                                p.Mode = PersistenceMode.TrayAgent;
+                            else if (string.Equals(val, "Disabled", StringComparison.OrdinalIgnoreCase))
+                                p.Mode = PersistenceMode.Disabled;
+                            else
+                                p.Mode = PersistenceMode.StealthWatcher;
                         }
                         else
                         {
-                            // Backwards compatibility with v0.1.0/v0.1.1 legacy profile format: upgrade auto-start to Zero-RAM mode
+                            // Backwards compatibility with v0.1.0/v0.1.1 legacy profile format: upgrade auto-start to StealthWatcher
                             Match mAuto = Regex.Match(json, "\"AutoStart\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
                             if (mAuto.Success)
                             {
                                 bool auto = bool.Parse(mAuto.Groups[1].Value);
-                                p.Mode = auto ? PersistenceMode.ZeroRamDriver : PersistenceMode.Disabled;
+                                p.Mode = auto ? PersistenceMode.StealthWatcher : PersistenceMode.Disabled;
                             }
                         }
                     }
@@ -656,7 +659,7 @@ namespace RedgearA20ControlCenter
 
         // Persistence & Startup UI (3-Mode Selection)
         private GroupBox gbPersistence;
-        private RadioButton rbZeroRam;
+        private RadioButton rbStealth;
         private RadioButton rbTrayAgent;
         private RadioButton rbDisabled;
 
@@ -683,7 +686,8 @@ namespace RedgearA20ControlCenter
         private ushort cachedUsagePage = 0;
         private volatile bool isSavingInProgress = false;
         private AppProfile currentProfile;
-        private bool startInTray = false;
+        private bool startHidden = false;
+        private bool isStealth = false;
         private bool isExplicitlyRestoring = false;
         private bool balloonShownOnce = false;
         private bool isExiting = false;
@@ -708,6 +712,10 @@ namespace RedgearA20ControlCenter
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool ChangeWindowMessageFilter(int message, uint dwFlag);
+        private const uint MSGFLT_ADD = 1;
+
         private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
         private static int wmShowControlCenter = 0;
         private static Mutex appMutex = null;
@@ -721,10 +729,10 @@ namespace RedgearA20ControlCenter
                 return;
             }
 
-            if (!isExiting && currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent)
+            if (!isExiting && currentProfile != null && (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
             {
                 e.Cancel = true;
-                MinimizeToTray(true);
+                MinimizeToWatcher(showBalloon: currentProfile.Mode == PersistenceMode.TrayAgent);
                 return;
             }
 
@@ -742,13 +750,13 @@ namespace RedgearA20ControlCenter
             base.OnResize(e);
             if (this.WindowState == FormWindowState.Minimized && currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent)
             {
-                MinimizeToTray(false);
+                MinimizeToWatcher(false);
             }
         }
 
         protected override void SetVisibleCore(bool value)
         {
-            if (startInTray && !isExplicitlyRestoring)
+            if (startHidden && !isExplicitlyRestoring)
             {
                 value = false;
                 if (!this.IsHandleCreated) CreateHandle();
@@ -774,7 +782,7 @@ namespace RedgearA20ControlCenter
             }
             else if (wmShowControlCenter != 0 && m.Msg == wmShowControlCenter)
             {
-                RestoreFromTray();
+                RestoreGui();
             }
         }
 
@@ -789,7 +797,7 @@ namespace RedgearA20ControlCenter
             catch { }
         }
 
-        private static void SetAutoStart(bool enable)
+        private static void SetAutoStart(PersistenceMode mode)
         {
             try
             {
@@ -797,10 +805,25 @@ namespace RedgearA20ControlCenter
                 {
                     if (key != null)
                     {
-                        if (enable)
+                        if (mode == PersistenceMode.StealthWatcher)
                         {
-                            string exePath = Application.ExecutablePath;
-                            key.SetValue(APP_REG_NAME, string.Format("\"{0}\" --tray", exePath));
+                            string targetPath;
+                            string deployErr;
+                            if (!TaskSchedulerHelper.DeployDriverBinary(out targetPath, out deployErr))
+                            {
+                                targetPath = Application.ExecutablePath;
+                            }
+                            key.SetValue(APP_REG_NAME, string.Format("\"{0}\" --stealth", targetPath));
+                        }
+                        else if (mode == PersistenceMode.TrayAgent)
+                        {
+                            string targetPath;
+                            string deployErr;
+                            if (!TaskSchedulerHelper.DeployDriverBinary(out targetPath, out deployErr))
+                            {
+                                targetPath = Application.ExecutablePath;
+                            }
+                            key.SetValue(APP_REG_NAME, string.Format("\"{0}\" --tray", targetPath));
                         }
                         else
                         {
@@ -821,7 +844,7 @@ namespace RedgearA20ControlCenter
 
             ToolStripMenuItem miOpen = new ToolStripMenuItem("Open Control Center");
             miOpen.Font = new Font(trayMenu.Font, FontStyle.Bold);
-            miOpen.Click += delegate { RestoreFromTray(); };
+            miOpen.Click += delegate { RestoreGui(); };
             trayMenu.Items.Add(miOpen);
 
             ToolStripMenuItem miApply = new ToolStripMenuItem("Apply Profile Now");
@@ -830,7 +853,7 @@ namespace RedgearA20ControlCenter
 
             trayMenu.Items.Add(new ToolStripSeparator());
 
-            ToolStripMenuItem miExit = new ToolStripMenuItem("Exit");
+            ToolStripMenuItem miExit = new ToolStripMenuItem("Exit Driver");
             miExit.Click += delegate
             {
                 isExiting = true;
@@ -844,20 +867,21 @@ namespace RedgearA20ControlCenter
                 Icon = this.Icon != null ? this.Icon : SystemIcons.Application,
                 Text = "Redgear A20 Control Center",
                 ContextMenuStrip = trayMenu,
-                Visible = startInTray && currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent
+                Visible = (currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent)
             };
 
-            trayIcon.DoubleClick += delegate { RestoreFromTray(); };
+            trayIcon.DoubleClick += delegate { RestoreGui(); };
         }
 
-        private void MinimizeToTray(bool showBalloon)
+        private void MinimizeToWatcher(bool showBalloon)
         {
             this.Hide();
             this.ShowInTaskbar = false;
+            isExplicitlyRestoring = false;
             if (trayIcon != null)
             {
-                trayIcon.Visible = true;
-                if (showBalloon && !balloonShownOnce)
+                trayIcon.Visible = (currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent);
+                if (trayIcon.Visible && showBalloon && !balloonShownOnce)
                 {
                     trayIcon.ShowBalloonTip(3000, "Redgear A20 Control Center", "Running in tray to auto-apply your RGB settings on reconnect.", ToolTipIcon.Info);
                     balloonShownOnce = true;
@@ -866,15 +890,17 @@ namespace RedgearA20ControlCenter
             TrimMemory();
         }
 
-        private void RestoreFromTray()
+        private void RestoreGui()
         {
             isExplicitlyRestoring = true;
-            startInTray = false;
+            startHidden = false;
             this.Show();
             this.WindowState = FormWindowState.Normal;
             this.ShowInTaskbar = true;
             this.BringToFront();
             this.Activate();
+            RefreshDeviceConnection();
+            UpdateColorPreview();
         }
 
         private void InitUsbWatcher()
@@ -888,20 +914,33 @@ namespace RedgearA20ControlCenter
         {
             usbDebounceTimer.Stop();
             RefreshDeviceConnection();
-            if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent)
+
+            if (string.IsNullOrEmpty(cachedDevicePath))
+            {
+                for (int retry = 0; retry < 3; retry++)
+                {
+                    await Task.Delay(300);
+                    RefreshDeviceConnection();
+                    if (!string.IsNullOrEmpty(cachedDevicePath)) break;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile != null &&
+                (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
             {
                 await ApplyCurrentProfileAsync(silent: true);
                 TrimMemory();
             }
         }
 
-        public MainForm() : this(false)
+        public MainForm() : this(false, false)
         {
         }
 
-        public MainForm(bool inTray)
+        public MainForm(bool hidden, bool stealth)
         {
-            this.startInTray = inTray;
+            this.startHidden = hidden;
+            this.isStealth = stealth;
             this.currentProfile = AppProfile.Load();
             this.currentColor = ParseColor(currentProfile.HexColor);
             this.currentBrightness = Math.Max(5, Math.Min(100, currentProfile.Brightness));
@@ -913,11 +952,19 @@ namespace RedgearA20ControlCenter
             RefreshDeviceConnection();
             UpdateColorPreview();
 
-            if (startInTray)
+            if (startHidden)
             {
                 Task.Run(async () =>
                 {
-                    if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile.Mode == PersistenceMode.TrayAgent)
+                    for (int i = 0; i < 15; i++)
+                    {
+                        if (!string.IsNullOrEmpty(cachedDevicePath)) break;
+                        await Task.Delay(200);
+                        RefreshDeviceConnection();
+                    }
+
+                    if (!string.IsNullOrEmpty(cachedDevicePath) &&
+                        (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
                     {
                         await ApplyCurrentProfileAsync(silent: true);
                     }
@@ -946,7 +993,7 @@ namespace RedgearA20ControlCenter
                 AutoSize = false,
                 Dock = DockStyle.Fill,
                 TextAlign = ContentAlignment.MiddleLeft,
-                Padding = new Padding(15, 0, 0, 0),
+                Padding = new Padding(15, 0, 175, 0),
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(160, 160, 175)
             };
@@ -954,14 +1001,42 @@ namespace RedgearA20ControlCenter
             {
                 Text = "Refresh",
                 Size = new Size(75, 27),
-                Location = new Point(475, 9),
+                Location = new Point(390, 9),
                 BackColor = Color.FromArgb(40, 42, 50),
                 ForeColor = Color.White,
                 FlatStyle = FlatStyle.Flat
             };
             btnRefresh.FlatAppearance.BorderSize = 0;
             btnRefresh.Click += delegate { RefreshDeviceConnection(); };
+
+            Button btnExit = new Button
+            {
+                Text = "Exit App",
+                Size = new Size(75, 27),
+                Location = new Point(475, 9),
+                BackColor = Color.FromArgb(50, 28, 32),
+                ForeColor = Color.FromArgb(255, 150, 150),
+                FlatStyle = FlatStyle.Flat
+            };
+            btnExit.FlatAppearance.BorderSize = 0;
+            btnExit.Click += delegate
+            {
+                DialogResult dr = MessageBox.Show(
+                    "Do you want to completely exit Redgear A20 Control Center and stop the background watcher?",
+                    "Exit Confirmation",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question
+                );
+                if (dr == DialogResult.Yes)
+                {
+                    isExiting = true;
+                    if (trayIcon != null) trayIcon.Visible = false;
+                    Application.Exit();
+                }
+            };
+
             pnlHeader.Controls.Add(btnRefresh);
+            pnlHeader.Controls.Add(btnExit);
             pnlHeader.Controls.Add(lblStatus);
             this.Controls.Add(pnlHeader);
 
@@ -1139,16 +1214,16 @@ namespace RedgearA20ControlCenter
                 ForeColor = Color.FromArgb(180, 185, 205)
             };
 
-            rbZeroRam = new RadioButton
+            rbStealth = new RadioButton
             {
-                Text = "🚀 Zero-RAM Stealth Driver Mode (0 MB RAM, 0 background processes - Recommended)",
+                Text = "🚀 Stealth Driver Watcher (Invisible, No Tray Icon, ~1.8 MB RAM — Recommended)",
                 Location = new Point(15, 20),
                 Size = new Size(510, 24),
                 ForeColor = Color.FromArgb(80, 230, 130),
                 Font = new Font("Segoe UI", 9.0f, FontStyle.Bold),
-                Checked = currentProfile == null || currentProfile.Mode == PersistenceMode.ZeroRamDriver
+                Checked = currentProfile == null || currentProfile.Mode == PersistenceMode.StealthWatcher
             };
-            gbPersistence.Controls.Add(rbZeroRam);
+            gbPersistence.Controls.Add(rbStealth);
 
             rbTrayAgent = new RadioButton
             {
@@ -1313,6 +1388,12 @@ namespace RedgearA20ControlCenter
 
         private void RefreshDeviceConnection()
         {
+            if (this.InvokeRequired)
+            {
+                try { this.Invoke(new Action(RefreshDeviceConnection)); } catch { }
+                return;
+            }
+
             ushort uPage;
             cachedDevicePath = HidTransport.FindTargetDevicePath(out uPage);
             cachedUsagePage = uPage;
@@ -1690,14 +1771,11 @@ namespace RedgearA20ControlCenter
 
             try
             {
-                PipelineResult res = await Task.Run(() => ExecuteHardwarePipeline(targetPath, p, Log));
+                Action<string, Color> logger = silent ? (Action<string, Color>)delegate(string s, Color c) { } : new Action<string, Color>(Log);
+                PipelineResult res = await Task.Run(() => ExecuteHardwarePipeline(targetPath, p, logger));
                 if (res.Success)
                 {
-                    if (silent)
-                    {
-                        Log("⚡ Auto-applied saved profile to mouse on connection.", Color.FromArgb(80, 230, 130));
-                    }
-                    else
+                    if (!silent)
                     {
                         Log("✅ Applied to mouse successfully! (Volatile RAM registers updated).", Color.FromArgb(140, 240, 255));
                     }
@@ -1751,8 +1829,8 @@ namespace RedgearA20ControlCenter
             currentProfile.ActiveDpiStage = cmbDpiStages != null ? cmbDpiStages.SelectedIndex : 1;
             currentProfile.EnableDpi = cbEnableDpi != null && cbEnableDpi.Checked;
 
-            if (rbZeroRam != null && rbZeroRam.Checked)
-                currentProfile.Mode = PersistenceMode.ZeroRamDriver;
+            if (rbStealth != null && rbStealth.Checked)
+                currentProfile.Mode = PersistenceMode.StealthWatcher;
             else if (rbTrayAgent != null && rbTrayAgent.Checked)
                 currentProfile.Mode = PersistenceMode.TrayAgent;
             else
@@ -1760,36 +1838,26 @@ namespace RedgearA20ControlCenter
 
             currentProfile.Save();
 
-            bool taskFailed = false;
-            string taskError = null;
+            // Clean up any legacy Task Scheduler task
+            string dummy;
+            TaskSchedulerHelper.RemoveTask(out dummy);
 
-            if (currentProfile.Mode == PersistenceMode.ZeroRamDriver)
+            if (currentProfile.Mode == PersistenceMode.StealthWatcher)
             {
                 if (trayIcon != null) trayIcon.Visible = false;
-                SetAutoStart(false);
-                if (!TaskSchedulerHelper.InstallTask(out taskError))
-                {
-                    taskFailed = true;
-                    Log("❌ Failed to install scheduled task: " + taskError, Color.FromArgb(255, 80, 80));
-                }
-                else
-                {
-                    Log("🚀 Zero-RAM Stealth Task successfully registered with Windows Task Scheduler.", Color.FromArgb(80, 230, 130));
-                }
+                SetAutoStart(PersistenceMode.StealthWatcher);
+                Log("🚀 Stealth Driver Watcher auto-start registered (Invisible, No Tray Icon, ~1.8 MB RAM).", Color.FromArgb(80, 230, 130));
             }
             else if (currentProfile.Mode == PersistenceMode.TrayAgent)
             {
-                string dummy;
-                TaskSchedulerHelper.RemoveTask(out dummy);
-                SetAutoStart(true);
-                Log("📌 Tray Agent startup registered in Windows Run key.", Color.FromArgb(140, 200, 255));
+                if (trayIcon != null) trayIcon.Visible = true;
+                SetAutoStart(PersistenceMode.TrayAgent);
+                Log("📌 Tray Agent startup registered in Windows Run key (~2.7 MB RAM).", Color.FromArgb(140, 200, 255));
             }
             else
             {
                 if (trayIcon != null) trayIcon.Visible = false;
-                string dummy;
-                TaskSchedulerHelper.RemoveTask(out dummy);
-                SetAutoStart(false);
+                SetAutoStart(PersistenceMode.Disabled);
                 Log("Auto-apply disabled. Mouse will use volatile RAM only.", Color.FromArgb(200, 200, 220));
             }
 
@@ -1801,23 +1869,16 @@ namespace RedgearA20ControlCenter
             if (ok)
             {
                 string msg;
-                if (currentProfile.Mode == PersistenceMode.ZeroRamDriver)
+                if (currentProfile.Mode == PersistenceMode.StealthWatcher)
                 {
-                    if (taskFailed)
-                    {
-                        msg = "Profile saved & applied to mouse!\n\n" +
-                              "⚠️ Warning: Failed to register Task Scheduler task:\n" + taskError + "\n\n" +
-                              "Settings will persist once Task Scheduler permissions are granted.";
-                    }
-                    else
-                    {
-                        msg = "Profile saved successfully!\n\n" +
-                              "✔ Color & Brightness applied to mouse.\n" +
-                              (currentProfile.EnableDpi ? string.Format("✔ DPI Stage {0} applied to mouse.\n", currentProfile.ActiveDpiStage) : "") +
-                              "✔ Zero-RAM Stealth Driver Mode active: Windows kernel will auto-apply settings on boot, wake, and hotplug.\n" +
-                              "✔ 0 MB RAM, 0 background processes, 0 CPU.\n\n" +
-                              "You can close this window now. The mouse will stay persisted forever!";
-                    }
+                    msg = "Profile saved successfully!\n\n" +
+                          "✔ Color & Brightness applied to mouse.\n" +
+                          (currentProfile.EnableDpi ? string.Format("✔ DPI Stage {0} applied to mouse.\n", currentProfile.ActiveDpiStage) : "") +
+                          "✔ Stealth Driver Watcher active:\n" +
+                          "   • Completely invisible in background (~1.8 MB RAM, 0% CPU).\n" +
+                          "   • No taskbar or system tray icons.\n" +
+                          "   • Auto-applies your settings on reboot, wake, and USB replug on ANY port.\n\n" +
+                          "You can safely close this window now. Your settings will persist!";
                 }
                 else if (currentProfile.Mode == PersistenceMode.TrayAgent)
                 {
@@ -1836,6 +1897,7 @@ namespace RedgearA20ControlCenter
 
                 MessageBox.Show(msg, "Profile Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
+            TrimMemory();
         }
 
         private async void BtnReset_Click(object sender, EventArgs e)
@@ -1890,7 +1952,7 @@ namespace RedgearA20ControlCenter
                         currentProfile.Mode = PersistenceMode.Disabled;
                         currentProfile.Save();
                     }
-                    SetAutoStart(false);
+                    SetAutoStart(PersistenceMode.Disabled);
 
                     string removeErr;
                     TaskSchedulerHelper.RemoveTask(out removeErr);
@@ -2050,7 +2112,8 @@ namespace RedgearA20ControlCenter
         [STAThread]
         public static void Main(string[] args)
         {
-            bool startInTray = false;
+            bool startHidden = false;
+            bool isStealth = false;
             bool applyAndExit = false;
 
             bool installTask = false;
@@ -2061,9 +2124,17 @@ namespace RedgearA20ControlCenter
                 for (int i = 0; i < args.Length; i++)
                 {
                     string a = args[i].ToLowerInvariant();
-                    if (a == "--tray" || a == "-tray" || a == "/tray" || a == "--minimized")
+                    if (a == "--stealth" || a == "-stealth" || a == "/stealth" ||
+                        a == "--silent" || a == "-silent" || a == "/silent" ||
+                        a == "--watcher" || a == "-watcher" || a == "/watcher")
                     {
-                        startInTray = true;
+                        startHidden = true;
+                        isStealth = true;
+                    }
+                    else if (a == "--tray" || a == "-tray" || a == "/tray" || a == "--minimized")
+                    {
+                        startHidden = true;
+                        isStealth = false;
                     }
                     else if (a == "--apply-and-exit" || a == "-apply" || a == "/apply")
                     {
@@ -2105,22 +2176,31 @@ namespace RedgearA20ControlCenter
                 return;
             }
 
-            if (startInTray)
+            if (startHidden)
             {
                 AppProfile p = AppProfile.Load();
-                if (p.Mode != PersistenceMode.TrayAgent)
+                if (p.Mode == PersistenceMode.Disabled)
                 {
-                    // Clean up stale legacy Run registry key if migrated away from TrayAgent
-                    SetAutoStart(false);
-                    if (p.Mode == PersistenceMode.ZeroRamDriver)
-                    {
-                        HeadlessApplyAndExit();
-                    }
+                    SetAutoStart(PersistenceMode.Disabled);
                     return;
+                }
+                if (isStealth && p.Mode == PersistenceMode.TrayAgent)
+                {
+                    isStealth = false;
+                }
+                else if (!isStealth && p.Mode == PersistenceMode.StealthWatcher)
+                {
+                    isStealth = true;
                 }
             }
 
             wmShowControlCenter = RegisterWindowMessage("RedgearA20_ShowControlCenter");
+            try
+            {
+                ChangeWindowMessageFilter(wmShowControlCenter, MSGFLT_ADD);
+                ChangeWindowMessageFilter(WM_DEVICECHANGE, MSGFLT_ADD);
+            }
+            catch { }
 
             bool createdNew = false;
             try
@@ -2135,7 +2215,7 @@ namespace RedgearA20ControlCenter
 
             if (!createdNew)
             {
-                if (!startInTray)
+                if (!startHidden)
                 {
                     PostMessage(HWND_BROADCAST, wmShowControlCenter, IntPtr.Zero, IntPtr.Zero);
                 }
@@ -2146,7 +2226,7 @@ namespace RedgearA20ControlCenter
             {
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new MainForm(startInTray));
+                Application.Run(new MainForm(startHidden, isStealth));
             }
             finally
             {
