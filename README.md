@@ -93,6 +93,7 @@ Packet Structure: [0x07, Command, Param1, Param2, Param3, Param4, Param5, Param6
 | **`0x20`** | Sync Latch | `[07 20 00 00 00 00 00 00]` | MCU register synchronization latch | ✅ **VERIFIED** |
 
 > 📚 **Project Documentation & Guides**:
+> - [Architecture & Guardrails](docs/architecture-decisions-and-guardrails.md) — Core architectural decisions, hardware reality, and strict developer guardrails.
 > - [Protocol Specification](docs/protocol-notes.md) — Complete byte-by-byte register and command reference.
 > - [Feature Roadmap](docs/roadmap.md) — Upcoming milestones, planned RGB effects, and sensor tuning.
 > - [Engineering DevLog](docs/devlog.md) — Technical story, reverse-engineering breakthrough, and safety architecture.
