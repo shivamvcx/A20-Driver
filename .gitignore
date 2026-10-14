@@ -1,0 +1,15 @@
+# Compiler outputs & IDE files
+bin/
+obj/
+release/
+*.pdb
+*.obj
+*.log
+
+# Local research archive (contains vendor binaries & exploratory test scripts)
+_research_archive/
+
+# OS metadata
+[Dd]esktop.ini
+.DS_Store
+Thumbs.db
