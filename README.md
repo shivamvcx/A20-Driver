@@ -1,7 +1,7 @@
 # Redgear A20 Control Center
 
 [![Download Executable](https://img.shields.io/github/v/release/shivamvcx/A20-Driver?include_prereleases&label=Download%20.exe&color=success)](https://github.com/shivamvcx/A20-Driver/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform: Windows x64](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20(64--bit)-0078D6.svg)](https://microsoft.com)
 [![Architecture: C# WinForms](https://img.shields.io/badge/Architecture-C%23%20WinForms-239120.svg)](src/Program.cs)
 [![Executable Size](https://img.shields.io/badge/Binary%20Size-~70%20KB-orange.svg)](#download--quick-start)
@@ -188,5 +188,5 @@ Every line of generated code, memory profile, and hardware guardrail was thoroug
 ---
 
 ## License
-
-This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
+ 
+This project is licensed under the **GNU General Public License v3.0 (GPLv3)**. See the [LICENSE](LICENSE) file for details.
