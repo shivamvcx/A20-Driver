@@ -1,9 +1,11 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,8 +17,8 @@ using Microsoft.Win32.SafeHandles;
 [assembly: AssemblyDescription("Open-Source Hardware Control Utility for Redgear A20")]
 [assembly: AssemblyProduct("Redgear A20 Control Center")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Redgear A20 Open Driver Project Contributors")]
-[assembly: AssemblyVersion("0.1.1.0")]
-[assembly: AssemblyFileVersion("0.1.1.0")]
+[assembly: AssemblyVersion("0.2.0.0")]
+[assembly: AssemblyFileVersion("0.2.0.0")]
 
 namespace RedgearA20ControlCenter
 {
@@ -157,7 +159,7 @@ namespace RedgearA20ControlCenter
                             string pathLower = path.ToLowerInvariant();
                             if (pathLower.Contains("vid_18f8") && pathLower.Contains("pid_0fc0"))
                             {
-                                SafeFileHandle hFile = CreateFile(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+                                SafeFileHandle hFile = CreateFile(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
                                 if (!hFile.IsInvalid)
                                 {
                                     using (hFile)
@@ -389,18 +391,57 @@ namespace RedgearA20ControlCenter
             return p;
         }
 
-        public void Save()
+        public bool Save(out string error)
         {
+            error = null;
+            string tmpFile = null;
             try
             {
                 string file = GetProfilePath();
+                string dir = Path.GetDirectoryName(file);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+
                 int bri = Math.Max(5, Math.Min(100, Brightness));
                 int dpi = Math.Max(0, Math.Min(5, ActiveDpiStage));
                 string json = string.Format("{{\n  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"ActiveDpiStage\": {2},\n  \"EnableDpi\": {3},\n  \"PersistenceMode\": {4}\n}}\n",
                     HexColor, bri, dpi, EnableDpi.ToString().ToLower(), (int)Mode);
-                File.WriteAllText(file, json);
+
+                tmpFile = file + ".tmp";
+                File.WriteAllText(tmpFile, json, Encoding.UTF8);
+
+                if (File.Exists(file))
+                {
+                    try
+                    {
+                        File.Replace(tmpFile, file, null);
+                    }
+                    catch
+                    {
+                        File.Delete(file);
+                        File.Move(tmpFile, file);
+                    }
+                }
+                else
+                {
+                    File.Move(tmpFile, file);
+                }
+                return true;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+                if (!string.IsNullOrEmpty(tmpFile))
+                {
+                    try { if (File.Exists(tmpFile)) File.Delete(tmpFile); } catch { }
+                }
+                return false;
+            }
+        }
+
+        public void Save()
+        {
+            string dummy;
+            Save(out dummy);
         }
     }
 
@@ -504,110 +545,11 @@ namespace RedgearA20ControlCenter
             }
         }
 
+        [Obsolete("Task Scheduler mode is deprecated in favor of lightweight Stealth Watcher persistence (--stealth)")]
         public static bool InstallTask(out string error)
         {
-            error = null;
-            string exePath;
-            if (!DeployDriverBinary(out exePath, out error)) return false;
-
-            string workingDir = Path.GetDirectoryName(exePath);
-            string xmlPath = Path.Combine(workingDir, "task.xml");
-
-            try
-            {
-                string xmlContent = string.Format(
-@"<?xml version=""1.0"" encoding=""UTF-16""?>
-<Task version=""1.2"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
-  <RegistrationInfo>
-    <Description>Auto-applies Redgear A20 RGB &amp; DPI profile on boot, wake, and USB reconnect with 0 MB background RAM.</Description>
-  </RegistrationInfo>
-  <Triggers>
-    <LogonTrigger>
-      <Enabled>true</Enabled>
-    </LogonTrigger>
-    <SessionStateChangeTrigger>
-      <Enabled>true</Enabled>
-      <StateChange>SessionUnlock</StateChange>
-    </SessionStateChangeTrigger>
-    <EventTrigger>
-      <Enabled>true</Enabled>
-      <Subscription>&lt;QueryList&gt;&lt;Query Id=""0"" Path=""System""&gt;&lt;Select Path=""System""&gt;*[System[(Provider[@Name='Microsoft-Windows-Kernel-Power'] and (EventID=107 or EventID=508)) or (Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
-    </EventTrigger>
-    <EventTrigger>
-      <Enabled>true</Enabled>
-      <Subscription>&lt;QueryList&gt;&lt;Query Id=""0"" Path=""Microsoft-Windows-Kernel-PnP/Configuration""&gt;&lt;Select Path=""Microsoft-Windows-Kernel-PnP/Configuration""&gt;*[System[(EventID=410)] and EventData[Data[@Name='ClassGuid']='{{745a17a0-74d3-11d0-b6fe-00a0c90f57da}}']]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
-    </EventTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id=""Author"">
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>false</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>true</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT1M</ExecutionTimeLimit>
-    <Priority>4</Priority>
-  </Settings>
-  <Actions Context=""Author"">
-    <Exec>
-      <Command>{0}</Command>
-      <Arguments>--apply-and-exit</Arguments>
-      <WorkingDirectory>{1}</WorkingDirectory>
-    </Exec>
-  </Actions>
-</Task>", exePath, workingDir);
-
-                File.WriteAllText(xmlPath, xmlContent, System.Text.Encoding.Unicode);
-
-                ProcessStartInfo psi = new ProcessStartInfo
-                {
-                    FileName = "schtasks.exe",
-                    Arguments = string.Format("/create /tn \"{0}\" /xml \"{1}\" /f", TASK_NAME, xmlPath),
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    RedirectStandardError = true,
-                    RedirectStandardOutput = true
-                };
-
-                using (Process p = Process.Start(psi))
-                {
-                    string stdout = p.StandardOutput.ReadToEnd();
-                    string stderr = p.StandardError.ReadToEnd();
-                    p.WaitForExit(5000);
-
-                    if (p.ExitCode != 0)
-                    {
-                        error = !string.IsNullOrWhiteSpace(stderr) ? stderr.Trim() : stdout.Trim();
-                        if (string.IsNullOrEmpty(error)) error = string.Format("schtasks failed with exit code {0}", p.ExitCode);
-                        return false;
-                    }
-                }
-                return true;
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
-                return false;
-            }
-            finally
-            {
-                try { if (File.Exists(xmlPath)) File.Delete(xmlPath); } catch { }
-            }
+            error = "Task Scheduler XML installer is deprecated. Use --stealth to run the lightweight background watcher.";
+            return false;
         }
 
         public static bool RemoveTask(out string error)
@@ -617,7 +559,7 @@ namespace RedgearA20ControlCenter
             {
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
-                    FileName = "schtasks.exe",
+                    FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "schtasks.exe"),
                     Arguments = string.Format("/delete /tn \"{0}\" /f", TASK_NAME),
                     CreateNoWindow = true,
                     UseShellExecute = false,
@@ -641,6 +583,76 @@ namespace RedgearA20ControlCenter
     }
 
     // ═════════════════════════════════════════════════════════════════════════
+    //  UI Design System Tokens (Zero-Allocation GDI+ Theme)
+    // ═════════════════════════════════════════════════════════════════════════
+    public static class Theme
+    {
+        // ─── Colors: Base Neutrals ───
+        public static readonly Color Canvas = Color.FromArgb(18, 19, 22);          // #121316
+        public static readonly Color Surface = Color.FromArgb(26, 28, 34);         // #1A1C22
+        public static readonly Color SurfaceElevated = Color.FromArgb(36, 39, 49); // #242731
+        public static readonly Color SurfaceHover = Color.FromArgb(45, 49, 62);    // #2D313E
+        public static readonly Color Border = Color.FromArgb(43, 47, 58);          // #2B2F3A
+        public static readonly Color BorderSubtle = Color.FromArgb(32, 35, 42);    // #20232A
+
+        // ─── Colors: Text Neutrals ───
+        public static readonly Color TextPrimary = Color.FromArgb(241, 243, 247);  // #F1F3F7
+        public static readonly Color TextSecondary = Color.FromArgb(141, 147, 165);// #8D93A5
+        public static readonly Color TextMuted = Color.FromArgb(90, 96, 114);       // #5A6072
+        public static readonly Color TextDisabled = Color.FromArgb(82, 88, 102);   // #525866
+
+        // ─── Colors: Single Primary Accent (Emerald / Hardware Mint) ───
+        public static readonly Color Accent = Color.FromArgb(16, 185, 129);        // #10B981
+        public static readonly Color AccentHover = Color.FromArgb(5, 150, 105);    // #059669
+        public static readonly Color AccentText = Color.White;                     // #FFFFFF
+        public static readonly Color AccentDim = Color.FromArgb(6, 78, 59);        // #064E3B
+
+        // ─── Colors: Functional Semantic States ───
+        public static readonly Color Warning = Color.FromArgb(245, 158, 11);       // #F59E0B
+        public static readonly Color WarningSurface = Color.FromArgb(35, 28, 19);  // #231C13
+        public static readonly Color WarningBorder = Color.FromArgb(92, 61, 16);   // #5C3D10
+        public static readonly Color Danger = Color.FromArgb(239, 68, 68);         // #EF4444
+        public static readonly Color DangerSurface = Color.FromArgb(40, 20, 22);   // #281416
+        public static readonly Color DangerBorder = Color.FromArgb(77, 29, 34);    // #4D1D22
+        public static readonly Color TerminalBg = Color.FromArgb(14, 15, 18);      // #0E0F12
+        public static readonly Color TerminalText = Color.FromArgb(16, 185, 129);  // #10B981
+
+        // ─── Fonts: System Fonts Only (Pre-allocated Static Instances) ───
+        public static readonly Font FontHeading = new Font("Segoe UI", 9.75f, FontStyle.Bold);      // 13px bold
+        public static readonly Font FontBodyPrimary = new Font("Segoe UI", 9.0f, FontStyle.Regular);// 12px
+        public static readonly Font FontBodyBold = new Font("Segoe UI", 9.0f, FontStyle.Bold);       // 12px bold
+        public static readonly Font FontBodySecondary = new Font("Segoe UI", 8.25f, FontStyle.Regular); // 11px
+        public static readonly Font FontBadge = new Font("Segoe UI", 7.5f, FontStyle.Bold);         // 10px bold
+        public static readonly Font FontMono = new Font("Consolas", 8.25f, FontStyle.Regular);      // 11px mono
+
+        // ─── Cached GDI Brushes & Pens (Never reallocated in Paint) ───
+        public static readonly SolidBrush BrushCanvas = new SolidBrush(Canvas);
+        public static readonly SolidBrush BrushSurface = new SolidBrush(Surface);
+        public static readonly SolidBrush BrushSurfaceElevated = new SolidBrush(SurfaceElevated);
+        public static readonly SolidBrush BrushAccent = new SolidBrush(Accent);
+        public static readonly SolidBrush BrushWarning = new SolidBrush(Warning);
+        public static readonly SolidBrush BrushDanger = new SolidBrush(Danger);
+        public static readonly SolidBrush BrushTextPrimary = new SolidBrush(TextPrimary);
+        public static readonly SolidBrush BrushTextSecondary = new SolidBrush(TextSecondary);
+        public static readonly Pen PenBorder = new Pen(Border, 1);
+        public static readonly Pen PenBorderSubtle = new Pen(BorderSubtle, 1);
+        public static readonly Pen PenAccent = new Pen(Accent, 1);
+        public static readonly Pen PenWarning = new Pen(Warning, 1);
+        public static readonly Pen PenDanger = new Pen(Danger, 1);
+
+        // ─── Spacing Scale (Pixels) ───
+        public const int Space1 = 4;
+        public const int Space2 = 8;
+        public const int Space3 = 12;
+        public const int Space4 = 16;
+        public const int Space5 = 20;
+
+        // ─── Geometry ───
+        public const int RadiusDefault = 4;
+        public const int BorderWidth = 1;
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
     //  Main GUI Application Form (Native Windows Forms, Dark Theme)
     // ═════════════════════════════════════════════════════════════════════════
     public class MainForm : Form
@@ -658,14 +670,14 @@ namespace RedgearA20ControlCenter
         private Button btnReset;
 
         // Persistence & Startup UI (3-Mode Selection)
-        private GroupBox gbPersistence;
+        private Panel gbPersistence;
         private RadioButton rbStealth;
         private RadioButton rbTrayAgent;
         private RadioButton rbDisabled;
 
         // Experimental DPI section
         private CheckBox cbEnableDpi;
-        private GroupBox gbDpi;
+        private Panel gbDpi;
         private ComboBox cmbDpiStages;
         private Button btnTestDpi;
 
@@ -673,6 +685,9 @@ namespace RedgearA20ControlCenter
         private RichTextBox rtbLog;
         private Button btnClearLog;
         private Button btnCopyLog;
+        private Button btnRefresh;
+        private Button btnExit;
+        private Button[] presetButtons;
 
         // System Tray & Background Watcher
         private NotifyIcon trayIcon;
@@ -691,6 +706,7 @@ namespace RedgearA20ControlCenter
         private bool isExplicitlyRestoring = false;
         private bool balloonShownOnce = false;
         private bool isExiting = false;
+        private bool isHotplugHandling = false;
 
         private const int EEPROM_WRITE_DELAY_MS = 100;
 
@@ -716,9 +732,34 @@ namespace RedgearA20ControlCenter
         private static extern bool ChangeWindowMessageFilter(int message, uint dwFlag);
         private const uint MSGFLT_ADD = 1;
 
+        [DllImport("dwmapi.dll", PreserveSig = true)]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+        private const int DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1 = 19;
+        private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+
+        [DllImport("uxtheme.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+        private static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
+
         private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
         private static int wmShowControlCenter = 0;
         private static Mutex appMutex = null;
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            try
+            {
+                if (Environment.OSVersion.Version.Major >= 10)
+                {
+                    int useDarkMode = 1;
+                    if (DwmSetWindowAttribute(this.Handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref useDarkMode, sizeof(int)) != 0)
+                    {
+                        DwmSetWindowAttribute(this.Handle, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref useDarkMode, sizeof(int));
+                    }
+                }
+            }
+            catch { }
+        }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
@@ -736,13 +777,45 @@ namespace RedgearA20ControlCenter
                 return;
             }
 
+            if (trayMenu != null)
+            {
+                trayMenu.Dispose();
+                trayMenu = null;
+            }
+
             if (trayIcon != null)
             {
                 trayIcon.Visible = false;
                 trayIcon.Dispose();
+                trayIcon = null;
             }
 
             base.OnFormClosing(e);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (trayMenu != null)
+                {
+                    trayMenu.Dispose();
+                    trayMenu = null;
+                }
+                if (trayIcon != null)
+                {
+                    trayIcon.Visible = false;
+                    trayIcon.Dispose();
+                    trayIcon = null;
+                }
+                if (usbDebounceTimer != null)
+                {
+                    usbDebounceTimer.Stop();
+                    usbDebounceTimer.Dispose();
+                    usbDebounceTimer = null;
+                }
+            }
+            base.Dispose(disposing);
         }
 
         protected override void OnResize(EventArgs e)
@@ -925,23 +998,37 @@ namespace RedgearA20ControlCenter
         private async void OnUsbDebounceTimerTick(object sender, EventArgs e)
         {
             usbDebounceTimer.Stop();
-            RefreshDeviceConnection();
+            if (isHotplugHandling) return;
+            isHotplugHandling = true;
 
-            if (string.IsNullOrEmpty(cachedDevicePath))
+            try
             {
-                for (int retry = 0; retry < 3; retry++)
+                RefreshDeviceConnection();
+
+                if (string.IsNullOrEmpty(cachedDevicePath))
                 {
-                    await Task.Delay(300);
-                    RefreshDeviceConnection();
-                    if (!string.IsNullOrEmpty(cachedDevicePath)) break;
+                    for (int retry = 0; retry < 3; retry++)
+                    {
+                        await Task.Delay(300);
+                        RefreshDeviceConnection();
+                        if (!string.IsNullOrEmpty(cachedDevicePath)) break;
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile != null &&
+                    (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
+                {
+                    await ApplyCurrentProfileAsync(silent: true);
+                    TrimMemory();
                 }
             }
-
-            if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile != null &&
-                (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
+            catch (Exception ex)
             {
-                await ApplyCurrentProfileAsync(silent: true);
-                TrimMemory();
+                Debug.WriteLine("Hotplug handle error: " + ex.Message);
+            }
+            finally
+            {
+                isHotplugHandling = false;
             }
         }
 
@@ -968,69 +1055,170 @@ namespace RedgearA20ControlCenter
             {
                 Task.Run(async () =>
                 {
-                    for (int i = 0; i < 15; i++)
+                    try
                     {
-                        if (!string.IsNullOrEmpty(cachedDevicePath)) break;
-                        await Task.Delay(200);
-                        RefreshDeviceConnection();
-                    }
+                        for (int i = 0; i < 15; i++)
+                        {
+                            ushort uPage;
+                            string devPath = HidTransport.FindTargetDevicePath(out uPage);
+                            if (!string.IsNullOrEmpty(devPath))
+                            {
+                                cachedDevicePath = devPath;
+                                cachedUsagePage = uPage;
+                                break;
+                            }
+                            await Task.Delay(200);
+                        }
 
-                    if (!string.IsNullOrEmpty(cachedDevicePath) &&
-                        (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
-                    {
-                        await ApplyCurrentProfileAsync(silent: true);
+                        if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile != null &&
+                            (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
+                        {
+                            await ApplyCurrentProfileAsync(silent: true);
+                        }
+                        await Task.Delay(1000);
+                        TrimMemory();
                     }
-                    await Task.Delay(1000);
-                    TrimMemory();
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine("Stealth startup error: " + ex.Message);
+                    }
                 });
+            }
+        }
+
+        private Panel CreateSectionPanel(Point loc, Size size, string title, string badge, bool isWarning)
+        {
+            Panel pnl = new Panel
+            {
+                Location = loc,
+                Size = size,
+                BackColor = isWarning ? Theme.WarningSurface : Theme.Surface,
+                BorderStyle = BorderStyle.None
+            };
+
+            Pen pen = isWarning ? Theme.PenWarning : Theme.PenBorder;
+            pnl.Paint += delegate(object s, PaintEventArgs e)
+            {
+                e.Graphics.DrawRectangle(pen, 0, 0, pnl.Width - 1, pnl.Height - 1);
+            };
+
+            Label lblTitle = new Label
+            {
+                Text = title,
+                Location = new Point(12, 8),
+                AutoSize = true,
+                Font = Theme.FontHeading,
+                ForeColor = isWarning ? Theme.Warning : Theme.TextPrimary
+            };
+            pnl.Controls.Add(lblTitle);
+
+            if (!string.IsNullOrEmpty(badge))
+            {
+                int badgeWidth = badge.Length * 7 + 16;
+                Label lblBadge = new Label
+                {
+                    Text = badge,
+                    Location = new Point(size.Width - 12 - badgeWidth, 8),
+                    Size = new Size(badgeWidth, 18),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Font = Theme.FontBadge,
+                    BackColor = isWarning ? Color.FromArgb(48, 34, 16) : Theme.SurfaceElevated,
+                    ForeColor = isWarning ? Theme.Warning : Theme.TextSecondary
+                };
+                Pen badgePen = isWarning ? Theme.PenWarning : Theme.PenBorderSubtle;
+                lblBadge.Paint += delegate(object s, PaintEventArgs e)
+                {
+                    e.Graphics.DrawRectangle(badgePen, 0, 0, lblBadge.Width - 1, lblBadge.Height - 1);
+                };
+                pnl.Controls.Add(lblBadge);
+            }
+
+            return pnl;
+        }
+
+        private void OnPresetButtonClick(Button b, Color color)
+        {
+            currentColor = color;
+            txtHex.Text = string.Format("#{0:X2}{1:X2}{2:X2}", currentColor.R, currentColor.G, currentColor.B);
+            UpdateColorPreview();
+
+            if (presetButtons != null)
+            {
+                for (int j = 0; j < presetButtons.Length; j++)
+                {
+                    bool isActive = (presetButtons[j] == b);
+                    presetButtons[j].FlatAppearance.BorderColor = isActive ? Theme.Accent : Theme.Border;
+                    presetButtons[j].ForeColor = isActive ? Color.White : Theme.TextSecondary;
+                }
             }
         }
 
         private void InitForm()
         {
-            this.Text = "Redgear A20 Control Center v0.1.1";
+            this.Text = "Redgear A20 Control Center v0.2.0";
             this.Size = new Size(580, 835);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
-            this.BackColor = Color.FromArgb(24, 25, 29);
-            this.ForeColor = Color.FromArgb(235, 235, 240);
-            this.Font = new Font("Segoe UI", 9.25f, FontStyle.Regular);
+            this.BackColor = Theme.Canvas;
+            this.ForeColor = Theme.TextPrimary;
+            this.Font = Theme.FontBodyPrimary;
+            this.AutoScaleMode = AutoScaleMode.Dpi;
 
             // 1. Connection Header Banner
-            Panel pnlHeader = new Panel { Dock = DockStyle.Top, Height = 45, BackColor = Color.FromArgb(18, 19, 22) };
+            Panel pnlHeader = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 44,
+                BackColor = Color.FromArgb(24, 26, 32)
+            };
+            pnlHeader.Paint += delegate(object s, PaintEventArgs e)
+            {
+                e.Graphics.DrawLine(Theme.PenBorderSubtle, 0, pnlHeader.Height - 1, pnlHeader.Width, pnlHeader.Height - 1);
+            };
+
             lblStatus = new Label
             {
-                Text = "🔍 Searching for Redgear A20...",
+                Text = "● Searching for Redgear A20...",
                 AutoSize = false,
                 Dock = DockStyle.Fill,
                 TextAlign = ContentAlignment.MiddleLeft,
-                Padding = new Padding(15, 0, 175, 0),
-                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(160, 160, 175)
+                Padding = new Padding(14, 0, 175, 0),
+                Font = Theme.FontBodyBold,
+                ForeColor = Theme.TextSecondary
             };
-            Button btnRefresh = new Button
+
+            btnRefresh = new Button
             {
                 Text = "Refresh",
-                Size = new Size(75, 27),
+                Size = new Size(75, 26),
                 Location = new Point(390, 9),
-                BackColor = Color.FromArgb(40, 42, 50),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat
+                BackColor = Theme.SurfaceElevated,
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.FontBodySecondary,
+                FlatStyle = FlatStyle.Flat,
+                TabIndex = 0,
+                AccessibleName = "Refresh USB HID connection status"
             };
-            btnRefresh.FlatAppearance.BorderSize = 0;
+            btnRefresh.FlatAppearance.BorderColor = Theme.Border;
+            btnRefresh.FlatAppearance.BorderSize = 1;
             btnRefresh.Click += delegate { RefreshDeviceConnection(); };
 
-            Button btnExit = new Button
+            btnExit = new Button
             {
                 Text = "Exit App",
-                Size = new Size(75, 27),
+                Size = new Size(75, 26),
                 Location = new Point(475, 9),
-                BackColor = Color.FromArgb(50, 28, 32),
-                ForeColor = Color.FromArgb(255, 150, 150),
-                FlatStyle = FlatStyle.Flat
+                BackColor = Theme.DangerSurface,
+                ForeColor = Theme.Danger,
+                Font = Theme.FontBodySecondary,
+                FlatStyle = FlatStyle.Flat,
+                TabIndex = 1,
+                AccessibleName = "Completely exit application and stop background watcher"
             };
-            btnExit.FlatAppearance.BorderSize = 0;
+            btnExit.FlatAppearance.BorderColor = Theme.DangerBorder;
+            btnExit.FlatAppearance.BorderSize = 1;
+
             ToolTip tipExit = new ToolTip();
             tipExit.SetToolTip(btnExit, "Completely stops the driver and background persistence.\nTo close this window while keeping persistence active, click the [X] button.");
             btnExit.Click += delegate
@@ -1065,56 +1253,70 @@ namespace RedgearA20ControlCenter
             this.Controls.Add(pnlHeader);
 
             // Container Panel
-            body = new Panel { Location = new Point(15, 55), Size = new Size(535, 730) };
+            body = new Panel { Location = new Point(15, 52), Size = new Size(535, 735) };
 
             // ─── Group 1: Colour Selection ───
-            GroupBox gbColor = new GroupBox
-            {
-                Text = "  1. LED Colour Selection (Verified Cmd 0x14)  ",
-                Location = new Point(0, 0),
-                Size = new Size(535, 125),
-                ForeColor = Color.FromArgb(180, 185, 205)
-            };
+            Panel gbColor = CreateSectionPanel(new Point(0, 0), new Size(535, 115), "1. LED Colour Selection", "Verified Cmd 0x14", false);
 
             pnlColorPreview = new Panel
             {
-                Location = new Point(20, 25),
-                Size = new Size(60, 42),
-                BorderStyle = BorderStyle.FixedSingle,
-                BackColor = currentColor
+                Location = new Point(12, 34),
+                Size = new Size(52, 32),
+                BorderStyle = BorderStyle.None,
+                BackColor = currentColor,
+                AccessibleName = "Current RGB Color Swatch Preview"
+            };
+            pnlColorPreview.Paint += delegate(object s, PaintEventArgs e)
+            {
+                e.Graphics.DrawRectangle(Theme.PenBorder, 0, 0, pnlColorPreview.Width - 1, pnlColorPreview.Height - 1);
             };
             gbColor.Controls.Add(pnlColorPreview);
 
             btnPickColor = new Button
             {
                 Text = "Pick Colour...",
-                Location = new Point(90, 25),
-                Size = new Size(110, 30),
-                BackColor = Color.FromArgb(45, 48, 58),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat
+                Location = new Point(72, 35),
+                Size = new Size(95, 28),
+                BackColor = Theme.SurfaceElevated,
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.FontBodySecondary,
+                FlatStyle = FlatStyle.Flat,
+                TabIndex = 2,
+                AccessibleName = "Open Windows Color Picker dialog"
             };
-            btnPickColor.FlatAppearance.BorderSize = 0;
+            btnPickColor.FlatAppearance.BorderColor = Theme.Border;
+            btnPickColor.FlatAppearance.BorderSize = 1;
             btnPickColor.Click += BtnPickColor_Click;
             gbColor.Controls.Add(btnPickColor);
 
-            Label lblHex = new Label { Text = "Hex Code:", Location = new Point(220, 30), AutoSize = true, ForeColor = Color.FromArgb(200, 200, 210) };
+            Label lblHex = new Label
+            {
+                Text = "Hex:",
+                Location = new Point(178, 41),
+                AutoSize = true,
+                ForeColor = Theme.TextSecondary,
+                Font = Theme.FontBodySecondary
+            };
             txtHex = new TextBox
             {
                 Text = currentProfile != null ? currentProfile.HexColor : "#BE59FF",
-                Location = new Point(290, 27),
-                Size = new Size(95, 26),
-                BackColor = Color.FromArgb(32, 34, 40),
-                ForeColor = Color.White,
+                Location = new Point(212, 37),
+                Size = new Size(85, 24),
+                BackColor = Theme.SurfaceElevated,
+                ForeColor = Theme.TextPrimary,
                 BorderStyle = BorderStyle.FixedSingle,
-                MaxLength = 7
+                Font = Theme.FontMono,
+                TextAlign = HorizontalAlignment.Center,
+                MaxLength = 7,
+                TabIndex = 3,
+                AccessibleName = "Hex Color Code"
             };
             txtHex.Leave += TxtHex_Leave;
             txtHex.KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Enter) TxtHex_Leave(s, e); };
             gbColor.Controls.Add(lblHex);
             gbColor.Controls.Add(txtHex);
 
-            // Quick Preset Buttons
+            // Quick Preset Buttons (9 Presets, 53px width each, 4px spacing)
             string[] presetNames = new string[] { "Lavender", "Purple", "Cyan", "Ice Blue", "Mint", "Green", "Gold", "Pink", "White" };
             Color[] presetColors = new Color[] {
                 Color.FromArgb(190, 89, 255), Color.FromArgb(180, 0, 255), Color.FromArgb(0, 255, 255),
@@ -1122,50 +1324,53 @@ namespace RedgearA20ControlCenter
                 Color.FromArgb(255, 180, 0), Color.FromArgb(255, 50, 140), Color.FromArgb(255, 255, 255)
             };
 
-            int qx = 20;
+            presetButtons = new Button[presetNames.Length];
+            int qx = 12;
             for (int i = 0; i < presetNames.Length; i++)
             {
+                Color pColor = presetColors[i];
+                bool isInitSelected = (currentColor.ToArgb() == pColor.ToArgb());
                 Button btnPreset = new Button
                 {
                     Text = presetNames[i],
-                    Location = new Point(qx, 80),
-                    Size = new Size(52, 26),
-                    BackColor = Color.FromArgb(35, 38, 46),
-                    ForeColor = Color.FromArgb(215, 215, 225),
-                    Font = new Font("Segoe UI", 7.5f),
+                    Location = new Point(qx, 76),
+                    Size = new Size(53, 24),
+                    BackColor = Theme.SurfaceElevated,
+                    ForeColor = isInitSelected ? Color.White : Theme.TextSecondary,
+                    Font = Theme.FontBadge,
                     FlatStyle = FlatStyle.Flat,
-                    Tag = presetColors[i]
+                    Tag = pColor,
+                    TabIndex = 4 + i,
+                    AccessibleName = presetNames[i] + " color preset"
                 };
-                btnPreset.FlatAppearance.BorderColor = Color.FromArgb(55, 58, 70);
+                btnPreset.FlatAppearance.BorderColor = isInitSelected ? Theme.Accent : Theme.Border;
+                btnPreset.FlatAppearance.BorderSize = 1;
                 btnPreset.Click += delegate(object s, EventArgs e)
                 {
                     Button b = (Button)s;
-                    currentColor = (Color)b.Tag;
-                    txtHex.Text = string.Format("#{0:X2}{1:X2}{2:X2}", currentColor.R, currentColor.G, currentColor.B);
-                    UpdateColorPreview();
+                    OnPresetButtonClick(b, (Color)b.Tag);
                 };
+                presetButtons[i] = btnPreset;
                 gbColor.Controls.Add(btnPreset);
-                qx += 56;
+                qx += 57;
             }
             body.Controls.Add(gbColor);
 
             // ─── Group 2: Brightness Control ───
-            GroupBox gbBright = new GroupBox
-            {
-                Text = "  2. Brightness Slider (Verified PWM Proportion Scaling)  ",
-                Location = new Point(0, 135),
-                Size = new Size(535, 75),
-                ForeColor = Color.FromArgb(180, 185, 205)
-            };
+            Panel gbBright = CreateSectionPanel(new Point(0, 123), new Size(535, 68), "2. Brightness Slider", "PWM Proportion Scaling", false);
 
             tbBrightness = new TrackBar
             {
-                Location = new Point(15, 22),
-                Size = new Size(420, 45),
+                Location = new Point(12, 30),
+                Size = new Size(445, 30),
                 Minimum = 5,
                 Maximum = 100,
                 Value = currentBrightness,
-                TickFrequency = 10
+                TickFrequency = 10,
+                TickStyle = TickStyle.None,
+                BackColor = Theme.Surface,
+                TabIndex = 13,
+                AccessibleName = "Brightness Percentage Slider"
             };
             tbBrightness.ValueChanged += delegate
             {
@@ -1178,117 +1383,123 @@ namespace RedgearA20ControlCenter
             lblBrightnessVal = new Label
             {
                 Text = currentBrightness.ToString() + "%",
-                Location = new Point(445, 27),
-                AutoSize = true,
-                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
-                ForeColor = Color.FromArgb(140, 200, 255)
+                Location = new Point(462, 32),
+                Size = new Size(60, 24),
+                TextAlign = ContentAlignment.MiddleRight,
+                Font = Theme.FontHeading,
+                ForeColor = Theme.Accent
             };
             gbBright.Controls.Add(lblBrightnessVal);
             body.Controls.Add(gbBright);
 
             // ─── Action Buttons (Safe Decoupled Architecture) ───
+            Panel pnlActions = new Panel { Location = new Point(0, 199), Size = new Size(535, 36) };
+
             btnApply = new Button
             {
                 Text = "▶ Apply (RAM)",
-                Location = new Point(0, 220),
-                Size = new Size(165, 38),
-                BackColor = Color.FromArgb(130, 60, 220),
-                ForeColor = Color.White,
-                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-                FlatStyle = FlatStyle.Flat
+                Location = new Point(0, 0),
+                Size = new Size(155, 36),
+                BackColor = Theme.SurfaceElevated,
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.FontBodyBold,
+                FlatStyle = FlatStyle.Flat,
+                TabIndex = 14,
+                AccessibleName = "Apply settings to mouse volatile RAM"
             };
-            btnApply.FlatAppearance.BorderSize = 0;
+            btnApply.FlatAppearance.BorderColor = Theme.Border;
+            btnApply.FlatAppearance.BorderSize = 1;
             btnApply.Click += BtnApply_Click;
-            body.Controls.Add(btnApply);
+            pnlActions.Controls.Add(btnApply);
 
             btnSave = new Button
             {
                 Text = "💾 Save Profile",
-                Location = new Point(175, 220),
-                Size = new Size(195, 38),
-                BackColor = Color.FromArgb(38, 120, 75),
-                ForeColor = Color.White,
-                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
-                FlatStyle = FlatStyle.Flat
+                Location = new Point(163, 0),
+                Size = new Size(209, 36),
+                BackColor = Theme.Accent,
+                ForeColor = Theme.AccentText,
+                Font = Theme.FontBodyBold,
+                FlatStyle = FlatStyle.Flat,
+                TabIndex = 15,
+                AccessibleName = "Save profile and enable auto-apply persistence"
             };
-            btnSave.FlatAppearance.BorderSize = 0;
+            btnSave.FlatAppearance.BorderColor = Theme.AccentHover;
+            btnSave.FlatAppearance.BorderSize = 1;
             btnSave.Click += BtnSave_Click;
-            body.Controls.Add(btnSave);
+            pnlActions.Controls.Add(btnSave);
 
             btnReset = new Button
             {
                 Text = "↺ Reset Profile",
-                Location = new Point(380, 220),
-                Size = new Size(155, 38),
-                BackColor = Color.FromArgb(48, 52, 62),
-                ForeColor = Color.FromArgb(220, 220, 230),
-                Font = new Font("Segoe UI", 9.0f, FontStyle.Regular),
-                FlatStyle = FlatStyle.Flat
+                Location = new Point(380, 0),
+                Size = new Size(155, 36),
+                BackColor = Theme.Surface,
+                ForeColor = Theme.TextSecondary,
+                Font = Theme.FontBodyPrimary,
+                FlatStyle = FlatStyle.Flat,
+                TabIndex = 16,
+                AccessibleName = "Reset mouse to factory default profile"
             };
-            btnReset.FlatAppearance.BorderSize = 0;
+            btnReset.FlatAppearance.BorderColor = Theme.Border;
+            btnReset.FlatAppearance.BorderSize = 1;
             btnReset.Click += BtnReset_Click;
-            body.Controls.Add(btnReset);
+            pnlActions.Controls.Add(btnReset);
+
+            body.Controls.Add(pnlActions);
 
             // ─── Group 3: Persistence Mode (Instant A704 Auto-Apply) ───
-            gbPersistence = new GroupBox
-            {
-                Text = "  3. Persistence Mode (Instant A704 Auto-Apply)  ",
-                Location = new Point(0, 270),
-                Size = new Size(535, 105),
-                ForeColor = Color.FromArgb(180, 185, 205)
-            };
+            gbPersistence = CreateSectionPanel(new Point(0, 243), new Size(535, 96), "3. Persistence Mode", "Instant A704 Auto-Apply", false);
 
             rbStealth = new RadioButton
             {
-                Text = "🚀 Stealth Driver Watcher (Invisible, No Tray Icon, ~1.8 MB RAM — Recommended)",
-                Location = new Point(15, 20),
-                Size = new Size(510, 24),
-                ForeColor = Color.FromArgb(80, 230, 130),
-                Font = new Font("Segoe UI", 9.0f, FontStyle.Bold),
-                Checked = currentProfile == null || currentProfile.Mode == PersistenceMode.StealthWatcher
+                Text = "Stealth Driver Watcher (Invisible, No Tray Icon, ~1.8 MB RAM — Recommended)",
+                Location = new Point(14, 28),
+                Size = new Size(505, 20),
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.FontBodyBold,
+                Checked = currentProfile == null || currentProfile.Mode == PersistenceMode.StealthWatcher,
+                TabIndex = 17
             };
             gbPersistence.Controls.Add(rbStealth);
 
             rbTrayAgent = new RadioButton
             {
-                Text = "📌 Tray Agent Mode (~2.7 MB RAM, quick access tray icon)",
-                Location = new Point(15, 46),
-                Size = new Size(510, 24),
-                ForeColor = Color.FromArgb(140, 200, 255),
-                Font = new Font("Segoe UI", 9.0f, FontStyle.Regular),
-                Checked = currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent
+                Text = "Tray Agent Mode (~2.7 MB RAM, quick access tray icon)",
+                Location = new Point(14, 49),
+                Size = new Size(505, 20),
+                ForeColor = Theme.TextSecondary,
+                Font = Theme.FontBodyPrimary,
+                Checked = currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent,
+                TabIndex = 18
             };
             gbPersistence.Controls.Add(rbTrayAgent);
 
             rbDisabled = new RadioButton
             {
-                Text = "○ Disabled (RAM only - profile resets when mouse is unplugged or PC restarts)",
-                Location = new Point(15, 72),
-                Size = new Size(510, 24),
-                ForeColor = Color.FromArgb(180, 180, 190),
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
-                Checked = currentProfile != null && currentProfile.Mode == PersistenceMode.Disabled
+                Text = "Disabled (RAM only - profile resets when mouse is unplugged or PC restarts)",
+                Location = new Point(14, 70),
+                Size = new Size(505, 20),
+                ForeColor = Theme.TextMuted,
+                Font = Theme.FontBodySecondary,
+                Checked = currentProfile != null && currentProfile.Mode == PersistenceMode.Disabled,
+                TabIndex = 19
             };
             gbPersistence.Controls.Add(rbDisabled);
             body.Controls.Add(gbPersistence);
 
-            // ─── Group 4: ⚠️ EXPERIMENTAL - DPI Controls ───
-            gbDpi = new GroupBox
-            {
-                Text = "  4. ⚠️ EXPERIMENTAL - DPI Stage (Disabled by Default)  ",
-                Location = new Point(0, 385),
-                Size = new Size(535, 85),
-                ForeColor = Color.FromArgb(220, 150, 60)
-            };
+            // ─── Group 4: EXPERIMENTAL - DPI Controls ───
+            gbDpi = CreateSectionPanel(new Point(0, 347), new Size(535, 78), "4. Experimental DPI Stages", "Cmd 0x09", true);
 
             cbEnableDpi = new CheckBox
             {
-                Text = "Enable Experimental DPI Controls (I understand this uses unverified Cmd 0x09)",
-                Location = new Point(15, 20),
-                Size = new Size(500, 20),
-                ForeColor = Color.FromArgb(235, 180, 100),
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-                Checked = currentProfile != null && currentProfile.EnableDpi
+                Text = "Enable Experimental DPI Controls (unverified Cmd 0x09)",
+                Location = new Point(14, 25),
+                Size = new Size(505, 20),
+                ForeColor = Theme.Warning,
+                Font = Theme.FontBodyBold,
+                Checked = currentProfile != null && currentProfile.EnableDpi,
+                TabIndex = 20
             };
             cbEnableDpi.CheckedChanged += delegate
             {
@@ -1298,15 +1509,24 @@ namespace RedgearA20ControlCenter
             };
             gbDpi.Controls.Add(cbEnableDpi);
 
-            Label lblSelectDpi = new Label { Text = "Select DPI Target:", Location = new Point(15, 48), AutoSize = true, ForeColor = Color.FromArgb(190, 190, 200) };
+            Label lblSelectDpi = new Label
+            {
+                Text = "Target Stage:",
+                Location = new Point(14, 48),
+                Size = new Size(85, 20),
+                ForeColor = Theme.TextSecondary,
+                Font = Theme.FontBodySecondary
+            };
             cmbDpiStages = new ComboBox
             {
-                Location = new Point(130, 45),
-                Size = new Size(230, 25),
+                Location = new Point(102, 46),
+                Size = new Size(278, 24),
                 DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Color.FromArgb(32, 34, 40),
-                ForeColor = Color.White,
-                Enabled = currentProfile != null && currentProfile.EnableDpi
+                BackColor = Theme.SurfaceElevated,
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.FontBodyPrimary,
+                Enabled = currentProfile != null && currentProfile.EnableDpi,
+                TabIndex = 21
             };
             cmbDpiStages.Items.AddRange(new object[] {
                 "Stage 0: 600 DPI (Default Blue)",
@@ -1317,56 +1537,62 @@ namespace RedgearA20ControlCenter
                 "Stage 5: 3200 DPI (Default White)"
             });
             cmbDpiStages.SelectedIndex = currentProfile != null ? Math.Max(0, Math.Min(5, currentProfile.ActiveDpiStage)) : 1;
+            try { SetWindowTheme(cmbDpiStages.Handle, "DarkMode_Explorer", null); } catch { }
+
             gbDpi.Controls.Add(lblSelectDpi);
             gbDpi.Controls.Add(cmbDpiStages);
 
             btnTestDpi = new Button
             {
                 Text = "Test DPI (RAM)",
-                Location = new Point(375, 43),
-                Size = new Size(140, 28),
-                BackColor = Color.FromArgb(65, 50, 30),
-                ForeColor = Color.FromArgb(255, 200, 100),
+                Location = new Point(390, 44),
+                Size = new Size(133, 26),
+                BackColor = Color.FromArgb(48, 32, 12),
+                ForeColor = Theme.Warning,
+                Font = Theme.FontBodyBold,
                 FlatStyle = FlatStyle.Flat,
-                Enabled = currentProfile != null && currentProfile.EnableDpi
+                Enabled = currentProfile != null && currentProfile.EnableDpi,
+                TabIndex = 22,
+                AccessibleName = "Test selected DPI stage in volatile RAM"
             };
-            btnTestDpi.FlatAppearance.BorderColor = Color.FromArgb(130, 95, 45);
+            btnTestDpi.FlatAppearance.BorderColor = Theme.WarningBorder;
+            btnTestDpi.FlatAppearance.BorderSize = 1;
             btnTestDpi.Click += BtnTestDpi_Click;
             gbDpi.Controls.Add(btnTestDpi);
 
             body.Controls.Add(gbDpi);
 
             // ─── Group 5: Live Diagnostic Log Panel ───
-            GroupBox gbLog = new GroupBox
-            {
-                Text = "  5. Diagnostic USB Report Log (Every Packet & Return Code)  ",
-                Location = new Point(0, 480),
-                Size = new Size(535, 245),
-                ForeColor = Color.FromArgb(180, 185, 205)
-            };
+            Panel gbLog = CreateSectionPanel(new Point(0, 433), new Size(535, 295), "5. Diagnostic USB Packet Log", "Report ID 0x07", false);
 
             rtbLog = new RichTextBox
             {
-                Location = new Point(15, 22),
-                Size = new Size(505, 180),
+                Location = new Point(12, 32),
+                Size = new Size(511, 224),
                 ReadOnly = true,
-                BackColor = Color.FromArgb(14, 15, 18),
-                ForeColor = Color.FromArgb(0, 230, 130),
-                Font = new Font("Consolas", 8.75f, FontStyle.Regular),
-                BorderStyle = BorderStyle.None
+                BackColor = Theme.TerminalBg,
+                ForeColor = Theme.TerminalText,
+                Font = Theme.FontMono,
+                BorderStyle = BorderStyle.None,
+                TabIndex = 23,
+                AccessibleName = "Diagnostic USB HID packet return code log"
             };
             gbLog.Controls.Add(rtbLog);
 
             btnCopyLog = new Button
             {
                 Text = "Copy Log",
-                Location = new Point(350, 209),
-                Size = new Size(80, 26),
-                BackColor = Color.FromArgb(40, 42, 50),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat
+                Location = new Point(355, 262),
+                Size = new Size(80, 25),
+                BackColor = Theme.SurfaceElevated,
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.FontBodySecondary,
+                FlatStyle = FlatStyle.Flat,
+                TabIndex = 24,
+                AccessibleName = "Copy diagnostic log to clipboard"
             };
-            btnCopyLog.FlatAppearance.BorderSize = 0;
+            btnCopyLog.FlatAppearance.BorderColor = Theme.Border;
+            btnCopyLog.FlatAppearance.BorderSize = 1;
             btnCopyLog.Click += delegate
             {
                 if (!string.IsNullOrEmpty(rtbLog.Text))
@@ -1380,13 +1606,17 @@ namespace RedgearA20ControlCenter
             btnClearLog = new Button
             {
                 Text = "Clear Log",
-                Location = new Point(440, 209),
-                Size = new Size(80, 26),
-                BackColor = Color.FromArgb(40, 42, 50),
-                ForeColor = Color.White,
-                FlatStyle = FlatStyle.Flat
+                Location = new Point(443, 262),
+                Size = new Size(80, 25),
+                BackColor = Theme.Surface,
+                ForeColor = Theme.TextSecondary,
+                Font = Theme.FontBodySecondary,
+                FlatStyle = FlatStyle.Flat,
+                TabIndex = 25,
+                AccessibleName = "Clear diagnostic log text"
             };
-            btnClearLog.FlatAppearance.BorderSize = 0;
+            btnClearLog.FlatAppearance.BorderColor = Theme.Border;
+            btnClearLog.FlatAppearance.BorderSize = 1;
             btnClearLog.Click += delegate { rtbLog.Clear(); };
             gbLog.Controls.Add(btnClearLog);
 
@@ -1406,7 +1636,7 @@ namespace RedgearA20ControlCenter
             rtbLog.SelectionStart = rtbLog.TextLength;
             rtbLog.SelectionLength = 0;
             rtbLog.SelectionColor = col;
-            rtbLog.AppendText(string.Format("[{0}] {1}\n", DateTime.Now.ToString("HH:mm:ss.fff"), msg));
+            rtbLog.AppendText(string.Format(CultureInfo.InvariantCulture, "[{0:HH:mm:ss.fff}] {1}\n", DateTime.Now, msg));
             rtbLog.ScrollToCaret();
         }
 
@@ -1425,14 +1655,14 @@ namespace RedgearA20ControlCenter
             if (cachedDevicePath != null)
             {
                 lblStatus.Text = string.Format("● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0x{0:X4})", cachedUsagePage);
-                lblStatus.ForeColor = Color.FromArgb(80, 230, 130);
-                Log(string.Format("Hardware detected: {0} (UsagePage 0x{1:X4})", cachedDevicePath, cachedUsagePage), Color.FromArgb(140, 200, 255));
+                lblStatus.ForeColor = Theme.Accent;
+                Log(string.Format("Hardware detected: {0} (UsagePage 0x{1:X4})", cachedDevicePath, cachedUsagePage), Theme.Accent);
             }
             else
             {
                 lblStatus.Text = "○ Device Not Found. Is USB Connected?";
-                lblStatus.ForeColor = Color.FromArgb(255, 100, 100);
-                Log("Device search completed: Redgear A20 (18F8:0FC0) not currently enumerated.", Color.FromArgb(255, 120, 120));
+                lblStatus.ForeColor = Theme.Danger;
+                Log("Device search completed: Redgear A20 (18F8:0FC0) not currently enumerated.", Theme.Danger);
             }
         }
 
@@ -1463,8 +1693,10 @@ namespace RedgearA20ControlCenter
             }
         }
 
-        private void TxtHex_Leave(object sender, EventArgs e)
+        private bool TrySyncHexColor(out string error)
         {
+            error = null;
+            if (txtHex == null) return true;
             string raw = txtHex.Text.Trim();
             if (!raw.StartsWith("#")) raw = "#" + raw;
 
@@ -1476,10 +1708,21 @@ namespace RedgearA20ControlCenter
                 currentColor = Color.FromArgb(r, g, b);
                 txtHex.Text = raw.ToUpper();
                 UpdateColorPreview();
+                return true;
             }
             else
             {
-                MessageBox.Show("Invalid Hex Color format. Please use #RRGGBB (e.g. #BE59FF)", "Format Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                error = "Invalid Hex Color format. Please use #RRGGBB (e.g. #BE59FF)";
+                return false;
+            }
+        }
+
+        private void TxtHex_Leave(object sender, EventArgs e)
+        {
+            string err;
+            if (!TrySyncHexColor(out err))
+            {
+                MessageBox.Show(err, "Format Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 txtHex.Text = string.Format("#{0:X2}{1:X2}{2:X2}", currentColor.R, currentColor.G, currentColor.B);
             }
         }
@@ -1779,14 +2022,23 @@ namespace RedgearA20ControlCenter
                 }
             }
 
+            byte activeDpi = (byte)Math.Max(0, Math.Min(5, currentProfile != null ? currentProfile.ActiveDpiStage : 1));
+            bool sendDpi = currentProfile != null && currentProfile.EnableDpi;
+
+            if (!silent && !this.InvokeRequired)
+            {
+                if (cmbDpiStages != null) activeDpi = (byte)Math.Max(0, Math.Min(5, cmbDpiStages.SelectedIndex));
+                if (cbEnableDpi != null) sendDpi = cbEnableDpi.Checked;
+            }
+
             SaveParameters p = new SaveParameters
             {
                 Color = currentColor,
                 Brightness = currentBrightness,
-                ActiveDpiIndex = (byte)Math.Max(0, Math.Min(5, cmbDpiStages != null ? cmbDpiStages.SelectedIndex : 1)),
+                ActiveDpiIndex = activeDpi,
                 DpiMask = 0x3F,
                 CommitToFlash = false, // Volatile RAM - Instant A704 registers
-                SendDpi = cbEnableDpi != null && cbEnableDpi.Checked
+                SendDpi = sendDpi
             };
 
             string targetPath = cachedDevicePath;
@@ -1809,6 +2061,17 @@ namespace RedgearA20ControlCenter
                 {
                     string friendlyMsg = TranslateWin32Error(res.Win32ErrorCode);
                     Log(string.Format("❌ Apply failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
+
+                    if (res.Win32ErrorCode == 1167 || res.Win32ErrorCode == 2 || res.Win32ErrorCode == 6)
+                    {
+                        cachedDevicePath = null;
+                        if (!silent && !this.InvokeRequired && lblStatus != null)
+                        {
+                            lblStatus.Text = "○ Device Not Found. Is USB Connected?";
+                            lblStatus.ForeColor = Color.FromArgb(255, 100, 100);
+                        }
+                    }
+
                     if (!silent)
                     {
                         MessageBox.Show(string.Format("Failed to apply settings at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -1827,12 +2090,27 @@ namespace RedgearA20ControlCenter
         private async void BtnApply_Click(object sender, EventArgs e)
         {
             if (isSavingInProgress) return;
+            string err;
+            if (!TrySyncHexColor(out err))
+            {
+                MessageBox.Show(err, "Format Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                txtHex.Text = string.Format("#{0:X2}{1:X2}{2:X2}", currentColor.R, currentColor.G, currentColor.B);
+                return;
+            }
             await ApplyCurrentProfileAsync(silent: false);
         }
 
         private async void BtnSave_Click(object sender, EventArgs e)
         {
             if (isSavingInProgress) return;
+
+            string hexErr;
+            if (!TrySyncHexColor(out hexErr))
+            {
+                MessageBox.Show(hexErr, "Format Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                txtHex.Text = string.Format("#{0:X2}{1:X2}{2:X2}", currentColor.R, currentColor.G, currentColor.B);
+                return;
+            }
 
             if (string.IsNullOrEmpty(cachedDevicePath))
             {
@@ -1845,10 +2123,7 @@ namespace RedgearA20ControlCenter
             }
 
             if (currentProfile == null) currentProfile = new AppProfile();
-            string hexInput = txtHex.Text.Trim();
-            if (!hexInput.StartsWith("#")) hexInput = "#" + hexInput;
-            currentProfile.HexColor = hexInput;
-            currentColor = ParseColor(hexInput);
+            currentProfile.HexColor = txtHex.Text;
             currentProfile.Brightness = currentBrightness;
             currentProfile.ActiveDpiStage = cmbDpiStages != null ? cmbDpiStages.SelectedIndex : 1;
             currentProfile.EnableDpi = cbEnableDpi != null && cbEnableDpi.Checked;
@@ -1860,7 +2135,13 @@ namespace RedgearA20ControlCenter
             else
                 currentProfile.Mode = PersistenceMode.Disabled;
 
-            currentProfile.Save();
+            string saveErr;
+            if (!currentProfile.Save(out saveErr))
+            {
+                Log("❌ Failed to save profile to disk: " + saveErr, Color.FromArgb(255, 80, 80));
+                MessageBox.Show("Failed to save profile to disk:\n\n" + saveErr, "Save Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
 
             // Clean up any legacy Task Scheduler task
             string dummy;
@@ -1958,10 +2239,10 @@ namespace RedgearA20ControlCenter
                 PipelineResult res = await Task.Run(() => ExecuteFactoryReset(targetPath, Log));
                 if (res.Success)
                 {
-                    currentColor = Color.FromArgb(190, 89, 255);
+                    currentColor = Color.FromArgb(255, 255, 0);
                     currentBrightness = 100;
                     tbBrightness.Value = 100;
-                    txtHex.Text = "#BE59FF";
+                    txtHex.Text = "#FFFF00";
                     if (rbDisabled != null) rbDisabled.Checked = true;
                     if (cbEnableDpi != null) cbEnableDpi.Checked = false;
                     if (cmbDpiStages != null) cmbDpiStages.SelectedIndex = 1;
@@ -1969,12 +2250,16 @@ namespace RedgearA20ControlCenter
 
                     if (currentProfile != null)
                     {
-                        currentProfile.HexColor = "#BE59FF";
+                        currentProfile.HexColor = "#FFFF00";
                         currentProfile.Brightness = 100;
                         currentProfile.ActiveDpiStage = 1;
                         currentProfile.EnableDpi = false;
                         currentProfile.Mode = PersistenceMode.Disabled;
-                        currentProfile.Save();
+                        string saveErr;
+                        if (!currentProfile.Save(out saveErr))
+                        {
+                            Log("⚠️ Warning: Failed to save reset profile to disk: " + saveErr, Color.FromArgb(255, 120, 50));
+                        }
                     }
                     SetAutoStart(PersistenceMode.Disabled);
 
@@ -1989,6 +2274,15 @@ namespace RedgearA20ControlCenter
                 {
                     string friendlyMsg = TranslateWin32Error(res.Win32ErrorCode);
                     Log(string.Format("❌ Factory reset failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
+                    if (res.Win32ErrorCode == 1167 || res.Win32ErrorCode == 2 || res.Win32ErrorCode == 6)
+                    {
+                        cachedDevicePath = null;
+                        if (lblStatus != null)
+                        {
+                            lblStatus.Text = "○ Device Not Found. Is USB Connected?";
+                            lblStatus.ForeColor = Color.FromArgb(255, 100, 100);
+                        }
+                    }
                     MessageBox.Show(string.Format("Factory reset failed at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Reset Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
             }
@@ -1996,13 +2290,16 @@ namespace RedgearA20ControlCenter
             {
                 isSavingInProgress = false;
                 body.Enabled = true;
-                lblStatus.Text = string.Format("● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0x{0:X4})", cachedUsagePage);
-                lblStatus.ForeColor = Color.FromArgb(80, 230, 130);
+                if (!string.IsNullOrEmpty(cachedDevicePath) && lblStatus != null)
+                {
+                    lblStatus.Text = string.Format("● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0x{0:X4})", cachedUsagePage);
+                    lblStatus.ForeColor = Color.FromArgb(80, 230, 130);
+                }
             }
         }
 
         // ─── UNVERIFIED / EXPERIMENTAL SECTION: DPI TESTING ───
-        private void BtnTestDpi_Click(object sender, EventArgs e)
+        private async void BtnTestDpi_Click(object sender, EventArgs e)
         {
             if (!cbEnableDpi.Checked) return;
             if (string.IsNullOrEmpty(cachedDevicePath))
@@ -2013,34 +2310,55 @@ namespace RedgearA20ControlCenter
 
             int selectedStage = cmbDpiStages.SelectedIndex;
             if (selectedStage < 0 || selectedStage > 5) selectedStage = 0;
+            string targetPath = cachedDevicePath;
 
             btnTestDpi.Enabled = false;
-            bool lockAcquired = false;
-            Mutex hwMutex = null;
 
             try
             {
-                try
-                {
-                    hwMutex = new Mutex(false, TaskSchedulerHelper.HARDWARE_MUTEX_NAME);
-                    try { lockAcquired = hwMutex.WaitOne(3000, false); }
-                    catch (AbandonedMutexException) { lockAcquired = true; }
-                }
-                catch { lockAcquired = false; }
-
-                if (!lockAcquired)
-                {
-                    Log("Cmd 0x09: Hardware lock timeout (Device busy).", Color.FromArgb(255, 80, 80));
-                    return;
-                }
-
                 Log("⚠️ --- Transmitting EXPERIMENTAL DPI Command 0x09 (RAM Only, Never Flashed) ---", Color.FromArgb(255, 120, 50));
 
                 byte b2 = (byte)(0x40 | (selectedStage & 0x07));
                 byte[] dpiPacket = new byte[] { HidTransport.REPORT_ID, 0x09, b2, 0x08, 0x3F, 0x00, 0x00, 0x00 };
 
-                string err;
-                bool ok = HidTransport.SendSinglePacket(cachedDevicePath, dpiPacket, out err);
+                bool lockAcquired = false;
+                string err = null;
+                bool ok = false;
+
+                bool lockSuccess = await Task.Run(() =>
+                {
+                    Mutex hwMutex = null;
+                    try
+                    {
+                        try
+                        {
+                            hwMutex = new Mutex(false, TaskSchedulerHelper.HARDWARE_MUTEX_NAME);
+                            try { lockAcquired = hwMutex.WaitOne(3000, false); }
+                            catch (AbandonedMutexException) { lockAcquired = true; }
+                        }
+                        catch { lockAcquired = false; }
+
+                        if (!lockAcquired) return false;
+
+                        ok = HidTransport.SendSinglePacket(targetPath, dpiPacket, out err);
+                        return true;
+                    }
+                    finally
+                    {
+                        if (hwMutex != null)
+                        {
+                            if (lockAcquired) { try { hwMutex.ReleaseMutex(); } catch { } }
+                            hwMutex.Close();
+                        }
+                    }
+                });
+
+                if (!lockSuccess)
+                {
+                    Log("Cmd 0x09: Hardware lock timeout (Device busy).", Color.FromArgb(255, 80, 80));
+                    return;
+                }
+
                 if (ok)
                 {
                     Log(string.Format("Cmd 0x09 [Stage {0}]: {1} -> OK", selectedStage, FormatHex(dpiPacket)), Color.FromArgb(255, 200, 80));
@@ -2053,11 +2371,6 @@ namespace RedgearA20ControlCenter
             }
             finally
             {
-                if (hwMutex != null)
-                {
-                    if (lockAcquired) { try { hwMutex.ReleaseMutex(); } catch { } }
-                    hwMutex.Close();
-                }
                 btnTestDpi.Enabled = true;
             }
         }
@@ -2133,6 +2446,21 @@ namespace RedgearA20ControlCenter
             }
         }
 
+        private static void LogUnhandledException(Exception ex, bool isFatal)
+        {
+            if (ex == null) return;
+            try
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "RedgearA20");
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                string logFile = Path.Combine(dir, "crash.log");
+                string entry = string.Format(CultureInfo.InvariantCulture, "[{0:yyyy-MM-dd HH:mm:ss}] {1}Unhandled Exception: {2}\n{3}\n\n",
+                    DateTime.Now, isFatal ? "FATAL " : "", ex.Message, ex.StackTrace);
+                File.AppendAllText(logFile, entry, Encoding.UTF8);
+            }
+            catch { }
+        }
+
         [STAThread]
         public static void Main(string[] args)
         {
@@ -2175,12 +2503,34 @@ namespace RedgearA20ControlCenter
                 }
             }
 
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object sender, ThreadExceptionEventArgs e)
+            {
+                LogUnhandledException(e.Exception, false);
+                if (!startHidden && e.Exception != null)
+                {
+                    MessageBox.Show("An unexpected error occurred:\n\n" + e.Exception.Message + "\n\nDiagnostic details written to %LocalAppData%\\RedgearA20\\crash.log",
+                        "Redgear A20 Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            };
+
+            AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs e)
+            {
+                Exception ex = e.ExceptionObject as Exception;
+                LogUnhandledException(ex, true);
+                if (!startHidden && ex != null)
+                {
+                    MessageBox.Show("A fatal error occurred:\n\n" + ex.Message + "\n\nDiagnostic details written to %LocalAppData%\\RedgearA20\\crash.log",
+                        "Redgear A20 Fatal Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            };
+
             if (installTask)
             {
-                string err;
-                bool ok = TaskSchedulerHelper.InstallTask(out err);
-                if (!ok) Console.Error.WriteLine("Failed to install task: " + err);
-                Environment.Exit(ok ? 0 : 1);
+                Console.WriteLine("Note: Task Scheduler XML installer is deprecated in favor of lightweight Stealth Watcher persistence (--stealth).");
+                Console.WriteLine("Configuring auto-start watcher in Windows Run registry key...");
+                SetAutoStart(PersistenceMode.StealthWatcher);
+                Environment.Exit(0);
                 return;
             }
 

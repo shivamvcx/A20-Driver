@@ -2,16 +2,16 @@
 
 ---
 
-## 📌 Project Overview
+## Project Overview
 * **Target Device**: Redgear A20 RGB Gaming Mouse
 * **Chipset**: Instant Microelectronics OEM USB Gaming Mouse Controller
 * **Hardware Identifiers**: `VID: 0x18F8`, `PID: 0x0FC0`
 * **Communication Interface**: USB HID Feature Reports, Report ID `0x07` (8 Bytes), Endpoint `UsagePage 0xFF01` (Col04)
-* **Status**: v0.1.0 (Verified Solid Color & Brightness in RAM; EEPROM Save in Progress)
+* **Status**: v0.2.0 (Verified Solid Color & Brightness in RAM, Native Manifest & Stealth Hotplug Persistence)
 
 ---
 
-## 📅 Chronological Development Log
+## Chronological Development Log
 
 ### Phase 1: Problem Definition & Hardware Identification
 * **The Problem**: The official Redgear A20 driver software is abandoned, unstable, and fails to configure the mouse's RGB lighting to a fixed color (e.g. Pure Purple). The mouse defaults to an unchangeable slow rainbow spectrum cycle.
@@ -146,4 +146,44 @@
 * **Field Verification**:
   - Verified across physical USB disconnects/reconnects across all USB 2.0 / 3.0 / Type-C hubs.
   - Verified across system reboots, hibernate, and fast-startup wake cycles via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
-  - User confirmation: *"BRUH DAMM ITS WORKING NOW😭😭💕"*.
+  - Verified 100% reliable settings persistence across physical USB reconnects, Modern Standby / sleep cycles, and system cold reboots.
+
+---
+
+### Phase 8: UI Overhaul, Modern Windows Integration & Production-Grade Hardening (v0.2.0)
+
+#### 1. From Raw WinForms to Industrial Precision Utility
+* **The Aesthetic Transformation**:
+  - The v0.1.0 and v0.1.1 interfaces relied on default Windows Forms GroupBoxes and ad-hoc color styling, which gave the tool a prototype-grade appearance.
+  - Formulated a comprehensive Design System specification (`DESIGN.md`) rooted in an "Industrial Precision Utility" philosophy:
+    - Structured dark palette: `#121316` Canvas, `#1A1C22` Surface cards, `#242731` elevated inputs, `#2B2F3A` hairline borders.
+    - Single functional primary accent: Emerald / Hardware Mint (`#10B981`) highlighting actionable states.
+    - Flat 1px card containers (`CreateSectionPanel`) with bold section headings and metadata badges.
+    - Active preset border highlighting (`OnPresetButtonClick`) giving immediate visual confirmation of the active lighting color.
+    - Unified 36px action row aligning `Apply (RAM)`, `Save Profile`, and `Reset Profile` according to action severity and hierarchy.
+* **Zero-Allocation GDI+ Rendering Engine**:
+  - WinForms applications often experience micro-stutter when custom paint handlers dynamically instantiate pens and brushes.
+  - Implemented the static `Theme` token engine with pre-cached GDI+ brushes, pens, and system fonts (`Segoe UI` and `Consolas`), guaranteeing zero heap allocation and zero GC pressure during paint cycles.
+
+#### 2. Native Modern Windows OS Integration (DWM & Manifest)
+* **Immersive Dark Title Bar (`dwmapi.dll`)**:
+  - Windows Forms does not automatically style non-client window frames (title bars and borders) in dark mode.
+  - Implemented `DwmSetWindowAttribute` P/Invoke targeting `DWMWA_USE_IMMERSIVE_DARK_MODE` (attribute 20 and fallback attribute 19). Windows now paints the native title bar in true dark gray/black matching the dark canvas.
+  - Applied `uxtheme.dll` (`SetWindowTheme`) with `"DarkMode_Explorer"` to ensure native combo boxes conform to dark styling.
+* **Per-Monitor V2 High-DPI Awareness (`src/app.manifest`)**:
+  - On high-resolution displays (4K monitors, high-DPI laptops), unmanifested WinForms apps suffer from OS bitmap stretching resulting in blurry text and blurry borders.
+  - Authored a dedicated native Windows application manifest declaring `PerMonitorV2, PerMonitor` DPI awareness and binding to `Microsoft.Windows.Common-Controls` v6.0.0.0.
+  - Configured `AutoScaleMode = AutoScaleMode.Dpi`, ensuring razor-sharp rendering at 100%, 125%, 150%, and 200% Windows desktop scaling.
+
+#### 3. Concurrency, Storage Safety & Fault Tolerance
+* **Asynchronous Hardware Mutex Dispatch**:
+  - In earlier versions, clicking "Test DPI" acquired the hardware synchronization mutex synchronously on the UI thread, causing potential GUI freezes if the device communication encountered latency.
+  - Converted the test handler into an asynchronous background worker (`Task.Run` with `async`/`await`), safely isolating mutex acquisition and packet dispatch away from the message pump.
+* **Atomic Profile Serialization**:
+  - Replaced direct `File.WriteAllText` with a multi-stage atomic commit mechanism: profile data is written to a temporary file (`.tmp`) with UTF-8 encoding and then committed atomically via `File.Replace` (with fallback to `File.Move`).
+  - Completely prevents corrupted or zero-byte JSON files if a user powers off or the system reboots while saving.
+* **Graceful Disconnect Recovery & Hotplug Re-Entrancy Guard**:
+  - Intercepted Win32 error codes `1167` (`ERROR_DEVICE_NOT_CONNECTED`), `2`, and `6` during hardware transmissions. The driver immediately invalidates cached device handles and transitions the UI into a clear, red-tinted disconnected alert state.
+  - Introduced `isHotplugHandling` re-entrancy protection inside `HandleUsbHotplugDebounced` to serialize overlapping device notifications during rapid USB replugging.
+* **Global Crash Diagnostics**:
+  - Registered `Application.ThreadException` and `AppDomain.CurrentDomain.UnhandledException` in `Main()`, ensuring any unexpected error is written to `%LocalAppData%\RedgearA20\crash.log` with complete stack traces and diagnostic timestamps rather than crashing silently.

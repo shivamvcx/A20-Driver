@@ -1,13 +1,13 @@
 # 🏛️ Redgear A20 Control Center: Architecture, Decisions & Developer Guardrails
 
-> **Target Audience**: Core developers, reverse engineers, and AI coding agents working on **v0.1.2**, **v0.2.0**, and future milestones.
-> **Last Updated**: Release v0.1.1 (October 2026)
+> **Target Audience**: Core developers, reverse engineers, and AI coding agents working on **v0.2.0**, **v0.3.0**, and future milestones.
+> **Last Updated**: Release v0.2.0 (October 2026)
 > **Target Device**: Redgear A20 RGB Gaming Mouse (`VID: 0x18F8`, `PID: 0x0FC0`)
 > **Microcontroller**: Instant Microelectronics A704 / A704F USB Optical Gaming Mouse IC
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
 1. [Executive Summary & Core Philosophy](#1-executive-summary--core-philosophy)
 2. [Silicon & Hardware Architecture (The A704 Reality)](#2-silicon--hardware-architecture-the-a704-reality)
@@ -33,9 +33,9 @@
 7. [Window Lifecycle & Exit Mechanics](#7-window-lifecycle--exit-mechanics)
    - [Window Close [X] vs. "Exit App" Button](#window-close-x-vs-exit-app-button)
    - [Accidental Termination Safeguards](#accidental-termination-safeguards)
-8. [⛔ STRICT ANTI-PATTERNS: Things to NEVER Do in v0.1.2 / v0.2.0](#8--strict-anti-patterns-things-to-never-do-in-v012--v020)
-9. [✅ SAFE ROADMAP: Safe Expansion Patterns for v0.1.2 & v0.2.0](#9--safe-roadmap-safe-expansion-patterns-for-v012--v020)
-10. [🧪 Mandatory Pre-Flight Verification Checklist](#10--mandatory-pre-flight-verification-checklist)
+8. [Architectural Anti-Patterns](#8-architectural-anti-patterns)
+9. [Safe Expansion Patterns](#9-safe-expansion-patterns)
+10. [Mandatory Pre-Flight Verification Checklist](#10-mandatory-pre-flight-verification-checklist)
 
 ---
 
@@ -335,44 +335,44 @@ Because terminating the process stops hotplug persistence, `btnExit` displays a 
 
 ---
 
-## 8. ⛔ STRICT ANTI-PATTERNS: Things to NEVER Do in v0.1.2 / v0.2.0
+## 8. Architectural Anti-Patterns
 
 > [!CAUTION]
 > The following actions were intentionally avoided or eliminated after rigorous testing. **DO NOT REINTRODUCE THEM.**
 
-1. ❌ **NEVER add external NuGet packages or third-party DLL dependencies.**
+1. **Never add external NuGet packages or third-party DLL dependencies.**
    - Do NOT add `Newtonsoft.Json`, `HidLibrary`, `Costura.Fody`, or UI skin frameworks.
    - The project's strength is its pure zero-dependency compilation via `csc.exe`. Any JSON parsing needed must be handled via regex or native string helpers.
-2. ❌ **NEVER remove the 50ms inter-packet delay.**
+2. **Never remove the 50ms inter-packet delay.**
    - Removing or lowering `Thread.Sleep(50)` will saturate the Instant A704's endpoint FIFO buffer and lock up physical mouse clicks.
-3. ❌ **NEVER transmit USB packets during slider drag events.**
+3. **Never transmit USB packets during slider drag events.**
    - Live dragging triggers dozens of packets per second. It causes micro-stuttering on the USB bus and risks MCU buffer stalls.
-4. ❌ **NEVER hold persistent open HID file handles.**
+4. **Never hold persistent open HID file handles.**
    - Always open, transmit, flush, and close immediately.
-5. ❌ **NEVER attempt to flash OTP memory addresses.**
+5. **Never attempt to flash OTP memory addresses.**
    - Do not attempt random write commands or fuzz command IDs outside `0x07, 0x09, 0x11, 0x13, 0x14, 0x15, 0x16, 0x20`. Fuzzing undocumented addresses on OTP chipsets can corrupt internal state pointers.
-6. ❌ **NEVER revert to Windows Task Scheduler Event Triggers for USB detection.**
+6. **Never revert to Windows Task Scheduler Event Triggers for USB detection.**
    - As proven in Section 3, Windows Event Log does not record Event 410 on normal runtime USB hotplugging.
-7. ❌ **NEVER bind Left Click or Right Click to unverified actions.**
+7. **Never bind Left Click or Right Click to unverified actions.**
    - In Milestone 4 (Button Remapping), Left Click (`Button 1`) and Right Click (`Button 2`) must have **hardcoded UI locks** preventing them from being unmapped, disabled, or bound to invalid registers.
-8. ❌ **NEVER require Administrator privileges for basic operation.**
+8. **Never require Administrator privileges for basic operation.**
    - Standard user mode is sufficient for HID Feature Reports on vendor collections (`UsagePage 0xFF01`). Requiring elevation annoys users and triggers unnecessary UAC prompts on every reboot.
-9. ❌ **NEVER remove the hardware mutex lock (`Local\RedgearA20_HardwareLock`).**
+9. **Never remove the hardware mutex lock (`Local\RedgearA20_HardwareLock`).**
    - The hardware mutex prevents concurrent dispatches from corrupting multi-packet sequences if a hotplug event fires while the GUI is actively saving.
-10. ❌ **NEVER overwrite `%LocalAppData%\RedgearA20\RedgearA20.exe` without the atomic move-away pattern.**
+10. **Never overwrite `%LocalAppData%\RedgearA20\RedgearA20.exe` without the atomic move-away pattern.**
     - Direct overwriting of a running binary causes `IOException (Sharing Violation)`. Always use `.old` renaming.
 
 ---
 
-## 9. ✅ SAFE ROADMAP: Safe Expansion Patterns for v0.1.2 & v0.2.0
+## 9. Safe Expansion Patterns
 
-### Safe Scope for v0.1.2 (Maintenance & Polish)
+### Safe Scope for v0.2.x (Maintenance & Polish)
 * [x] Enhanced Exit Confirmation Dialog with prominent persistence warnings.
 * [ ] Expanded quick color preset buttons (e.g. Amber, Coral, Deep Ocean, Emerald).
 * [ ] Diagnostic log copy formatting options (Markdown / Plain Text).
 * [ ] System tray icon tooltip enhancements showing active DPI and color.
 
-### Safe Scope for v0.2.0 (Extended Lighting Engine)
+### Safe Scope for v0.3.0 (Extended Lighting Engine)
 * **Breathing Modes (`0x80`–`0x85`)**:
   - Expose hardware breathing mode byte with user-selectable cycle speeds:
     - `0x80`: Slow Pulse (~6s cycle)
@@ -392,7 +392,7 @@ Because terminating the process stops hotplug persistence, `btnExit` displays a 
 
 ---
 
-## 10. 🧪 Mandatory Pre-Flight Verification Checklist
+## 10. Mandatory Pre-Flight Verification Checklist
 
 Before publishing any future release (`v0.1.2`, `v0.2.0`, etc.), the following manual verification battery **MUST** be performed:
 

@@ -1,15 +1,58 @@
-# Compiler outputs & IDE files
+# Compiler outputs, build artifacts & binaries
 bin/
 obj/
 release/
+*.exe
+*.dll
 *.pdb
 *.obj
 *.log
+crash.log
+*.cache
 
-# Local research archive (contains vendor binaries & exploratory test scripts)
+# Temporary, backup & scratch files
+*.tmp
+*.bak
+*.swp
+*~
+*.diff
+*.patch
+
+# Visual Studio & IDE metadata
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# AI Coding Agents & LLM tooling workspaces
+.agents/
+.impeccable/
+skills-lock.json
+.gemini/
+.cursor/
+.claude/
+.windsurf/
+.cline/
+.roo/
+
+# Hardware USB captures & diagnostic crash dumps
+*.pcap
+*.pcapng
+*.dmp
+*.mdmp
+
+# Local research archives & test scratch folders
 _research_archive/
+scratch/
+temp/
+tmp/
 
-# OS metadata
+# OS metadata & system artifacts
 [Dd]esktop.ini
 .DS_Store
 Thumbs.db
+ehthumbs.db
+$RECYCLE.BIN/

@@ -4,7 +4,7 @@ This document outlines the development milestones, planned features, and archite
 
 ---
 
-## 🎯 Project Vision & Guiding Principles
+## Project Vision & Guiding Principles
 
 The official Redgear software is abandoned, bloated, and unstable. Our goal is to provide a clean, high-performance hardware utility inspired by tools like **Logitech Onboard Memory Manager (OMM)** and **OpenRGB**:
 
@@ -14,20 +14,21 @@ The official Redgear software is abandoned, bloated, and unstable. Our goal is t
 
 ---
 
-## 📍 Release Milestones
+## Release Milestones
 
 ```mermaid
 flowchart LR
     v1["v0.1.0\nFoundation & Color\n(RELEASED)"] --> v11["v0.1.1\nStealth Persistence & DPI\n(RELEASED)"]
-    v11 --> v2["v0.2.0\nExtended RGB Effects\n(IN PROGRESS)"]
-    v2 --> v3["v0.3.0\nSensor & Polling Rate\n(PLANNED)"]
-    v3 --> v4["v0.4.0\nButton Remapping\n(RESEARCH)"]
-    v4 --> v5["v1.0.0\nUniversal OEM Support\n(LONG TERM)"]
+    v11 --> v2["v0.2.0\nUI Overhaul & Hardening\n(RELEASED)"]
+    v2 --> v3["v0.3.0\nExtended RGB Effects\n(PLANNED)"]
+    v3 --> v4["v0.4.0\nSensor & Polling Rate\n(PLANNED)"]
+    v4 --> v5["v0.5.0\nButton Remapping\n(RESEARCH)"]
+    v5 --> v6["v1.0.0\nUniversal OEM Support\n(LONG TERM)"]
 ```
 
 ---
 
-### ✅ Milestone 1: v0.1.0 — Core Lighting & Safety Architecture (Released)
+### Milestone 1: v0.1.0 — Core Lighting & Safety Architecture (Released)
 - [x] Full reverse engineering of `Gaming Mouse 2.0.exe` and endpoint collection detection (`UsagePage 0xFF01`).
 - [x] **12-bit Active-Low PWM Color Engine**: 4,096 discrete hardware colors ($16 \times 16 \times 16$).
 - [x] **Proportional Brightness Dimming**: Continuous scaling ($5\text{–}100\%$) while preserving exact color hue.
@@ -38,7 +39,7 @@ flowchart LR
 
 ---
 
-### ✅ Milestone 1.5: v0.1.1 — Stealth Driver Watcher & Instant Persistence (Current Release)
+### Milestone 1.5: v0.1.1 — Stealth Driver Watcher & Instant Persistence (Released)
 - [x] **Stealth Driver Watcher**:
   - Intercepts Win32 `WM_DEVICECHANGE` (`0x0219`) for instant (<50ms) detection of USB insertion on ANY port or hub.
   - Automatically restores custom color and DPI in ~300ms.
@@ -49,18 +50,44 @@ flowchart LR
   - `ChangeWindowMessageFilter` ensures Windows message passing across integrity levels.
   - Launching the `.exe` again smoothly restores the existing GUI; closing via `[X]` hides to stealth mode.
 - [x] **3-Mode Persistence Engine**:
-  - `🚀 Stealth Driver Watcher` (~1.8 MB RAM, invisible)
-  - `📌 Tray Agent Mode` (~2.7 MB RAM, quick access tray icon)
-  - `○ Disabled` (RAM Only)
-- [x] **🎯 ⚠️ Experimental DPI Stage Controls**:
+  - Stealth Driver Watcher (~1.8 MB RAM, invisible)
+  - Tray Agent Mode (~2.7 MB RAM, quick access tray icon)
+  - Disabled (RAM Only)
+- [x] **Experimental DPI Stage Controls**:
   - Opt-in Command `0x09` dispatch for active DPI levels (600, 1000, 1200, 1600, 2400, 3200 DPI) with live RAM testing.
 - [x] **Self-Contained Local Deployment**:
   - Automatic deployment to `%LocalAppData%\RedgearA20\RedgearA20.exe` using atomic move-away rename.
 
 ---
 
-### ⏳ Milestone 2: v0.2.0 — Extended RGB Effects & Lighting Engine
-*Target: Q4 2026*
+### Milestone 2: v0.2.0 — UI Overhaul, Modern Windows Integration & Safety Hardening (Current Release)
+- [x] **Industrial Precision Utility UI Overhaul**:
+  - Engineered dark-mode aesthetic with 1px hairline framing and card containers (`CreateSectionPanel`).
+  - Pre-cached static GDI+ token system (`Theme` class) guaranteeing zero memory allocations or garbage collection stutter during window repainting.
+  - Emerald (`#10B981`) primary functional accent, unified 36px action row (`Apply`, `Save`, `Reset`), and active-state preset border highlighting.
+  - TrackBar modernization with `TickStyle.None` and dynamic percentage readout.
+- [x] **Native Windows 10 & 11 Dark Title Bar**:
+  - Intercepted window handle creation to apply `DWMWA_USE_IMMERSIVE_DARK_MODE` via `dwmapi.dll` P/Invoke.
+- [x] **Per-Monitor V2 High-DPI Scaling & Modern Common Controls**:
+  - Embedded native application manifest (`src/app.manifest`) declaring Per-Monitor V2 DPI awareness and `Microsoft.Windows.Common-Controls` v6.
+- [x] **Multi-Threaded Hardware Concurrency & Safe Mutex Dispatch**:
+  - Offloaded experimental DPI stage testing and hardware mutex synchronization (`TaskSchedulerHelper.HARDWARE_MUTEX_NAME`) to background worker tasks (`Task.Run` with `async`/`await`), eliminating UI thread freezes.
+- [x] **Fault-Tolerant Storage & Crash Diagnostics**:
+  - Atomic profile serialization via temporary file replacement (`File.Replace`), eliminating risk of corrupt JSON files during abrupt system shutdowns.
+  - Global unhandled exception trapping logged to `%LocalAppData%\RedgearA20\crash.log`.
+  - Non-destructive query access (`0`) in HID device path discovery.
+  - Automatic stale device handle invalidation on USB disconnect.
+  - Re-entrancy protection for rapid USB hotplugging (`isHotplugHandling`).
+  - Strict hex input sanitization and validation (`TrySyncHexColor`).
+- [x] **Dual-Architecture Build Pipeline**:
+  - Standardized `build.bat` with automated 64-bit and 32-bit `csc.exe` compiler detection, manifest embedding, and explicit exit codes.
+- [x] **Foundational Strategic Documentation**:
+  - Authored the comprehensive Developer Guardrails bible, 70+ Feature Masterlist, formal Design System tokens, and product specification docs.
+
+---
+
+### Milestone 3: v0.3.0 — Extended RGB Effects & Lighting Engine
+*Target: Q1 2027*
 
 - [ ] **Configurable Breathing Mode**:
   - Expose hardware modes `0x80` through `0x85` with selectable cycle periods (slow pulse to fast pulse).
@@ -75,8 +102,8 @@ flowchart LR
 
 ---
 
-### ⏳ Milestone 3: v0.3.0 — Sensor, Polling Rate & Per-Stage Customization
-*Target: Q1 2027*
+### Milestone 4: v0.4.0 — Sensor, Polling Rate & Per-Stage Customization
+*Target: Q2 2027*
 
 - [ ] **DPI Stage Pruning (Command `0x09`)**:
   - Enable players to reduce the default 6 DPI stages down to 2 or 3 active stages using the hardware bitmask, eliminating redundant DPI cycling during competitive matches.
@@ -87,7 +114,7 @@ flowchart LR
 
 ---
 
-### 🔬 Milestone 4: v0.4.0 — Hardware Button Remapping (Experimental)
+### Milestone 5: v0.5.0 — Hardware Button Remapping (Experimental)
 *Target: Mid 2027*
 
 - [ ] **Side Button Customization (Command `0x15` / `0x16`)**:
@@ -99,7 +126,7 @@ flowchart LR
 
 ---
 
-### 🌐 Milestone 5: v1.0.0 — Multi-Device & Community Profiles
+### Milestone 6: v1.0.0 — Multi-Device & Community Profiles
 *Target: Late 2027*
 
 - [ ] **Device Profile Abstraction**:
@@ -111,7 +138,7 @@ flowchart LR
 
 ---
 
-## 🚫 Out of Scope (Explicit Non-Goals)
+## Out of Scope (Explicit Non-Goals)
 
 To preserve the utility's lightweight nature and protect mouse hardware, the following are explicitly out of scope:
 
