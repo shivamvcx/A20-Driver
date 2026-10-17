@@ -9,7 +9,7 @@
 
 A standalone, zero-bloat, open-source Windows driver and hardware control application for the **Redgear A20 RGB Gaming Mouse** (`VID: 0x18F8 & PID: 0x0FC0`).
 
-I engineered this project single-handedly to replace the abandoned, malfunctioning official vendor software with a clean, high-performance desktop utility that unlocks true 12-bit RGB lighting control, eliminates unwanted rainbow breathing, and communicates directly with mouse hardware without background services or telemetry.
+I engineered this project to replace the abandoned, malfunctioning official vendor software with a clean, high-performance desktop utility that unlocks true 12-bit RGB lighting control, eliminates unwanted rainbow breathing, and communicates directly with mouse hardware without background services or telemetry.
 
 <p align="center">
   <img src="assets/control-center-ui.png" alt="Redgear A20 Control Center UI" width="460">
@@ -173,9 +173,17 @@ To request support or contribute a profile, please open an Issue with:
 
 ## Author & Background
 
-Hey, I'm **[Shivam](https://github.com/shivamvcx)** ([@shivamvcx](https://github.com/shivamvcx)). I single-handedly built and reverse-engineered this project as an independent open-source passion project under my personal development lab, **[Silicon Labs](https://siliconlabs.vercel.app/)**.
+Hey, I'm **[Shivam](https://github.com/shivamvcx)** ([@shivamvcx](https://github.com/shivamvcx)). I created and reverse-engineered this project as an independent open-source passion project under my personal development lab, **[Silicon Labs](https://siliconlabs.vercel.app/)**.
 
-I got tired of the abandoned, buggy official OEM software constantly wiping my mouse's RGB settings on every reboot or USB replug, so I sat down, reverse-engineered the USB HID communication protocol from scratch, and wrote a clean, lightweight driver utility for myself and anyone else using the Redgear A20.
+I got tired of the abandoned, buggy official OEM software constantly wiping my mouse's RGB settings on every reboot or USB replug, so I sat down, reverse-engineered the USB HID communication protocol from scratch, and built a clean, lightweight driver utility for myself and anyone else using the Redgear A20.
+
+### AI Pair-Programming & Transparency
+
+I believe in complete transparency about modern software development workflows:
+* **Hardware Reverse-Engineering & Validation**: All USB packet captures, protocol analysis, hardware hypotheses, safety testing, and physical validation on real hardware were performed hands-on by me with my physical Redgear A20 mouse.
+* **AI Agentic Acceleration**: I partnered extensively with AI coding agents (Google Antigravity) to accelerate implementation — rapidly synthesizing Win32 P/Invoke interop bindings, building the zero-allocation GDI+ token architecture, auditing memory footprints, and structuring comprehensive developer documentation.
+
+Every line of generated code, memory profile, and hardware guardrail was thoroughly reviewed, debugged, and verified against physical hardware to guarantee safety and stability.
 
 ---
 
