@@ -155,7 +155,7 @@
 #### 1. From Raw WinForms to Industrial Precision Utility
 * **The Aesthetic Transformation**:
   - The v0.1.0 and v0.1.1 interfaces relied on default Windows Forms GroupBoxes and ad-hoc color styling, which gave the tool a prototype-grade appearance.
-  - Formulated a comprehensive Design System specification (`DESIGN.md`) rooted in an "Industrial Precision Utility" philosophy:
+  - Formulated a comprehensive Design System specification (`docs/design-tokens.md`) rooted in an "Industrial Precision Utility" philosophy:
     - Structured dark palette: `#121316` Canvas, `#1A1C22` Surface cards, `#242731` elevated inputs, `#2B2F3A` hairline borders.
     - Single functional primary accent: Emerald / Hardware Mint (`#10B981`) highlighting actionable states.
     - Flat 1px card containers (`CreateSectionPanel`) with bold section headings and metadata badges.

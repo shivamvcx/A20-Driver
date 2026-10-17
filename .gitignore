@@ -9,6 +9,8 @@ release/
 *.log
 crash.log
 *.cache
+*.sha256
+*.checksum
 
 # Temporary, backup & scratch files
 *.tmp
@@ -17,6 +19,9 @@ crash.log
 *~
 *.diff
 *.patch
+CHANGES_SINCE_*.md
+*-preview.html
+redesign-preview.html
 
 # Visual Studio & IDE metadata
 .vs/
@@ -31,6 +36,9 @@ crash.log
 .agents/
 .impeccable/
 skills-lock.json
+*.figcraft
+assets/*.figcraft
+assets/Before vs After.png
 .gemini/
 .cursor/
 .claude/

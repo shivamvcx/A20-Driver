@@ -1,10 +1,10 @@
-# 🖱️ Redgear A20 Control Center
+# Redgear A20 Control Center
 
 [![Download Executable](https://img.shields.io/github/v/release/shivamvcx/A20-Driver?include_prereleases&label=Download%20.exe&color=success)](https://github.com/shivamvcx/A20-Driver/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Windows x64](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20(64--bit)-0078D6.svg)](https://microsoft.com)
 [![Architecture: C# WinForms](https://img.shields.io/badge/Architecture-C%23%20WinForms-239120.svg)](src/Program.cs)
-[![Executable Size](https://img.shields.io/badge/Binary%20Size-~65%20KB-orange.svg)](#download--quick-start)
+[![Executable Size](https://img.shields.io/badge/Binary%20Size-~70%20KB-orange.svg)](#download--quick-start)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(Pure%20Win32)-success.svg)](#system--hardware-compatibility)
 
 A standalone, zero-bloat, open-source Windows driver and hardware control application for the **Redgear A20 RGB Gaming Mouse** (`VID: 0x18F8 & PID: 0x0FC0`).
@@ -79,7 +79,7 @@ I engineered this project single-handedly to replace the abandoned, malfunctioni
 * **Live Monospace Diagnostic Log**:
   - Embedded console displaying every 8-byte Feature Report sent and its Win32 return status, with one-click clipboard export.
 * **Ultra-Light Portable Executable**:
-  - Standalone $\approx 65\text{ KB}$ 64-bit executable (`RedgearA20-win-x64.exe`). Zero dependencies, zero installer, zero electron wrappers.
+  - Standalone $\approx 70\text{ KB}$ 64-bit executable (`RedgearA20-win-x64.exe`). Zero dependencies, zero installer, zero electron wrappers.
 
 ---
 
@@ -109,8 +109,8 @@ Packet Structure: [0x07, Command, Param1, Param2, Param3, Param4, Param5, Param6
 
 > **Project Documentation & Technical Guides**:
 > - [Architecture & Guardrails](docs/architecture-decisions-and-guardrails.md) — Core architectural decisions, hardware reality, and strict developer guardrails.
-> - [Design System Tokens](DESIGN.md) — Visual design tokens, GDI+ rendering rules, and palette hierarchy.
-> - [Product Specification](PRODUCT.md) — Target audience, hardware positioning, constraints, and commitments.
+> - [Design System Tokens](docs/design-tokens.md) — Visual design tokens, GDI+ rendering rules, and palette hierarchy.
+> - [Product Specification](docs/product-spec.md) — Target audience, hardware positioning, constraints, and commitments.
 > - [Protocol Specification](docs/protocol-notes.md) — Complete byte-by-byte register and command reference.
 > - [Feature Roadmap](docs/roadmap.md) — Upcoming milestones, planned RGB effects, and sensor tuning.
 > - [Feature Masterlist (v10.0.0)](docs/features-masterlist.md) — Comprehensive long-term end-state feature specification.

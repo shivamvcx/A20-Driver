@@ -13,7 +13,7 @@ Budget gamers and PC enthusiasts owning the Redgear A20 RGB Gaming Mouse (Instan
 Provide a standalone, zero-bloat, open-source Windows hardware utility that unlocks true 12-bit active-low PWM RGB lighting control, eliminates default rainbow breathing in favor of solid static illumination, and guarantees persistent hardware settings across cold boots, sleep cycles, and USB hotplugs without background bloat, telemetry, or system tray clutter. Success means users set their configuration once, close the window, and have their hardware settings automatically restored seamlessly with under 2 MB RAM usage and 0% CPU.
 
 ## Positioning
-Unlike the official vendor software (`Gaming Mouse 2.0.exe`) and heavy gaming peripheral suites (e.g., Razer Synapse, Corsair iCUE) that require hundreds of megabytes of RAM, background web servers, telemetry, and user accounts, Redgear A20 Control Center is a single portable ~65 KB binary with zero external dependencies. It overcomes the A704 hardware's lack of onboard non-volatile EEPROM by implementing a featherweight native Win32 `WM_DEVICECHANGE` Stealth Driver Watcher that uses `SetProcessWorkingSetSize` memory compression to idle at ~1.8 MB RAM.
+Unlike the official vendor software (`Gaming Mouse 2.0.exe`) and heavy gaming peripheral suites (e.g., Razer Synapse, Corsair iCUE) that require hundreds of megabytes of RAM, background web servers, telemetry, and user accounts, Redgear A20 Control Center is a single portable ~70 KB binary with zero external dependencies. It overcomes the A704 hardware's lack of onboard non-volatile EEPROM by implementing a featherweight native Win32 `WM_DEVICECHANGE` Stealth Driver Watcher that uses `SetProcessWorkingSetSize` memory compression to idle at ~1.8 MB RAM.
 
 ## Operating Context
 Runs on 64-bit Windows 10 and Windows 11 desktop environments. Communicates directly with mouse hardware over USB HID Feature Reports (Report ID `0x07`, UsagePage `0xFF01`). Runs either as an interactive desktop GUI for configuration or silently in the background (`Stealth Driver Watcher`) launched via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Intercepts system USB arrival/removal notifications to restore volatile SRAM settings instantly upon hotplug.
@@ -48,7 +48,7 @@ Runs on 64-bit Windows 10 and Windows 11 desktop environments. Communicates dire
 
 ## Product Principles
 - **Hardware Safety First**: Never compromise hardware stability or drop mouse input packets; enforce inter-packet pacing and volatile RAM testing before saving.
-- **Zero-Bloat Sovereignty**: Keep binary lightweight (~65 KB), dependency-free, and resource-minimal (~1.8 MB RAM, 0% CPU); strictly reject telemetry, login walls, and heavy background runtimes.
+- **Zero-Bloat Sovereignty**: Keep binary lightweight (~70 KB), dependency-free, and resource-minimal (~1.8 MB RAM, 0% CPU); strictly reject telemetry, login walls, and heavy background runtimes.
 - **Transparent Control**: Expose direct hardware reality (register hex, feature reports, diagnostic log) rather than obscuring it behind artificial abstractions.
 - **Silent Reliability**: Settings must persist across reboots, sleep/wake transitions, and USB port changes without demanding user attention or cluttering the system tray.
 

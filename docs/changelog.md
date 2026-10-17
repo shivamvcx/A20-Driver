@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Comprehensive Architectural Documentation**:
   - Added `docs/architecture-decisions-and-guardrails.md`: 414-line developer bible covering Instant A704 hardware volatile SRAM realities and the 7 Developer Guardrails.
   - Added `docs/features-masterlist.md`: 89-line masterlist organizing 70+ peripheral driver features across 4 strategic priority tiers.
-  - Added `DESIGN.md` & `PRODUCT.md`: Formal Design System tokens and Product Strategy specifications.
+  - Added `docs/design-tokens.md` & `docs/product-spec.md`: Formal Design System tokens and Product Strategy specifications.
 
 ### Changed
 - **Non-Destructive Device Path Enumeration**: Changed device query access parameter in `CreateFile` to `0` (query access only), eliminating handle sharing conflicts during background enumeration.
