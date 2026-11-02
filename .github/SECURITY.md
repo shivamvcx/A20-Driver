@@ -22,7 +22,7 @@ We welcome reports regarding:
 2. **Win32 P/Invoke Memory Safety**: Unhandled pointer dereferences, buffer overflows, or handle leaks in `hid.dll` or `setupapi.dll` calls.
 3. **Privilege & Execution Safety**: Any vector allowing unauthorized privilege escalation, persistence, or malicious payload execution.
 
-*(Note: Third-party physical hardware damage resulting from modifying source code to bypass safety delays or send arbitrary unknown opcodes to the device is outside project liability; please see our [DISCLAIMER](README.md#%EF%B8%8F-disclaimer).)*
+*(Note: Third-party physical hardware damage resulting from modifying source code to bypass safety delays or send arbitrary unknown opcodes to the device is outside project liability; please see our [DISCLAIMER](README.md#disclaimer).)*
 
 ---
 

@@ -4,189 +4,87 @@
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform: Windows x64](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20(64--bit)-0078D6.svg)](https://microsoft.com)
 [![Architecture: C# WinForms](https://img.shields.io/badge/Architecture-C%23%20WinForms-239120.svg)](src/Program.cs)
-[![Executable Size](https://img.shields.io/badge/Binary%20Size-~70%20KB-orange.svg)](#download--quick-start)
-[![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(Pure%20Win32)-success.svg)](#system--hardware-compatibility)
+[![Executable Size](https://img.shields.io/badge/Binary%20Size-~70%20KB-orange.svg)](#build-from-source)
+[![Zero Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(Pure%20Win32)-success.svg)](#disclaimer)
 
-A standalone, zero-bloat, open-source Windows driver and hardware control application for the **Redgear A20 RGB Gaming Mouse** (`VID: 0x18F8 & PID: 0x0FC0`).
-
-I engineered this project to replace the abandoned, malfunctioning official vendor software with a clean, high-performance desktop utility that unlocks true 12-bit RGB lighting control, eliminates unwanted rainbow breathing, and communicates directly with mouse hardware without background services or telemetry.
+A standalone, zero-bloat, open-source Windows control utility for the **Redgear A20 RGB Gaming Mouse** (`VID: 0x18F8 & PID: 0x0FC0`). It talks directly to the mouse's Instant A704 microcontroller over USB HID Feature Reports — no installer, no background services, no telemetry.
 
 <p align="center">
   <img src="assets/control-center-ui.png" alt="Redgear A20 Control Center UI" width="460">
 </p>
 
----
+## Key Features
 
-## Disclaimer
+- **True 12-bit RGB control** — 4,096 colors via reverse-engineered active-low PWM registers, with a visual picker, `#RRGGBB` hex input, and quick presets.
+- **Solid static mode** — hardware mode `0x86` permanently replaces the stock, unchangeable rainbow breathing cycle.
+- **Proportional brightness dimming** — 5–100% scaling that preserves the exact color hue.
+- **Experimental DPI stage control** — select among 600–3200 DPI stages (opt-in and RAM-tested before saving).
+- **Stealth persistence** — a hidden background watcher (~1.8 MB RAM, 0% CPU, no tray clutter) detects USB hotplugs via native `WM_DEVICECHANGE` and restores your settings in ~300 ms, across reboots, sleep cycles, and any USB port. Three modes: Stealth Watcher, Tray Agent, or RAM-only.
+- **Safety-first engineering** — RAM-only application, mandatory 50 ms inter-packet pacing, atomic profile writes, global crash logging, and automatic disconnect recovery.
+- **Live diagnostic console** — every 8-byte feature report with its Win32 return status, copyable to clipboard.
+- **Native modern UI** — immersive dark title bar, Per-Monitor V2 DPI awareness, and crisp 4K rendering in a ~70 KB binary.
 
-> **This is an independent, unofficial community project.** It is not affiliated with, endorsed by, sponsored by, or associated with **Redgear** or **Imagine Marketing Limited**. All trademarks and brand names belong to their respective owners.
-> 
-> This software interacts directly with mouse hardware using reverse-engineered USB HID Feature Reports. While it has been designed with strict safety guardrails (RAM-only application, mandatory hardware delays, decoupled flash writes), **use this software at your own risk**.
+## Quick Start
 
----
+1. Download the latest `RedgearA20-win-x64.exe` from [Releases](https://github.com/shivamvcx/A20-Driver/releases).
+2. Plug in your Redgear A20 and double-click the executable — no installation required.
+3. Confirm the status bar shows `● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0xFF01)`.
+4. Pick a color and brightness.
+5. Under **Persistence Mode**, select **Stealth Driver Watcher**, then click **Save Profile**.
+6. Close the window. Your settings now persist silently across reboots and USB replugs.
 
-## System & Hardware Compatibility
+## How Persistence Works
 
-* **Supported Mouse**: **Redgear A20 RGB Gaming Mouse** (Instant Microelectronics OEM chipset, `VID: 0x18F8`, `PID: 0x0FC0`).
-  *(Other mice are not supported in this release; see [Adding Support for Other Mice](#adding-support-for-other-mice)).*
-* **Supported Operating System**: **Windows 10 / Windows 11 (64-bit)**.
-* **Dependencies**: **None**. Built with standard .NET Framework 4.8 Windows Forms; runs on any standard Windows installation out-of-the-box.
+The A704 chip has no non-volatile storage for user settings — custom registers live in volatile SRAM and reset to factory defaults the moment USB power drops. The original vendor software worked around this with a bloated background service; this project solves it with a featherweight hidden watcher that reapplies your profile the instant the mouse reappears on the bus.
 
----
+## USB Protocol
 
-## Key Features (v0.2.0 Release)
+All communication uses 8-byte HID Feature Reports on the vendor endpoint `UsagePage 0xFF01` (Report ID `0x07`):
 
-* **Industrial Precision Utility UI & Windows 10/11 Dark Title Bar**:
-  - **Native Dark Window Title Bar**: Integrated `dwmapi.dll` P/Invoke (`DWMWA_USE_IMMERSIVE_DARK_MODE`) ensuring the OS title bar renders in immersive dark mode instead of standard bright white.
-  - **Zero-Allocation GDI+ Token Engine**: Pre-cached brushes, pens, and system typography (`Theme` class) guaranteeing smooth rendering without garbage collection stutter during paint events.
-  - **Clean Hairline Card Architecture**: Replaced generic WinForms GroupBoxes with 1px hairline card containers (`CreateSectionPanel`), visual preset borders, unified 36px action row, and clear visual hierarchy with an Emerald (`#10B981`) primary accent.
-  - **Per-Monitor V2 High-DPI Scaling & Common Controls v6**: Embedded native application manifest (`src/app.manifest`) delivering crisp, sharp rendering across modern 4K multi-monitor setups without bitmap blur.
-* **Stealth Driver Watcher (Near-Zero RAM Persistence)**:
-  - **Zero Taskbar & Zero System Tray Clutter**: Runs as an invisible background watcher (`trayIcon.Visible = false`) with no taskbar button and no tray icons cluttering your screen.
-  - **Ultra-Low Memory Footprint**: Uses `SetProcessWorkingSetSize` P/Invoke to aggressively compress working set memory to **~1.8 MB RAM** and **0.00% CPU** when idle.
-  - **Instant Hotplug Persistence Across All Ports**: Intercepts native Win32 `WM_DEVICECHANGE` window messages in `< 50ms`. Custom color and DPI are restored in `~300ms` when unplugging, replugging, or switching USB ports.
-  - **Cold-Boot & Sleep Persistence**: Starts silently on Windows login via `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Survives system reboots and Modern Standby / S3 sleep.
-  - **Single-Instance IPC with UIPI Traversal**: Re-launching the `.exe` wakes the existing GUI without spawning duplicate background processes. Closing via the Windows Close `[X]` button keeps your settings auto-applying silently in the background. An explicit **Exit App** button (with confirmation) is provided to completely terminate the background watcher.
-  - **3 Persistence Modes**:
-    1. **Stealth Driver Watcher**: Invisible, no tray icon, ~1.8 MB RAM (Recommended)
-    2. **Tray Agent Mode**: ~2.7 MB RAM, quick-access system tray icon
-    3. **Disabled**: RAM only, reverts to default when mouse is unplugged
-* **4,096-Color True Precision Engine**:
-  - Full 12-bit RGB color control ($16 \times 16 \times 16$ levels per channel).
-  - Uses verified **Active-Low PWM** register mapping ($0 = 100\%$ ON, $15 = 0\%$ OFF).
-  - Visual Color Dialog picker + custom Hex code input (`#RRGGBB`) with strict sanitization and validation.
-  - Quick presets: *Lavender, Purple, Cyan, Ice Blue, Mint, Green, Gold, Pink, White*.
-* **Proportional PWM Brightness Dimming**:
-  - Variable brightness slider ($5\text{–}100\%$) that scales channel duty cycles proportionally while preserving the exact color hue.
-* **Solid Static Mode (No Breathing)**:
-  - Hardware mode `0x86` forces the microcontroller to display permanent, non-fading solid light, eliminating the default unchangeable rainbow breathing cycle.
-* **Experimental DPI Stage Controls & Asynchronous Mutex Dispatch**:
-  - Optional toggle for Command `0x09` allowing selection of active DPI stages (Stage 0: 600, Stage 1: 1000, Stage 2: 1200, Stage 3: 1600, Stage 4: 2400, Stage 5: 3200 DPI).
-  - Multi-threaded background execution (`Task.Run` with `async`/`await`) ensures UI never freezes while waiting for hardware mutex acquisition.
-* **Hardened Safety Architecture & Fault Tolerance**:
-  - **Resilient Atomic Profile Serialization**: Uses temporary file replacement (`File.Replace`) with UTF-8 encoding to prevent profile corruption during abrupt shutdowns.
-  - **Dynamic Disconnect Recovery**: Automatically detects cable disconnects (Win32 errors 1167, 2, 6), invalidates stale device handles, and displays red status alert.
-  - **Hotplug Re-Entrancy Guard**: Prevents overlapping recovery sweeps during rapid USB reconnection.
-  - **Global Crash Diagnostics**: Automatically logs unhandled exceptions to `%LocalAppData%\RedgearA20\crash.log`.
-  - **Non-Destructive Device Enumeration**: Uses query access mode `0` during device discovery to eliminate handle sharing conflicts.
-  - **Apply to RAM Only**: Changes can be tested in volatile memory first (`Apply (RAM)`).
-  - **Local Profile Persistence**: Auto-deploys to `%LocalAppData%\RedgearA20\RedgearA20.exe` so you can move or delete the downloaded file without breaking persistence.
-  - **Factory Profile Reset**: Restores stock multi-stage DPI colors (Blue, Yellow, Green, Purple, Cyan, White) and default breathing cycle mode.
-  - **Asynchronous Execution & UI Locking**: Background worker execution prevents GUI stuttering; locks UI controls during transmission.
-  - **Post-Write Health Check**: Interrogates `HidD_GetFeature` to verify microcontroller responsiveness.
-  - **Zero Slider Spamming**: Sliders only update local UI preview; zero USB packets transmitted while dragging.
-  - **Mandatory 50ms Delays**: Safe inter-packet delay prevents 8-bit MCU buffer overruns.
-* **Live Monospace Diagnostic Log**:
-  - Embedded console displaying every 8-byte Feature Report sent and its Win32 return status, with one-click clipboard export.
-* **Ultra-Light Portable Executable**:
-  - Standalone $\approx 70\text{ KB}$ 64-bit executable (`RedgearA20-win-x64.exe`). Zero dependencies, zero installer, zero electron wrappers.
+| Command | Purpose | Status |
+| :---: | :--- | :---: |
+| `0x14` | Per-stage RGB color (4-bit active-low PWM) | Verified |
+| `0x13` | LED mode — `0x86` static, `0x87` off, breathing, spectrum | Verified |
+| `0x20` | Hardware register sync latch | Verified |
+| `0x09` | DPI stage & enabled-stage bitmask | Experimental |
+| `0x10` / `0x15` / `0x16` | Button remapping matrix | Research (v0.3.0) |
 
----
+## Roadmap
 
-## Hardware Architecture: Instant A704
-
-Through reverse engineering and disassembling the vendor's `Gaming Mouse 2.0.exe`, I discovered a critical hardware reality:
-- The **Instant Microelectronics A704 / A704F IC** physically lacks non-volatile EEPROM/Flash storage for custom RGB lighting. Custom lighting registers are held in volatile SRAM, which wipes whenever power is lost (PC shutdown or USB unplug).
-- The official Redgear software worked around this by leaving a bloated background service running.
-- **Redgear A20 Control Center replaces that bloat** with a featherweight **Stealth Driver Watcher** (~1.8 MB RAM, 0% CPU, no tray icon) that detects USB hotplug in real-time via Win32 `WM_DEVICECHANGE` and restores your profile instantly.
-
----
-
-## Protocol Reference
-
-All hardware communication is performed via 8-byte USB HID Feature Reports sent to endpoint **UsagePage `0xFF01` (Report ID `0x07`)**:
-
-```
-Packet Structure: [0x07, Command, Param1, Param2, Param3, Param4, Param5, Param6]
-```
-
-| Command | Target | Payload Format | Description | Status |
-| :---: | :---: | :--- | :--- | :---: |
-| **`0x14`** | DPI Stage RGB | `[07 14 (Stage<<5)\|Green_Inv (Red_Inv<<4)\|Blue_Inv 00 00 00 00]` | 4-bit Active-Low PWM color per stage | Verified |
-| **`0x13`** | LED Mode | `[07 13 7F ModeByte 00 00 00 00]` | `0x86` = Solid Static, `0x80` = Breathing, `0x87` = Off | Verified |
-| **`0x09`** | Sensor DPI | `[07 09 (0x40\|Stage) 08 EnabledMask 00 00 00]` | Active stage & 6-bit enabled mask | Experimental |
-| **`0x20`** | Sync Latch | `[07 20 00 00 00 00 00 00]` | MCU register synchronization latch | Verified |
-
-> **Project Documentation & Technical Guides**:
-> - [Architecture & Guardrails](docs/architecture-decisions-and-guardrails.md) — Core architectural decisions, hardware reality, and strict developer guardrails.
-> - [Design System Tokens](docs/design-tokens.md) — Visual design tokens, GDI+ rendering rules, and palette hierarchy.
-> - [Product Specification](docs/product-spec.md) — Target audience, hardware positioning, constraints, and commitments.
-> - [Protocol Specification](docs/protocol-notes.md) — Complete byte-by-byte register and command reference.
-> - [Feature Roadmap](docs/roadmap.md) — Upcoming milestones, planned RGB effects, and sensor tuning.
-> - [Feature Masterlist (v10.0.0)](docs/features-masterlist.md) — Comprehensive long-term end-state feature specification.
-> - [Engineering DevLog](docs/devlog.md) — Technical story, reverse-engineering breakthrough, and safety architecture.
-> - [Changelog](docs/changelog.md) — Version release notes and migration history.
-
----
-
-## Download & Quick Start
-
-No installer or runtime dependencies required. It is a portable standalone utility for 64-bit Windows 10 and 11.
-
-1. **[Download Latest Release (`RedgearA20-win-x64.exe`)](https://github.com/shivamvcx/A20-Driver/releases)** from the GitHub Releases page.
-2. Plug in your **Redgear A20** mouse into any USB port.
-3. Double-click **`RedgearA20-win-x64.exe`** to launch.
-4. Verify the top status bar confirms:
-   `● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0xFF01)`
-5. Pick your color using the visual picker or type a custom `#RRGGBB` hex code (e.g. Lavender `#BE59FF`) and adjust brightness.
-6. Under **Section 3 (Persistence Mode)**, select **`Stealth Driver Watcher`** and click **`[ Save Profile ]`**.
-7. Close the window (`[X]`).
-   - The window closes and **no system tray icon appears**.
-   - Your mouse will now permanently keep your custom color across all reboots, laptop sleep/wake, and physical USB replugs into any port!
-
----
+| Version | Scope | Status |
+| :---: | :--- | :---: |
+| v0.1.0 – v0.2.1 | RGB engine, stealth persistence, industrial UI overhaul, stability hardening | Released |
+| v0.3.0 | Extended RGB effects + hardware button remapping (experimental) | Planned |
+| v0.4.0 | Sensor, polling rate, per-stage customization | Planned |
+| v0.5.0 | Advanced button actions, keyboard shortcuts, sniper mode | Planned |
+| v1.0.0 | Multi-device OEM support | Long-term |
 
 ## Build from Source
 
-If you prefer to audit the source code and compile the standalone executable yourself:
+No Visual Studio, SDK, or toolchain installation required — the project compiles with Windows' built-in C# compiler:
 
-> **Note**: This project compiles directly using Microsoft's built-in C# compiler (`csc.exe`) included with Windows. **No Visual Studio, SDK, or toolchain installation is needed.**
+```cmd
+git clone https://github.com/shivamvcx/A20-Driver
+cd A20-Driver
+build.bat
+```
 
-1. Clone the repository:
-   ```cmd
-   git clone https://github.com/shivamvcx/A20-Driver.git
-   cd A20-Driver
-   ```
-2. Run the 1-click build script:
-   ```cmd
-   build.bat
-   ```
-3. The executable and SHA256 checksum will be generated in `release\`:
-   - `release\RedgearA20-win-x64.exe`
-   - `release\RedgearA20-win-x64.sha256`
+Output lands in `release\`: `RedgearA20-win-x64.exe` plus its SHA-256 checksum.
 
----
+## Supporting Other Mice
 
-## Adding Support for Other Mice
+Community contributions for other OEM mice (Instant Microelectronics, SinoWealth, or Holtek chipsets) are welcome. Open an issue with your device's `VID`/`PID`, its USB HID report descriptor, and packet captures recorded against the original vendor software.
 
-If you have a different budget or OEM gaming mouse (e.g., mice powered by Instant Microelectronics, SinoWealth, or Holtek chips) that suffers from broken vendor software, community contributions are welcome!
+## Disclaimer
 
-To request support or contribute a profile, please open an Issue with:
-1. **Device Identification**:
-   - Vendor ID (`VID`) and Product ID (`PID`) (found in Windows Device Manager $\rightarrow$ Mice $\rightarrow$ Hardware IDs).
-2. **USB HID Report Descriptor**:
-   - Exported using tools like `USBlyzer`, `Wireshark` with `USBPcap`, or `node-hid`.
-3. **Packet Captures**:
-   - USB packet capture (`.pcapng`) recorded while clicking buttons or applying colors in the original vendor software.
+> **This is an independent, unofficial community project.** It is not affiliated with, endorsed by, sponsored by, or associated with Redgear or Imagine Marketing Limited. All trademarks belong to their respective owners.
+>
+> This software communicates directly with mouse hardware using reverse-engineered USB HID feature reports. While it is built with strict safety guardrails (RAM-only application, mandatory inter-packet delays, decoupled save operations), **use this software at your own risk**.
 
----
+## Author
 
-## Author & Background
-
-Hey, I'm **[Shivam](https://github.com/shivamvcx)** ([@shivamvcx](https://github.com/shivamvcx)). I created and reverse-engineered this project as an independent open-source passion project under my personal development lab, **[Silicon Labs](https://siliconlabs.vercel.app/)**.
-
-I got tired of the abandoned, buggy official OEM software constantly wiping my mouse's RGB settings on every reboot or USB replug, so I sat down, reverse-engineered the USB HID communication protocol from scratch, and built a clean, lightweight driver utility for myself and anyone else using the Redgear A20.
-
-### AI Pair-Programming & Transparency
-
-I believe in complete transparency about modern software development workflows:
-* **Hardware Reverse-Engineering & Validation**: All USB packet captures, protocol analysis, hardware hypotheses, safety testing, and physical validation on real hardware were performed hands-on by me with my physical Redgear A20 mouse.
-* **AI Agentic Acceleration**: I partnered extensively with AI coding agents (Google Antigravity) to accelerate implementation — rapidly synthesizing Win32 P/Invoke interop bindings, building the zero-allocation GDI+ token architecture, auditing memory footprints, and structuring comprehensive developer documentation.
-
-Every line of generated code, memory profile, and hardware guardrail was thoroughly reviewed, debugged, and verified against physical hardware to guarantee safety and stability.
-
----
+**Shivam** ([@shivamvcx](https://github.com/shivamvcx)) — reverse-engineered the USB protocol, validated every packet and guardrail on physical hardware, and used AI coding agents for implementation acceleration and documentation. Everything was reviewed, debugged, and verified against the real device.
 
 ## License
- 
-This project is licensed under the **GNU General Public License v3.0 (GPLv3)**. See the [LICENSE](LICENSE) file for details.
+
+This project is licensed under the **GNU General Public License v3.0** — see the [LICENSE](LICENSE) file for details.
