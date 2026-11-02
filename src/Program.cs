@@ -121,9 +121,31 @@ namespace RedgearA20ControlCenter
         private const uint FILE_SHARE_WRITE = 0x00000002;
         private const uint OPEN_EXISTING = 3;
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool ReadFile(SafeFileHandle hFile, byte[] buffer, int toRead, out int read, IntPtr overlapped);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CancelIoEx(SafeFileHandle hFile, IntPtr overlapped);
+
+        // Read-only, fully shared handle for the vendor input channel (shortcut press reports).
+        public static SafeFileHandle OpenForRead(string path)
+        {
+            return CreateFile(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+        }
+
         public static string FindTargetDevicePath(out ushort detectedUsagePage)
         {
+            string inputPath;
+            int inputLen;
+            return FindDevicePaths(out detectedUsagePage, out inputPath, out inputLen);
+        }
+
+        // inputPath: vendor collection 0xFF00 / Usage 1, which carries the button press reports.
+        public static string FindDevicePaths(out ushort detectedUsagePage, out string inputPath, out int inputLen)
+        {
             detectedUsagePage = 0;
+            inputPath = null;
+            inputLen = 0;
             Guid hidGuid;
             HidD_GetHidGuid(out hidGuid);
 
@@ -176,15 +198,18 @@ namespace RedgearA20ControlCenter
                                                 HIDP_CAPS caps = new HIDP_CAPS();
                                                 HidP_GetCaps(pData, ref caps);
 
-                                                if (caps.UsagePage == USAGE_PAGE_PRIMARY)
+                                                if (caps.UsagePage == USAGE_PAGE_PRIMARY && primaryPath == null)
                                                 {
                                                     primaryPath = path;
-                                                    detectedUsagePage = USAGE_PAGE_PRIMARY;
-                                                    break; // Ideal match found
                                                 }
-                                                else if (caps.UsagePage == USAGE_PAGE_FALLBACK && fallbackPath == null)
+                                                else if (caps.UsagePage == USAGE_PAGE_FALLBACK)
                                                 {
-                                                    fallbackPath = path;
+                                                    if (fallbackPath == null) fallbackPath = path;
+                                                    if (caps.Usage == 1 && caps.InputReportByteLength >= 3 && inputPath == null)
+                                                    {
+                                                        inputPath = path;
+                                                        inputLen = caps.InputReportByteLength;
+                                                    }
                                                 }
                                             }
                                             finally
@@ -208,7 +233,11 @@ namespace RedgearA20ControlCenter
                 SetupDiDestroyDeviceInfoList(hDevInfo);
             }
 
-            if (primaryPath != null) return primaryPath;
+            if (primaryPath != null)
+            {
+                detectedUsagePage = USAGE_PAGE_PRIMARY;
+                return primaryPath;
+            }
             if (fallbackPath != null)
             {
                 detectedUsagePage = USAGE_PAGE_FALLBACK;
@@ -306,6 +335,9 @@ namespace RedgearA20ControlCenter
     // Codes outside this set collapse to 0x00 in firmware (silent no-op), so they are never sent.
     public enum ButtonAction : byte
     {
+        // Report-to-host: the button does nothing locally and instead emits vendor input report
+        // [06, 0xF0+ButtonID, 01/80]; ShortcutEngine answers it with Cmd 0x15 key injection.
+        Shortcut = 0x00,
         LeftButton = 0x01,
         MiddleClick = 0x02,
         RightButton = 0x03,
@@ -329,6 +361,147 @@ namespace RedgearA20ControlCenter
         {
             ButtonId = buttonId;
             Action = action;
+        }
+    }
+
+    public struct KeyShortcut
+    {
+        public byte Mods; // bit0 Ctrl, bit1 Shift, bit2 Alt, bit3 Win (HID modifier usage = 0xE0 + bit)
+        public byte Vk;   // Windows virtual-key code of the single main key
+
+        public KeyShortcut(byte mods, byte vk)
+        {
+            Mods = mods;
+            Vk = vk;
+        }
+    }
+
+    // Shortcut rules live here so the picker, the profile loader and the engine share one gate.
+    public static class KeyShortcuts
+    {
+        public const byte MOD_CTRL = 1, MOD_SHIFT = 2, MOD_ALT = 4, MOD_WIN = 8;
+        private static readonly string[] ModNames = { "Ctrl", "Shift", "Alt", "Win" };
+
+        // Non-contiguous VK -> HID usage pairs, mirroring the vendor converter at VA 0x00415410.
+        // Caps / Num / Scroll Lock are deliberately absent: toggles would leave lasting state.
+        private static readonly byte[] VkPairs = {
+            0x08, 0x2A, 0x09, 0x2B, 0x0D, 0x28, 0x13, 0x48, 0x1B, 0x29, 0x20, 0x2C, 0x21, 0x4B, 0x22, 0x4E,
+            0x23, 0x4D, 0x24, 0x4A, 0x25, 0x50, 0x26, 0x52, 0x27, 0x4F, 0x28, 0x51, 0x2C, 0x46, 0x2D, 0x49,
+            0x2E, 0x4C, 0x30, 0x27, 0x5D, 0x65, 0x60, 0x62, 0x6A, 0x55, 0x6B, 0x57, 0x6D, 0x56, 0x6E, 0x63,
+            0x6F, 0x54, 0xBA, 0x33, 0xBB, 0x2E, 0xBC, 0x36, 0xBD, 0x2D, 0xBE, 0x37, 0xBF, 0x38, 0xC0, 0x35,
+            0xDB, 0x2F, 0xDC, 0x31, 0xDD, 0x30, 0xDE, 0x34 };
+
+        public static byte VkToUsage(byte vk)
+        {
+            if (vk >= 0x41 && vk <= 0x5A) return (byte)(vk - 0x3D); // A-Z
+            if (vk >= 0x31 && vk <= 0x39) return (byte)(vk - 0x13); // 1-9
+            if (vk >= 0x61 && vk <= 0x69) return (byte)(vk - 0x08); // Num 1-9
+            if (vk >= 0x70 && vk <= 0x7B) return (byte)(vk - 0x36); // F1-F12
+            if (vk >= 0x7C && vk <= 0x87) return (byte)(vk - 0x14); // F13-F24
+            for (int i = 0; i < VkPairs.Length; i += 2)
+            {
+                if (VkPairs[i] == vk) return VkPairs[i + 1];
+            }
+            return 0;
+        }
+
+        public static string KeyName(byte vk)
+        {
+            if (vk >= 0x30 && vk <= 0x39) return ((char)vk).ToString();
+            if (vk >= 0x60 && vk <= 0x69) return "Num " + (vk - 0x60);
+            switch (vk)
+            {
+                case 0x08: return "Backspace";
+                case 0x0D: return "Enter";
+                case 0x1B: return "Esc";
+                case 0x21: return "Page Up";
+                case 0x22: return "Page Down";
+                case 0x2C: return "Print Screen";
+                case 0x5D: return "Menu";
+                case 0x6A: return "Num *";
+                case 0x6B: return "Num +";
+                case 0x6D: return "Num -";
+                case 0x6E: return "Num .";
+                case 0x6F: return "Num /";
+                case 0xBA: return ";";
+                case 0xBB: return "=";
+                case 0xBC: return ",";
+                case 0xBD: return "-";
+                case 0xBE: return ".";
+                case 0xBF: return "/";
+                case 0xC0: return "`";
+                case 0xDB: return "[";
+                case 0xDC: return "\\";
+                case 0xDD: return "]";
+                case 0xDE: return "'";
+            }
+            return ((Keys)vk).ToString();
+        }
+
+        public static string Describe(KeyShortcut ks)
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int bit = 0; bit < 4; bit++)
+            {
+                if ((ks.Mods & (1 << bit)) != 0) sb.Append(ModNames[bit]).Append(" + ");
+            }
+            return sb.Append(KeyName(ks.Vk)).ToString();
+        }
+
+        // Ctrl+Alt+Del is the Secure Attention Sequence; a real USB keyboard (which is what the
+        // mouse becomes) can trigger it, so it is refused outright.
+        public static bool IsBlocked(KeyShortcut ks)
+        {
+            bool ctrlAlt = (ks.Mods & (MOD_CTRL | MOD_ALT)) == (MOD_CTRL | MOD_ALT);
+            return ctrlAlt && (ks.Vk == 0x2E || ks.Vk == 0x6E);
+        }
+
+        public static bool IsAllowed(KeyShortcut ks)
+        {
+            return (ks.Mods & 0xF0) == 0 && VkToUsage(ks.Vk) != 0 && !IsBlocked(ks);
+        }
+
+        // Allowed, but confirmed with the user before saving.
+        public static string Warning(KeyShortcut ks)
+        {
+            bool ctrl = (ks.Mods & MOD_CTRL) != 0;
+            if (((ks.Mods & MOD_ALT) != 0 || ctrl) && ks.Vk == 0x73 || ctrl && ks.Vk == 0x57)
+                return "closes the active window, which may be this app or a document with unsaved work.";
+            if ((ks.Mods & MOD_WIN) != 0 && ks.Vk == 0x4C)
+                return "locks your PC.";
+            return null;
+        }
+
+        public static string ToToken(KeyShortcut ks)
+        {
+            return ks.Mods.ToString("X2") + ":" + ks.Vk.ToString("X2");
+        }
+
+        public static bool TryParse(string token, out KeyShortcut ks)
+        {
+            ks = new KeyShortcut();
+            Match m = Regex.Match(token ?? "", "^([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2})$");
+            if (!m.Success) return false;
+            ks = new KeyShortcut(Convert.ToByte(m.Groups[1].Value, 16), Convert.ToByte(m.Groups[2].Value, 16));
+            return IsAllowed(ks);
+        }
+
+        // [07 15 k0..k5]: modifiers first (as HID usages 0xE0-0xE3), then the main key.
+        public static byte[] DownPacket(KeyShortcut ks)
+        {
+            byte[] pkt = new byte[] { HidTransport.REPORT_ID, 0x15, 0, 0, 0, 0, 0, 0 };
+            int slot = 2;
+            for (int bit = 0; bit < 4; bit++)
+            {
+                if ((ks.Mods & (1 << bit)) != 0) pkt[slot++] = (byte)(0xE0 + bit);
+            }
+            pkt[slot] = VkToUsage(ks.Vk);
+            return pkt;
+        }
+
+        public static byte[] ReleasePacket()
+        {
+            return new byte[] { HidTransport.REPORT_ID, 0x15, 0, 0, 0, 0, 0, 0 };
         }
     }
 
@@ -385,6 +558,7 @@ namespace RedgearA20ControlCenter
             ButtonAction.DoubleClick,
             ButtonAction.Fire,
             ButtonAction.ShowDesktop,
+            ButtonAction.Shortcut,
             ButtonAction.Disabled
         };
 
@@ -392,6 +566,7 @@ namespace RedgearA20ControlCenter
         {
             switch (action)
             {
+                case ButtonAction.Shortcut: return "Keyboard Shortcut…";
                 case ButtonAction.LeftButton: return "Left Button";
                 case ButtonAction.MiddleClick: return "Middle Click";
                 case ButtonAction.RightButton: return "Right Button";
@@ -427,7 +602,7 @@ namespace RedgearA20ControlCenter
         public static bool TryParseToken(string token, out ButtonAction action)
         {
             action = ButtonAction.Disabled;
-            if (string.IsNullOrEmpty(token)) return false;
+            if (string.IsNullOrWhiteSpace(token) || !char.IsLetter(token.Trim()[0])) return false;
             try
             {
                 object parsed = Enum.Parse(typeof(ButtonAction), token.Trim(), true);
@@ -437,6 +612,199 @@ namespace RedgearA20ControlCenter
                 return true;
             }
             catch { return false; }
+        }
+    }
+
+    // Host-assisted keyboard shortcuts (hardware-verified by probe, Nov 2026).
+    // A button bound to code 0x00 makes the mouse emit vendor input report [06, 0xF0+ID, 01=down /
+    // 80=up] on collection 0xFF00. On "down" we reply with Cmd 0x15 key-down then all-zero key-up,
+    // and the mouse types the combo as its own USB keyboard. No global hooks and no SendInput:
+    // we only read our own device's vendor channel.
+    public static class ShortcutEngine
+    {
+        private const int HOLD_MS = 50; // also the mandatory inter-packet pacing
+
+        private static readonly object sync = new object();
+        private static volatile Dictionary<byte, KeyShortcut> active = new Dictionary<byte, KeyShortcut>();
+        private static volatile string writePath;
+        private static volatile Thread reader;
+        private static SafeFileHandle readHandle;
+        private static int busy;
+        private static volatile bool keysMayBeHeld;
+        public static Action<string, Color> Log;
+
+        private static void Report(string msg, Color col)
+        {
+            Action<string, Color> l = Log;
+            if (l != null) l(msg, col);
+        }
+
+        // map = buttons the mouse RAM currently has bound to code 0x00. Empty map stops listening.
+        public static void Configure(Dictionary<byte, KeyShortcut> map, string devicePath)
+        {
+            string msg = StartOrStop(map, devicePath);
+            // Logged outside the lock: Log marshals to the UI thread, which may itself be waiting on it.
+            if (msg != null) Report(msg, msg.StartsWith("Shortcut listener active") ? Color.FromArgb(140, 200, 255) : Color.FromArgb(255, 120, 120));
+        }
+
+        private static string StartOrStop(Dictionary<byte, KeyShortcut> map, string devicePath)
+        {
+            lock (sync)
+            {
+                active = map != null ? new Dictionary<byte, KeyShortcut>(map) : new Dictionary<byte, KeyShortcut>();
+                writePath = devicePath;
+                if (active.Count == 0 || string.IsNullOrEmpty(devicePath))
+                {
+                    StopReader();
+                    return null;
+                }
+                if (reader != null && reader.IsAlive) return null;
+
+                ushort page;
+                string inputPath;
+                int inputLen;
+                HidTransport.FindDevicePaths(out page, out inputPath, out inputLen);
+                if (inputPath == null) return "Shortcut listener: vendor input channel (UsagePage 0xFF00) not found.";
+                SafeFileHandle h = HidTransport.OpenForRead(inputPath);
+                if (h.IsInvalid) return "Shortcut listener: could not open input channel (Win32 " + Marshal.GetLastWin32Error() + ").";
+                readHandle = h;
+                reader = new Thread(delegate() { ReadLoop(h, inputLen); });
+                reader.IsBackground = true;
+                reader.Name = "A20 shortcut listener";
+                reader.Start();
+                return string.Format("Shortcut listener active for {0} button(s).", active.Count);
+            }
+        }
+
+        private static void StopReader()
+        {
+            Thread t = reader;
+            SafeFileHandle h = readHandle;
+            reader = null;
+            readHandle = null;
+            if (t == null || t == Thread.CurrentThread) return;
+            // CancelIoEx only hits a read that is already pending, so retry until the thread exits.
+            for (int i = 0; i < 5 && t.IsAlive; i++)
+            {
+                try { HidTransport.CancelIoEx(h, IntPtr.Zero); } catch { }
+                t.Join(100);
+            }
+        }
+
+        // Rebinds the listener to a (re)enumerated device without changing the shortcut map.
+        public static void Rebind(string devicePath)
+        {
+            Configure(active, devicePath);
+        }
+
+        public static byte[] ActiveButtonIds()
+        {
+            return new List<byte>(active.Keys).ToArray();
+        }
+
+        // Ends on cancel or device removal; the next hotplug refresh calls Configure again.
+        private static void ReadLoop(SafeFileHandle h, int len)
+        {
+            byte[] buf = new byte[len];
+            try
+            {
+                int n;
+                while (HidTransport.ReadFile(h, buf, len, out n, IntPtr.Zero))
+                {
+                    if (reader != Thread.CurrentThread) break; // superseded by a newer listener
+                    if (n >= 3 && buf[0] == 0x06 && buf[1] > 0xF0 && buf[2] == 0x01) OnPress((byte)(buf[1] - 0xF0));
+                }
+            }
+            catch { }
+            finally
+            {
+                h.Dispose();
+            }
+        }
+
+        private static void OnPress(byte buttonId)
+        {
+            KeyShortcut ks;
+            if (ButtonMap.IsLocked(buttonId) || !active.TryGetValue(buttonId, out ks) || !KeyShortcuts.IsAllowed(ks)) return;
+            // One shortcut in flight at a time; presses arriving meanwhile are dropped, not queued.
+            if (Interlocked.CompareExchange(ref busy, 1, 0) != 0) return;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { Fire(ks); }
+                catch { }
+                finally { Interlocked.Exchange(ref busy, 0); }
+            });
+        }
+
+        private static void Fire(KeyShortcut ks)
+        {
+            string path = writePath;
+            if (string.IsNullOrEmpty(path)) return;
+            using (Mutex m = new Mutex(false, TaskSchedulerHelper.HARDWARE_MUTEX_NAME))
+            {
+                bool got = false;
+                try { got = m.WaitOne(250, false); }
+                catch (AbandonedMutexException) { got = true; }
+                if (!got) return; // a settings write is in progress; drop rather than interleave
+                try
+                {
+                    int w;
+                    string err;
+                    keysMayBeHeld = true;
+                    bool ok = HidTransport.SendSinglePacket(path, KeyShortcuts.DownPacket(ks), out w, out err);
+                    Thread.Sleep(HOLD_MS);
+                    // Release is attempted unconditionally so a key can never stay held down.
+                    if (HidTransport.SendSinglePacket(path, KeyShortcuts.ReleasePacket(), out w, out err)) keysMayBeHeld = false;
+                    Thread.Sleep(HOLD_MS);
+                    if (!ok) Report("Shortcut " + KeyShortcuts.Describe(ks) + " failed: " + err, Color.FromArgb(255, 80, 80));
+                }
+                finally
+                {
+                    m.ReleaseMutex();
+                }
+            }
+        }
+
+        // Graceful exit: stop listening, release keys, and hand shortcut buttons back to their
+        // factory action so they do not stay dead while no listener is running.
+        public static void Shutdown()
+        {
+            Dictionary<byte, KeyShortcut> map;
+            string path;
+            lock (sync)
+            {
+                Log = null;
+                map = active;
+                path = writePath;
+                active = new Dictionary<byte, KeyShortcut>();
+                StopReader();
+            }
+            if (string.IsNullOrEmpty(path) || (map.Count == 0 && !keysMayBeHeld)) return;
+
+            using (Mutex m = new Mutex(false, TaskSchedulerHelper.HARDWARE_MUTEX_NAME))
+            {
+                bool got = false;
+                try { got = m.WaitOne(1000, false); }
+                catch (AbandonedMutexException) { got = true; }
+                if (!got) return;
+                try
+                {
+                    string err;
+                    HidTransport.SendSinglePacket(path, KeyShortcuts.ReleasePacket(), out err);
+                    Thread.Sleep(HOLD_MS);
+                    foreach (byte id in map.Keys)
+                    {
+                        ButtonMap.ButtonInfo info = ButtonMap.Find(id);
+                        if (info == null || info.Locked) continue;
+                        HidTransport.SendSinglePacket(path, new byte[] { HidTransport.REPORT_ID, 0x10, id, (byte)info.FactoryAction, 0, 0, 0, 0 }, out err);
+                        Thread.Sleep(HOLD_MS);
+                    }
+                }
+                finally
+                {
+                    m.ReleaseMutex();
+                }
+            }
         }
     }
 
@@ -466,6 +834,7 @@ namespace RedgearA20ControlCenter
         // Button remapping (Cmd 0x10). Absent/unparsable entries fall back to the factory
         // action, so an older or hand-edited profile can never put an unknown byte on the wire.
         public Dictionary<byte, ButtonAction> ButtonBindings = new Dictionary<byte, ButtonAction>();
+        public Dictionary<byte, KeyShortcut> Shortcuts = new Dictionary<byte, KeyShortcut>();
 
         public ButtonAction GetBinding(byte buttonId)
         {
@@ -473,7 +842,37 @@ namespace RedgearA20ControlCenter
             ButtonAction fallback = info != null ? info.FactoryAction : ButtonAction.Disabled;
             if (ButtonBindings == null) return fallback;
             ButtonAction stored;
-            return ButtonBindings.TryGetValue(buttonId, out stored) ? stored : fallback;
+            if (!ButtonBindings.TryGetValue(buttonId, out stored)) return fallback;
+            // A Shortcut binding without a valid key combo would leave a dead button.
+            KeyShortcut ks;
+            if (stored == ButtonAction.Shortcut && !TryGetShortcut(buttonId, out ks)) return fallback;
+            return stored;
+        }
+
+        public bool TryGetShortcut(byte buttonId, out KeyShortcut ks)
+        {
+            ks = new KeyShortcut();
+            return Shortcuts != null && Shortcuts.TryGetValue(buttonId, out ks) && KeyShortcuts.IsAllowed(ks);
+        }
+
+        public void SetShortcut(byte buttonId, KeyShortcut ks)
+        {
+            if (ButtonMap.IsLocked(buttonId) || ButtonMap.Find(buttonId) == null || !KeyShortcuts.IsAllowed(ks)) return;
+            if (Shortcuts == null) Shortcuts = new Dictionary<byte, KeyShortcut>();
+            Shortcuts[buttonId] = ks;
+        }
+
+        // Buttons whose effective binding is Shortcut, with their key combos (engine input).
+        public Dictionary<byte, KeyShortcut> GetActiveShortcuts()
+        {
+            Dictionary<byte, KeyShortcut> map = new Dictionary<byte, KeyShortcut>();
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            for (int i = 0; i < all.Length; i++)
+            {
+                KeyShortcut ks;
+                if (!all[i].Locked && GetBinding(all[i].Id) == ButtonAction.Shortcut && TryGetShortcut(all[i].Id, out ks)) map[all[i].Id] = ks;
+            }
+            return map;
         }
 
         public void SetBinding(byte buttonId, ButtonAction action)
@@ -497,7 +896,9 @@ namespace RedgearA20ControlCenter
         }
 
         // Only non-factory bindings are transmitted, keeping the hotplug replay budget minimal.
-        public ButtonBinding[] GetBindingsToTransmit()
+        // A process that exits right after applying (headless) must skip Shortcut bindings:
+        // with nobody listening for the press report, the button would simply go dead.
+        public ButtonBinding[] GetBindingsToTransmit(bool includeShortcuts)
         {
             List<ButtonBinding> list = new List<ButtonBinding>();
             ButtonMap.ButtonInfo[] all = ButtonMap.All;
@@ -506,6 +907,7 @@ namespace RedgearA20ControlCenter
                 if (all[i].Locked) continue;
                 ButtonAction action = GetBinding(all[i].Id);
                 if (action == all[i].FactoryAction) continue;
+                if (action == ButtonAction.Shortcut && !includeShortcuts) continue;
                 list.Add(new ButtonBinding(all[i].Id, action));
             }
             return list.ToArray();
@@ -558,6 +960,10 @@ namespace RedgearA20ControlCenter
                     for (int i = 0; i < buttons.Length; i++)
                     {
                         if (buttons[i].Locked) continue;
+                        Match mShort = Regex.Match(json, "\"" + ShortcutKey(buttons[i]) + "\"\\s*:\\s*\"([^\"]*)\"");
+                        KeyShortcut ks;
+                        if (mShort.Success && KeyShortcuts.TryParse(mShort.Groups[1].Value, out ks)) p.SetShortcut(buttons[i].Id, ks);
+
                         Match mBind = Regex.Match(json, "\"" + buttons[i].ProfileKey + "\"\\s*:\\s*\"([^\"]*)\"");
                         if (!mBind.Success) continue;
                         ButtonAction action;
@@ -607,6 +1013,12 @@ namespace RedgearA20ControlCenter
             return p;
         }
 
+        // "BindForward" -> "ShortForward" ("mods:vk" hex token, e.g. "04:73" = Alt + F4).
+        private static string ShortcutKey(ButtonMap.ButtonInfo info)
+        {
+            return "Short" + info.ProfileKey.Substring(4);
+        }
+
         // Tolerates corrupted/oversized numeric fields without aborting the whole profile load.
         private static int ParseClampedInt(string text, int min, int max, int fallback)
         {
@@ -639,6 +1051,8 @@ namespace RedgearA20ControlCenter
                 {
                     if (buttons[i].Locked) continue;
                     sbBinds.AppendFormat(",\n  \"{0}\": \"{1}\"", buttons[i].ProfileKey, ButtonMap.ToToken(GetBinding(buttons[i].Id)));
+                    KeyShortcut ks;
+                    if (TryGetShortcut(buttons[i].Id, out ks)) sbBinds.AppendFormat(",\n  \"{0}\": \"{1}\"", ShortcutKey(buttons[i]), KeyShortcuts.ToToken(ks));
                 }
 
                 string json = string.Format("{{\n  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"ActiveDpiStage\": {2},\n  \"EnableDpi\": {3},\n  \"PersistenceMode\": {4}{5}\n}}\n",
@@ -1428,6 +1842,7 @@ namespace RedgearA20ControlCenter
             this.currentBrightness = Math.Max(5, Math.Min(100, currentProfile.Brightness));
 
             InitForm();
+            ShortcutEngine.Log = Log;
             InitTrayIcon();
             InitUsbWatcher();
             InitShowSignal();
@@ -2106,6 +2521,7 @@ namespace RedgearA20ControlCenter
                 lblStatus.ForeColor = Theme.Danger;
                 Log("Device search completed: Redgear A20 (18F8:0FC0) not currently enumerated.", Theme.Danger);
             }
+            ShortcutEngine.Rebind(cachedDevicePath);
         }
 
         private void UpdateColorPreview()
@@ -2568,7 +2984,9 @@ namespace RedgearA20ControlCenter
                 if (cbEnableDpi != null) sendDpi = cbEnableDpi.Checked;
             }
 
-            ButtonBinding[] binds = currentProfile != null ? currentProfile.GetBindingsToTransmit() : new ButtonBinding[0];
+            ButtonBinding[] binds = currentProfile != null ? currentProfile.GetBindingsToTransmit(true) : new ButtonBinding[0];
+            Dictionary<byte, KeyShortcut> shortcuts = currentProfile != null ? currentProfile.GetActiveShortcuts() : new Dictionary<byte, KeyShortcut>();
+            binds = AddStaleShortcutResets(binds, shortcuts);
 
             SaveParameters p = new SaveParameters
             {
@@ -2592,6 +3010,7 @@ namespace RedgearA20ControlCenter
                 PipelineResult res = await Task.Run(() => ExecuteHardwarePipeline(targetPath, p, logger));
                 if (res.Success)
                 {
+                    ShortcutEngine.Configure(shortcuts, targetPath);
                     if (!silent)
                     {
                         Log("✅ Applied to mouse successfully! (Volatile RAM registers updated).", Color.FromArgb(140, 240, 255));
@@ -2953,7 +3372,9 @@ namespace RedgearA20ControlCenter
             {
                 if (all[i].Locked || currentProfile == null) continue;
                 ButtonAction a = currentProfile.GetBinding(all[i].Id);
-                if (a != all[i].FactoryAction) parts.Add(all[i].DisplayName + " → " + ButtonMap.Describe(a));
+                KeyShortcut ks;
+                if (a == ButtonAction.Shortcut && currentProfile.TryGetShortcut(all[i].Id, out ks)) parts.Add(all[i].DisplayName + " → " + KeyShortcuts.Describe(ks));
+                else if (a != all[i].FactoryAction) parts.Add(all[i].DisplayName + " → " + ButtonMap.Describe(a));
             }
             lblRemapSummary.Text = parts.Count == 0 ? "All buttons at factory defaults. Left / Right click are locked." : string.Join(" · ", parts.ToArray());
             lblRemapSummary.ForeColor = parts.Count == 0 ? Theme.TextSecondary : Theme.TextPrimary;
@@ -2971,7 +3392,23 @@ namespace RedgearA20ControlCenter
             TrimMemory();
         }
 
-        private async Task<bool> SendButtonBindingsAsync(ButtonBinding[] binds)
+        // A button the listener currently serves (e.g. from an unsaved mapper test) but which the
+        // profile no longer binds to Shortcut gets an explicit factory reset, so it can't go dead.
+        private static ButtonBinding[] AddStaleShortcutResets(ButtonBinding[] binds, Dictionary<byte, KeyShortcut> keep)
+        {
+            List<ButtonBinding> list = new List<ButtonBinding>(binds);
+            foreach (byte id in ShortcutEngine.ActiveButtonIds())
+            {
+                if (keep.ContainsKey(id)) continue;
+                bool listed = false;
+                for (int i = 0; i < list.Count; i++) if (list[i].ButtonId == id) listed = true;
+                ButtonMap.ButtonInfo info = ButtonMap.Find(id);
+                if (!listed && info != null && !info.Locked) list.Add(new ButtonBinding(id, info.FactoryAction));
+            }
+            return list.ToArray();
+        }
+
+        private async Task<bool> SendButtonBindingsAsync(ButtonBinding[] binds, Dictionary<byte, KeyShortcut> shortcuts)
         {
             if (isSavingInProgress) return false;
             if (string.IsNullOrEmpty(cachedDevicePath))
@@ -2991,6 +3428,7 @@ namespace RedgearA20ControlCenter
                 PipelineResult res = await Task.Run(() => ExecuteBindingPipeline(targetPath, binds, Log));
                 if (res.Success)
                 {
+                    ShortcutEngine.Configure(shortcuts, targetPath);
                     Log("✅ Button bindings applied to mouse RAM. Unplugging the mouse restores factory buttons.", Color.FromArgb(140, 240, 255));
                     return true;
                 }
@@ -3020,9 +3458,13 @@ namespace RedgearA20ControlCenter
             }
         }
 
-        private bool PersistButtonBindings(Dictionary<byte, ButtonAction> bindings)
+        private bool PersistButtonBindings(Dictionary<byte, ButtonAction> bindings, Dictionary<byte, KeyShortcut> shortcuts)
         {
             if (currentProfile == null) currentProfile = new AppProfile();
+            foreach (KeyValuePair<byte, KeyShortcut> kv in shortcuts)
+            {
+                currentProfile.SetShortcut(kv.Key, kv.Value);
+            }
             foreach (KeyValuePair<byte, ButtonAction> kv in bindings)
             {
                 currentProfile.SetBinding(kv.Key, kv.Value);
@@ -3091,7 +3533,7 @@ namespace RedgearA20ControlCenter
 
                 AppProfile profile = AppProfile.Load();
                 Color color = ParseColor(profile.HexColor);
-                ButtonBinding[] binds = profile.GetBindingsToTransmit();
+                ButtonBinding[] binds = profile.GetBindingsToTransmit(false);
 
                 SaveParameters p = new SaveParameters
                 {
@@ -3343,6 +3785,7 @@ namespace RedgearA20ControlCenter
             }
             finally
             {
+                try { ShortcutEngine.Shutdown(); } catch { }
                 if (appMutex != null)
                 {
                     try { appMutex.ReleaseMutex(); } catch { }
@@ -3366,10 +3809,16 @@ namespace RedgearA20ControlCenter
 
         private static bool testWarningAcknowledged = false;
 
-        private readonly Func<ButtonBinding[], Task<bool>> sendBindings;
-        private readonly Func<Dictionary<byte, ButtonAction>, bool> persistBindings;
+        private readonly Func<ButtonBinding[], Dictionary<byte, KeyShortcut>, Task<bool>> sendBindings;
+        private readonly Func<Dictionary<byte, ButtonAction>, Dictionary<byte, KeyShortcut>, bool> persistBindings;
         private readonly Dictionary<byte, ButtonAction> savedBindings = new Dictionary<byte, ButtonAction>();
+        private readonly Dictionary<byte, KeyShortcut> savedShortcuts = new Dictionary<byte, KeyShortcut>();
+        // Last combo chosen per row; kept when the row switches away so re-selecting pre-fills it.
+        private readonly Dictionary<byte, KeyShortcut> rowShortcuts = new Dictionary<byte, KeyShortcut>();
         private readonly Dictionary<byte, ComboBox> combos = new Dictionary<byte, ComboBox>();
+        private readonly Dictionary<byte, Button> shortcutButtons = new Dictionary<byte, Button>();
+        private readonly Dictionary<byte, int> lastIndex = new Dictionary<byte, int>();
+        private readonly PersistenceMode mode;
 
         private Button btnTest;
         private Button btnSaveBinds;
@@ -3379,16 +3828,21 @@ namespace RedgearA20ControlCenter
         private bool ramDiffersFromSaved = false;
         private bool closeConfirmed = false;
 
-        public ButtonMapperForm(AppProfile profile, Func<ButtonBinding[], Task<bool>> send, Func<Dictionary<byte, ButtonAction>, bool> persist)
+        public ButtonMapperForm(AppProfile profile, Func<ButtonBinding[], Dictionary<byte, KeyShortcut>, Task<bool>> send, Func<Dictionary<byte, ButtonAction>, Dictionary<byte, KeyShortcut>, bool> persist)
         {
             sendBindings = send;
             persistBindings = persist;
+            mode = profile.Mode;
 
             ButtonMap.ButtonInfo[] all = ButtonMap.All;
             for (int i = 0; i < all.Length; i++)
             {
-                if (!all[i].Locked) savedBindings[all[i].Id] = profile.GetBinding(all[i].Id);
+                if (all[i].Locked) continue;
+                savedBindings[all[i].Id] = profile.GetBinding(all[i].Id);
+                KeyShortcut ks;
+                if (profile.TryGetShortcut(all[i].Id, out ks)) rowShortcuts[all[i].Id] = ks;
             }
+            foreach (KeyValuePair<byte, KeyShortcut> kv in profile.GetActiveShortcuts()) savedShortcuts[kv.Key] = kv.Value;
 
             Text = "Button Mapper";
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -3398,7 +3852,7 @@ namespace RedgearA20ControlCenter
             StartPosition = FormStartPosition.CenterParent;
             AutoScaleMode = AutoScaleMode.Dpi;
             AutoScaleDimensions = new SizeF(96F, 96F);
-            ClientSize = new Size(470, 406);
+            ClientSize = new Size(470, 424);
             BackColor = Theme.Canvas;
             ForeColor = Theme.TextPrimary;
             Font = Theme.FontBodyPrimary;
@@ -3491,12 +3945,44 @@ namespace RedgearA20ControlCenter
                     SelectAction(cmb, savedBindings[info.Id]);
                     try { MainForm.SetWindowTheme(cmb.Handle, "DarkMode_Explorer", null); } catch { }
                     combos[info.Id] = cmb;
+                    lastIndex[info.Id] = cmb.SelectedIndex;
                     Controls.Add(cmb);
+
+                    Button edit = new Button
+                    {
+                        Location = new Point(354, y),
+                        Size = new Size(104, 24),
+                        BackColor = Theme.SurfaceElevated,
+                        ForeColor = Theme.TextPrimary,
+                        Font = Theme.FontBodySecondary,
+                        FlatStyle = FlatStyle.Flat,
+                        AutoEllipsis = true,
+                        Visible = false,
+                        AccessibleName = info.DisplayName + " keyboard shortcut, click to change"
+                    };
+                    edit.FlatAppearance.BorderColor = Theme.Border;
+                    shortcutButtons[info.Id] = edit;
+                    Controls.Add(edit);
+
+                    byte id = info.Id;
+                    // SelectionChangeCommitted fires for user picks only, never for SelectAction().
+                    cmb.SelectionChangeCommitted += delegate { BeginInvoke(new Action(delegate { OnActionPicked(id); })); };
+                    edit.Click += delegate { if (!busy && EditShortcut(id)) UpdateRow(id); };
+                    UpdateRow(id);
                 }
                 y += 32;
             }
 
-            int barY = y + 10;
+            Controls.Add(new Label
+            {
+                Text = "Keyboard shortcuts work only while this app is running (window, tray or watcher).",
+                Location = new Point(14, y + 2),
+                Size = new Size(444, 18),
+                ForeColor = Theme.TextSecondary,
+                Font = Theme.FontBodySecondary
+            });
+
+            int barY = y + 28;
             btnTest = CreateActionButton("Test on Mouse (RAM)", 12, barY, Color.FromArgb(48, 32, 12), Theme.Warning, Theme.WarningBorder);
             btnTest.Click += BtnTest_Click;
             btnSaveBinds = CreateActionButton("Save to Profile", 165, barY, Theme.Accent, Theme.AccentText, Theme.Accent);
@@ -3554,14 +4040,66 @@ namespace RedgearA20ControlCenter
             cmb.SelectedIndex = -1;
         }
 
+        private ButtonAction RowAction(byte id)
+        {
+            ActionItem item = combos[id].SelectedItem as ActionItem;
+            return item != null ? item.Action : ButtonMap.Find(id).FactoryAction;
+        }
+
+        // Shortcut rows shrink their selector and show the combo as a clickable edit button.
+        private void UpdateRow(byte id)
+        {
+            KeyShortcut ks;
+            bool isShortcut = RowAction(id) == ButtonAction.Shortcut && rowShortcuts.TryGetValue(id, out ks);
+            combos[id].Width = isShortcut ? 140 : 248;
+            shortcutButtons[id].Visible = isShortcut;
+            shortcutButtons[id].Text = isShortcut ? KeyShortcuts.Describe(rowShortcuts[id]) : "";
+        }
+
+        private void OnActionPicked(byte id)
+        {
+            if (IsDisposed) return;
+            ComboBox cmb = combos[id];
+            // Picking "Keyboard Shortcut…" opens the picker; cancelling it reverts the row.
+            if (RowAction(id) == ButtonAction.Shortcut && !EditShortcut(id))
+            {
+                cmb.SelectedIndex = lastIndex[id];
+            }
+            lastIndex[id] = cmb.SelectedIndex;
+            UpdateRow(id);
+        }
+
+        private bool EditShortcut(byte id)
+        {
+            KeyShortcut current;
+            bool has = rowShortcuts.TryGetValue(id, out current);
+            using (ShortcutPickerForm picker = new ShortcutPickerForm(ButtonMap.Find(id).DisplayName, has ? current : new KeyShortcut()))
+            {
+                if (picker.ShowDialog(this) != DialogResult.OK) return false;
+                rowShortcuts[id] = picker.Result;
+                return true;
+            }
+        }
+
         private Dictionary<byte, ButtonAction> ReadSelections()
         {
             Dictionary<byte, ButtonAction> result = new Dictionary<byte, ButtonAction>();
-            foreach (KeyValuePair<byte, ComboBox> kv in combos)
+            foreach (byte id in combos.Keys)
             {
-                ActionItem item = kv.Value.SelectedItem as ActionItem;
-                ButtonMap.ButtonInfo info = ButtonMap.Find(kv.Key);
-                result[kv.Key] = item != null ? item.Action : info.FactoryAction;
+                ButtonAction a = RowAction(id);
+                if (a == ButtonAction.Shortcut && !rowShortcuts.ContainsKey(id)) a = ButtonMap.Find(id).FactoryAction;
+                result[id] = a;
+            }
+            return result;
+        }
+
+        private Dictionary<byte, KeyShortcut> ShortcutsFor(Dictionary<byte, ButtonAction> map)
+        {
+            Dictionary<byte, KeyShortcut> result = new Dictionary<byte, KeyShortcut>();
+            foreach (KeyValuePair<byte, ButtonAction> kv in map)
+            {
+                KeyShortcut ks;
+                if (kv.Value == ButtonAction.Shortcut && rowShortcuts.TryGetValue(kv.Key, out ks)) result[kv.Key] = ks;
             }
             return result;
         }
@@ -3591,14 +4129,28 @@ namespace RedgearA20ControlCenter
             return map;
         }
 
-        private static bool SameBindings(Dictionary<byte, ButtonAction> a, Dictionary<byte, ButtonAction> b)
+        private bool SameAsSaved(Dictionary<byte, ButtonAction> sel, Dictionary<byte, KeyShortcut> shortcuts)
         {
-            foreach (KeyValuePair<byte, ButtonAction> kv in a)
+            foreach (KeyValuePair<byte, ButtonAction> kv in sel)
             {
                 ButtonAction other;
-                if (!b.TryGetValue(kv.Key, out other) || other != kv.Value) return false;
+                if (!savedBindings.TryGetValue(kv.Key, out other) || other != kv.Value) return false;
+            }
+            if (shortcuts.Count != savedShortcuts.Count) return false;
+            foreach (KeyValuePair<byte, KeyShortcut> kv in shortcuts)
+            {
+                KeyShortcut other;
+                if (!savedShortcuts.TryGetValue(kv.Key, out other) || other.Mods != kv.Value.Mods || other.Vk != kv.Value.Vk) return false;
             }
             return true;
+        }
+
+        private void RememberSaved(Dictionary<byte, ButtonAction> sel, Dictionary<byte, KeyShortcut> shortcuts)
+        {
+            foreach (KeyValuePair<byte, ButtonAction> kv in sel) savedBindings[kv.Key] = kv.Value;
+            savedShortcuts.Clear();
+            foreach (KeyValuePair<byte, KeyShortcut> kv in shortcuts) savedShortcuts[kv.Key] = kv.Value;
+            ramDiffersFromSaved = false;
         }
 
         private void SetBusy(bool value)
@@ -3608,16 +4160,17 @@ namespace RedgearA20ControlCenter
             btnSaveBinds.Enabled = !value;
             btnDefaults.Enabled = !value;
             foreach (ComboBox c in combos.Values) c.Enabled = !value;
+            foreach (Button b in shortcutButtons.Values) b.Enabled = !value;
             UseWaitCursor = value;
         }
 
-        private async Task<bool> Dispatch(Dictionary<byte, ButtonAction> map)
+        private async Task<bool> Dispatch(Dictionary<byte, ButtonAction> map, Dictionary<byte, KeyShortcut> shortcuts)
         {
             ButtonBinding[] set = ToPacketSet(map);
             SetBusy(true);
             try
             {
-                bool ok = await sendBindings(set);
+                bool ok = await sendBindings(set, shortcuts);
                 if (ok && set.Length > 0)
                 {
                     ButtonBinding last = set[set.Length - 1];
@@ -3650,9 +4203,10 @@ namespace RedgearA20ControlCenter
             }
 
             Dictionary<byte, ButtonAction> sel = ReadSelections();
-            if (await Dispatch(sel))
+            Dictionary<byte, KeyShortcut> shortcuts = ShortcutsFor(sel);
+            if (await Dispatch(sel, shortcuts))
             {
-                ramDiffersFromSaved = !SameBindings(sel, savedBindings);
+                ramDiffersFromSaved = !SameAsSaved(sel, shortcuts);
             }
         }
 
@@ -3660,11 +4214,19 @@ namespace RedgearA20ControlCenter
         {
             if (busy) return;
             Dictionary<byte, ButtonAction> sel = ReadSelections();
-            if (!await Dispatch(sel)) return;
-            if (persistBindings(sel))
+            Dictionary<byte, KeyShortcut> shortcuts = ShortcutsFor(sel);
+            if (shortcuts.Count > 0 && mode == PersistenceMode.Disabled)
             {
-                foreach (KeyValuePair<byte, ButtonAction> kv in sel) savedBindings[kv.Key] = kv.Value;
-                ramDiffersFromSaved = false;
+                DialogResult r = MessageBox.Show(
+                    "Keyboard shortcuts need this app to be running. Startup mode is set to Disabled, so after a restart these buttons keep their factory behaviour until you open the app again.\n\n" +
+                    "To keep shortcuts working after sign-in, choose Stealth Watcher or Tray Agent.\n\nSave anyway?",
+                    "Keyboard Shortcuts", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                if (r != DialogResult.Yes) return;
+            }
+            if (!await Dispatch(sel, shortcuts)) return;
+            if (persistBindings(sel, shortcuts))
+            {
+                RememberSaved(sel, shortcuts);
                 lblFooter.Text = "Saved · bindings will be restored automatically on every replug.";
             }
         }
@@ -3673,12 +4235,17 @@ namespace RedgearA20ControlCenter
         {
             if (busy) return;
             Dictionary<byte, ButtonAction> factory = FactoryMap();
-            foreach (KeyValuePair<byte, ComboBox> kv in combos) SelectAction(kv.Value, factory[kv.Key]);
-            if (!await Dispatch(factory)) return;
-            if (persistBindings(factory))
+            Dictionary<byte, KeyShortcut> none = new Dictionary<byte, KeyShortcut>();
+            foreach (KeyValuePair<byte, ComboBox> kv in combos)
             {
-                foreach (KeyValuePair<byte, ButtonAction> kv in factory) savedBindings[kv.Key] = kv.Value;
-                ramDiffersFromSaved = false;
+                SelectAction(kv.Value, factory[kv.Key]);
+                lastIndex[kv.Key] = kv.Value.SelectedIndex;
+                UpdateRow(kv.Key);
+            }
+            if (!await Dispatch(factory, none)) return;
+            if (persistBindings(factory, none))
+            {
+                RememberSaved(factory, none);
                 lblFooter.Text = "Factory button behaviour restored and saved.";
             }
         }
@@ -3703,9 +4270,209 @@ namespace RedgearA20ControlCenter
             }
 
             e.Cancel = true;
-            await Dispatch(new Dictionary<byte, ButtonAction>(savedBindings));
+            await Dispatch(new Dictionary<byte, ButtonAction>(savedBindings), new Dictionary<byte, KeyShortcut>(savedShortcuts));
             closeConfirmed = true;
             if (!IsDisposed) Close();
+        }
+    }
+
+    // Captures one key combination. Rules: 0-4 modifiers plus exactly one allow-listed main key,
+    // Ctrl+Alt+Del refused, window-closing / lock combos confirmed. Win is a checkbox because the
+    // Windows shell swallows most Win+key presses before any app can see them.
+    public class ShortcutPickerForm : Form
+    {
+        private readonly CheckBox[] modBoxes = new CheckBox[4];
+        private readonly TextBox txtCapture;
+        private readonly Label lblHint;
+        private readonly Button btnOk;
+        private byte vk;
+
+        public KeyShortcut Result;
+
+        public ShortcutPickerForm(string buttonName, KeyShortcut initial)
+        {
+            Text = "Keyboard Shortcut · " + buttonName;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleDimensions = new SizeF(96F, 96F);
+            ClientSize = new Size(380, 214);
+            BackColor = Theme.Canvas;
+            ForeColor = Theme.TextPrimary;
+            Font = Theme.FontBodyPrimary;
+            KeyPreview = false;
+
+            Controls.Add(new Label
+            {
+                Text = "Click the box, then press the key combination:",
+                Location = new Point(14, 14),
+                Size = new Size(352, 18),
+                ForeColor = Theme.TextSecondary
+            });
+
+            txtCapture = new TextBox
+            {
+                Location = new Point(14, 36),
+                Size = new Size(352, 26),
+                BackColor = Theme.SurfaceElevated,
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.FontHeading,
+                TextAlign = HorizontalAlignment.Center,
+                ShortcutsEnabled = false,
+                ContextMenu = new ContextMenu(),
+                AccessibleName = "Shortcut capture"
+            };
+            // Every key, including Tab / Enter / Esc / arrows, is captured instead of moving focus.
+            txtCapture.PreviewKeyDown += delegate(object s, PreviewKeyDownEventArgs e) { e.IsInputKey = true; };
+            txtCapture.KeyDown += Capture_KeyDown;
+            txtCapture.KeyUp += Capture_KeyUp;
+            txtCapture.KeyPress += delegate(object s, KeyPressEventArgs e) { e.Handled = true; };
+            Controls.Add(txtCapture);
+
+            string[] names = { "Ctrl", "Shift", "Alt", "Win" };
+            for (int i = 0; i < 4; i++)
+            {
+                modBoxes[i] = new CheckBox
+                {
+                    Text = names[i],
+                    Location = new Point(14 + i * 80, 72),
+                    Size = new Size(76, 22),
+                    ForeColor = Theme.TextPrimary,
+                    Checked = (initial.Mods & (1 << i)) != 0
+                };
+                modBoxes[i].CheckedChanged += delegate { UpdateState(); };
+                Controls.Add(modBoxes[i]);
+            }
+
+            lblHint = new Label
+            {
+                Location = new Point(14, 102),
+                Size = new Size(352, 62),
+                ForeColor = Theme.TextSecondary,
+                Font = Theme.FontBodySecondary
+            };
+            Controls.Add(lblHint);
+
+            btnOk = MakeButton("OK", 172, Theme.Accent, Theme.AccentText);
+            btnOk.Click += BtnOk_Click;
+            Button btnCancel = MakeButton("Cancel", 274, Theme.Surface, Theme.TextSecondary);
+            btnCancel.DialogResult = DialogResult.Cancel;
+
+            vk = initial.Vk;
+            UpdateState();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            MainForm.ApplyDarkTitleBar(this.Handle);
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            txtCapture.Focus();
+        }
+
+        private Button MakeButton(string text, int x, Color back, Color fore)
+        {
+            Button b = new Button
+            {
+                Text = text,
+                Location = new Point(x, 172),
+                Size = new Size(92, 30),
+                BackColor = back,
+                ForeColor = fore,
+                Font = Theme.FontBodyBold,
+                FlatStyle = FlatStyle.Flat
+            };
+            b.FlatAppearance.BorderColor = Theme.Border;
+            Controls.Add(b);
+            return b;
+        }
+
+        private static bool IsModifierKey(Keys k)
+        {
+            return k == Keys.ControlKey || k == Keys.ShiftKey || k == Keys.Menu || k == Keys.LWin || k == Keys.RWin ||
+                   k == Keys.LControlKey || k == Keys.RControlKey || k == Keys.LShiftKey || k == Keys.RShiftKey ||
+                   k == Keys.LMenu || k == Keys.RMenu;
+        }
+
+        private void Capture_KeyDown(object sender, KeyEventArgs e)
+        {
+            // Swallow everything so Alt+F4, Enter, Esc etc. are recorded rather than acted on.
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            if (IsModifierKey(e.KeyCode)) return;
+            Take(e);
+        }
+
+        // Print Screen only produces a key-up in WinForms.
+        private void Capture_KeyUp(object sender, KeyEventArgs e)
+        {
+            e.Handled = true;
+            if (e.KeyCode == Keys.PrintScreen) Take(e);
+        }
+
+        private void Take(KeyEventArgs e)
+        {
+            modBoxes[0].Checked = e.Control;
+            modBoxes[1].Checked = e.Shift;
+            modBoxes[2].Checked = e.Alt;
+            vk = (byte)((int)e.KeyCode & 0xFF);
+            UpdateState();
+        }
+
+        private KeyShortcut Current()
+        {
+            byte mods = 0;
+            for (int i = 0; i < 4; i++) if (modBoxes[i].Checked) mods |= (byte)(1 << i);
+            return new KeyShortcut(mods, vk);
+        }
+
+        private void UpdateState()
+        {
+            KeyShortcut ks = Current();
+            bool ok = false;
+            if (vk == 0)
+            {
+                txtCapture.Text = "Press a key…";
+                lblHint.Text = "Up to 4 modifiers plus exactly one key. The shortcut fires once per button press.";
+            }
+            else
+            {
+                txtCapture.Text = KeyShortcuts.Describe(ks);
+                if (KeyShortcuts.VkToUsage(vk) == 0)
+                    lblHint.Text = KeyShortcuts.KeyName(vk) + " can't be used. Lock keys, media keys and lone modifiers are not supported.";
+                else if (KeyShortcuts.IsBlocked(ks))
+                    lblHint.Text = "Ctrl + Alt + Del is reserved by Windows and can't be assigned.";
+                else
+                {
+                    ok = true;
+                    lblHint.Text = "Fires once per button press. Some combos (e.g. Win + key, Alt + Tab) are handled by Windows itself.";
+                }
+            }
+            lblHint.ForeColor = ok || vk == 0 ? Theme.TextSecondary : Theme.Danger;
+            btnOk.Enabled = ok;
+        }
+
+        private void BtnOk_Click(object sender, EventArgs e)
+        {
+            KeyShortcut ks = Current();
+            if (!KeyShortcuts.IsAllowed(ks)) return;
+            string warning = KeyShortcuts.Warning(ks);
+            if (warning != null)
+            {
+                DialogResult r = MessageBox.Show(
+                    KeyShortcuts.Describe(ks) + " " + warning + "\n\nAssign it anyway?",
+                    "Confirm Shortcut", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (r != DialogResult.Yes) return;
+            }
+            Result = ks;
+            DialogResult = DialogResult.OK;
         }
     }
 }
