@@ -1,6 +1,6 @@
 @echo off
 echo ===================================================================
-echo   Building Redgear A20 Control Center v0.2.0 (64-bit Windows)
+echo   Building Redgear A20 Control Center v0.3.0 (64-bit Windows)
 echo ===================================================================
 echo.
 
