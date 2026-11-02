@@ -17,8 +17,8 @@ using Microsoft.Win32.SafeHandles;
 [assembly: AssemblyDescription("Open-Source Hardware Control Utility for Redgear A20")]
 [assembly: AssemblyProduct("Redgear A20 Control Center")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Redgear A20 Open Driver Project Contributors")]
-[assembly: AssemblyVersion("0.2.0.0")]
-[assembly: AssemblyFileVersion("0.2.0.0")]
+[assembly: AssemblyVersion("0.2.1.0")]
+[assembly: AssemblyFileVersion("0.2.1.0")]
 
 namespace RedgearA20ControlCenter
 {
@@ -1305,7 +1305,7 @@ namespace RedgearA20ControlCenter
 
         private void InitForm()
         {
-            this.Text = "Redgear A20 Control Center v0.2.0";
+            this.Text = "Redgear A20 Control Center v0.2.1";
             this.Size = new Size(580, 835);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
