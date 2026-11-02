@@ -155,6 +155,9 @@ namespace RedgearA20ControlCenter
                             IntPtr pPath = new IntPtr(pDetail.ToInt64() + 4);
                             string path = Marshal.PtrToStringAuto(pPath);
 
+                            // A malformed/empty detail record can yield null; skip it.
+                            if (string.IsNullOrEmpty(path)) continue;
+
                             // Quick filter on VID & PID in string
                             string pathLower = path.ToLowerInvariant();
                             if (pathLower.Contains("vid_18f8") && pathLower.Contains("pid_0fc0"))
@@ -341,13 +344,20 @@ namespace RedgearA20ControlCenter
                 {
                     string json = File.ReadAllText(file);
                     Match mHex = Regex.Match(json, "\"HexColor\"\\s*:\\s*\"([^\"]+)\"");
-                    if (mHex.Success) p.HexColor = mHex.Groups[1].Value;
+                    if (mHex.Success)
+                    {
+                        string hex = mHex.Groups[1].Value.Trim();
+                        if (Regex.IsMatch(hex, "^#?[0-9A-Fa-f]{6}$"))
+                        {
+                            p.HexColor = "#" + hex.TrimStart('#').ToUpperInvariant();
+                        }
+                    }
 
                     Match mBri = Regex.Match(json, "\"Brightness\"\\s*:\\s*(\\d+)");
-                    if (mBri.Success) p.Brightness = Math.Max(5, Math.Min(100, int.Parse(mBri.Groups[1].Value)));
+                    if (mBri.Success) p.Brightness = ParseClampedInt(mBri.Groups[1].Value, 5, 100, p.Brightness);
 
                     Match mDpiStage = Regex.Match(json, "\"ActiveDpiStage\"\\s*:\\s*(\\d+)");
-                    if (mDpiStage.Success) p.ActiveDpiStage = Math.Max(0, Math.Min(5, int.Parse(mDpiStage.Groups[1].Value)));
+                    if (mDpiStage.Success) p.ActiveDpiStage = ParseClampedInt(mDpiStage.Groups[1].Value, 0, 5, p.ActiveDpiStage);
 
                     Match mEnDpi = Regex.Match(json, "\"EnableDpi\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
                     if (mEnDpi.Success) p.EnableDpi = bool.Parse(mEnDpi.Groups[1].Value);
@@ -355,8 +365,9 @@ namespace RedgearA20ControlCenter
                     Match mMode = Regex.Match(json, "\"(?:PersistenceMode|Mode)\"\\s*:\\s*(\\d+)");
                     if (mMode.Success)
                     {
-                        int modeVal = int.Parse(mMode.Groups[1].Value);
-                        if (Enum.IsDefined(typeof(PersistenceMode), modeVal))
+                        int modeVal;
+                        if (int.TryParse(mMode.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out modeVal) &&
+                            Enum.IsDefined(typeof(PersistenceMode), modeVal))
                         {
                             p.Mode = (PersistenceMode)modeVal;
                         }
@@ -391,6 +402,19 @@ namespace RedgearA20ControlCenter
             return p;
         }
 
+        // Tolerates corrupted/oversized numeric fields without aborting the whole profile load.
+        private static int ParseClampedInt(string text, int min, int max, int fallback)
+        {
+            int value;
+            if (!int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+            {
+                return fallback;
+            }
+            if (value < min) return min;
+            if (value > max) return max;
+            return value;
+        }
+
         public bool Save(out string error)
         {
             error = null;
@@ -417,8 +441,10 @@ namespace RedgearA20ControlCenter
                     }
                     catch
                     {
-                        File.Delete(file);
-                        File.Move(tmpFile, file);
+                        // Non-NTFS fallback: overwrite in place, then remove the temp file.
+                        // (Avoids a window where the only copy of the profile has been deleted.)
+                        File.Copy(tmpFile, file, true);
+                        File.Delete(tmpFile);
                     }
                 }
                 else
@@ -449,6 +475,7 @@ namespace RedgearA20ControlCenter
     {
         public const string TASK_NAME = "RedgearA20_AutoApply";
         public const string HARDWARE_MUTEX_NAME = @"Local\RedgearA20_HardwareLock";
+        public const string SHOW_EVENT_NAME = @"Local\RedgearA20_ShowControlCenter_Event";
 
         public static string GetInstalledExePath()
         {
@@ -568,6 +595,11 @@ namespace RedgearA20ControlCenter
                 };
                 using (Process p = Process.Start(psi))
                 {
+                    if (p == null)
+                    {
+                        error = "Failed to start schtasks.exe.";
+                        return false;
+                    }
                     p.StandardOutput.ReadToEnd();
                     p.StandardError.ReadToEnd();
                     p.WaitForExit(4000);
@@ -694,19 +726,26 @@ namespace RedgearA20ControlCenter
         private ContextMenuStrip trayMenu;
         private System.Windows.Forms.Timer usbDebounceTimer;
 
+        // Cross-process "show control center" signal (replaces unreliable HWND_BROADCAST IPC)
+        private EventWaitHandle showSignalEvent;
+        private RegisteredWaitHandle showSignalWait;
+
         // Internal State
         private Color currentColor = Color.FromArgb(190, 89, 255); // Soft Lavender default
         private int currentBrightness = 100;
-        private string cachedDevicePath = null;
-        private ushort cachedUsagePage = 0;
+        // volatile: written from background stealth-startup Task.Run and hotplug retries,
+        // read from the UI thread (Win32 message pump + async continuations).
+        private volatile string cachedDevicePath = null;
+        private volatile int cachedUsagePage = 0;
         private volatile bool isSavingInProgress = false;
         private AppProfile currentProfile;
         private bool startHidden = false;
         private bool isStealth = false;
         private bool isExplicitlyRestoring = false;
         private bool balloonShownOnce = false;
-        private bool isExiting = false;
+        private volatile bool isExiting = false;
         private bool isHotplugHandling = false;
+        private volatile bool pendingShowSignal = false;
 
         private const int EEPROM_WRITE_DELAY_MS = 100;
 
@@ -728,6 +767,20 @@ namespace RedgearA20ControlCenter
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
 
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool ChangeWindowMessageFilter(int message, uint dwFlag);
         private const uint MSGFLT_ADD = 1;
@@ -740,10 +793,9 @@ namespace RedgearA20ControlCenter
         [DllImport("uxtheme.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
         private static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
 
-        private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
+        // Registered message kept for backwards compatibility with older builds.
         private static int wmShowControlCenter = 0;
         private static Mutex appMutex = null;
-
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
@@ -759,18 +811,37 @@ namespace RedgearA20ControlCenter
                 }
             }
             catch { }
+
+            // A second instance may signal before this form has a window handle.
+            // Remember it and replay the request as soon as the handle exists.
+            if (pendingShowSignal)
+            {
+                pendingShowSignal = false;
+                try { BeginInvoke(new Action(RestoreGui)); } catch { }
+            }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (isSavingInProgress)
+            // Windows shutdown / Task Manager must never be blocked by our
+            // "keep running in background" behavior.
+            bool systemClose = e.CloseReason == CloseReason.WindowsShutDown ||
+                               e.CloseReason == CloseReason.TaskManagerClosing;
+            bool exitAuthorized = isExiting ||
+                                  e.CloseReason == CloseReason.ApplicationExitCall ||
+                                  systemClose;
+
+            if (isSavingInProgress && !systemClose)
             {
                 MessageBox.Show("Please wait until the operation completes before exiting.", "Busy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 e.Cancel = true;
+                // Do not leave a stale exit authorization behind: the next [X]
+                // must still minimize to the watcher as usual.
+                isExiting = false;
                 return;
             }
 
-            if (!isExiting && currentProfile != null && (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
+            if (!exitAuthorized && currentProfile != null && (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
             {
                 e.Cancel = true;
                 MinimizeToWatcher(showBalloon: currentProfile.Mode == PersistenceMode.TrayAgent);
@@ -813,6 +884,16 @@ namespace RedgearA20ControlCenter
                     usbDebounceTimer.Stop();
                     usbDebounceTimer.Dispose();
                     usbDebounceTimer = null;
+                }
+                if (showSignalWait != null)
+                {
+                    try { showSignalWait.Unregister(null); } catch { }
+                    showSignalWait = null;
+                }
+                if (showSignalEvent != null)
+                {
+                    try { showSignalEvent.Close(); } catch { }
+                    showSignalEvent = null;
                 }
             }
             base.Dispose(disposing);
@@ -865,7 +946,11 @@ namespace RedgearA20ControlCenter
             {
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
-                SetProcessWorkingSetSize(Process.GetCurrentProcess().Handle, new IntPtr(-1), new IntPtr(-1));
+                // Process.GetCurrentProcess() owns an OS handle; dispose it after use.
+                using (Process current = Process.GetCurrentProcess())
+                {
+                    SetProcessWorkingSetSize(current.Handle, new IntPtr(-1), new IntPtr(-1));
+                }
             }
             catch { }
         }
@@ -874,7 +959,7 @@ namespace RedgearA20ControlCenter
         {
             try
             {
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RUN_REG_KEY, true))
+                using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RUN_REG_KEY))
                 {
                     if (key != null)
                     {
@@ -940,9 +1025,7 @@ namespace RedgearA20ControlCenter
                 );
                 if (dr == DialogResult.Yes)
                 {
-                    isExiting = true;
-                    if (trayIcon != null) trayIcon.Visible = false;
-                    Application.Exit();
+                    RequestExit();
                 }
             };
             trayMenu.Items.Add(miExit);
@@ -958,10 +1041,27 @@ namespace RedgearA20ControlCenter
             trayIcon.DoubleClick += delegate { RestoreGui(); };
         }
 
+        private void RequestExit()
+        {
+            if (isSavingInProgress)
+            {
+                MessageBox.Show("Please wait until the current operation completes before exiting.", "Busy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            isExiting = true;
+            Application.Exit();
+        }
+
         private void MinimizeToWatcher(bool showBalloon)
         {
-            this.Hide();
+            // Restore Normal state BEFORE hiding. Setting WindowState after Hide()
+            // can make WinForms re-show a previously minimized window.
+            if (this.WindowState != FormWindowState.Normal)
+            {
+                this.WindowState = FormWindowState.Normal;
+            }
             this.ShowInTaskbar = false;
+            this.Hide();
             isExplicitlyRestoring = false;
             if (trayIcon != null)
             {
@@ -979,9 +1079,11 @@ namespace RedgearA20ControlCenter
         {
             isExplicitlyRestoring = true;
             startHidden = false;
-            this.Show();
+            // Normalize state before showing so the window cannot reappear
+            // minimized or without a taskbar button.
             this.WindowState = FormWindowState.Normal;
             this.ShowInTaskbar = true;
+            this.Show();
             this.BringToFront();
             this.Activate();
             RefreshDeviceConnection();
@@ -993,6 +1095,45 @@ namespace RedgearA20ControlCenter
             usbDebounceTimer = new System.Windows.Forms.Timer();
             usbDebounceTimer.Interval = 400; // 400 ms debounce after USB hotplug
             usbDebounceTimer.Tick += OnUsbDebounceTimerTick;
+        }
+
+        // ─── Cross-process GUI restore signalling ───
+        // Registered window messages (>= WM_USER) cannot be delivered via HWND_BROADCAST
+        // on modern Windows. A session-local named event is the deterministic IPC channel.
+        private void InitShowSignal()
+        {
+            try
+            {
+                showSignalEvent = new EventWaitHandle(false, EventResetMode.AutoReset, TaskSchedulerHelper.SHOW_EVENT_NAME);
+                showSignalWait = ThreadPool.RegisterWaitForSingleObject(
+                    showSignalEvent,
+                    OnShowSignalFired,
+                    null,
+                    Timeout.Infinite,
+                    false);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("Show-signal init error: " + ex.Message);
+            }
+        }
+
+        private void OnShowSignalFired(object state, bool timedOut)
+        {
+            if (timedOut || isExiting) return;
+            try
+            {
+                if (this.IsDisposed || this.Disposing) return;
+                if (!this.IsHandleCreated)
+                {
+                    pendingShowSignal = true;
+                    return;
+                }
+                this.BeginInvoke(new Action(RestoreGui));
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+            catch { }
         }
 
         private async void OnUsbDebounceTimerTick(object sender, EventArgs e)
@@ -1018,8 +1159,16 @@ namespace RedgearA20ControlCenter
                 if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile != null &&
                     (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
                 {
-                    await ApplyCurrentProfileAsync(silent: true);
-                    TrimMemory();
+                    if (isSavingInProgress)
+                    {
+                        // Do not drop the hotplug event because another save is running.
+                        usbDebounceTimer.Start();
+                    }
+                    else
+                    {
+                        await ApplyCurrentProfileAsync(silent: true);
+                        TrimMemory();
+                    }
                 }
             }
             catch (Exception ex)
@@ -1047,6 +1196,7 @@ namespace RedgearA20ControlCenter
             InitForm();
             InitTrayIcon();
             InitUsbWatcher();
+            InitShowSignal();
 
             RefreshDeviceConnection();
             UpdateColorPreview();
@@ -1241,9 +1391,7 @@ namespace RedgearA20ControlCenter
 
                 if (dr == DialogResult.Yes)
                 {
-                    isExiting = true;
-                    if (trayIcon != null) trayIcon.Visible = false;
-                    Application.Exit();
+                    RequestExit();
                 }
             };
 
@@ -1597,8 +1745,16 @@ namespace RedgearA20ControlCenter
             {
                 if (!string.IsNullOrEmpty(rtbLog.Text))
                 {
-                    Clipboard.SetText(rtbLog.Text);
-                    MessageBox.Show("Diagnostic log copied to clipboard!", "Log Copied", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    try
+                    {
+                        Clipboard.SetText(rtbLog.Text);
+                        MessageBox.Show("Diagnostic log copied to clipboard!", "Log Copied", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show("Could not copy the log to the clipboard:\n\n" + ex.Message,
+                            "Clipboard Busy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
                 }
             };
             gbLog.Controls.Add(btnCopyLog);
@@ -1627,17 +1783,25 @@ namespace RedgearA20ControlCenter
         private void Log(string msg, Color col)
         {
             if (rtbLog == null) return;
-            if (rtbLog.InvokeRequired)
+            try
             {
-                rtbLog.Invoke(new Action<string, Color>(Log), msg, col);
-                return;
+                if (rtbLog.InvokeRequired)
+                {
+                    rtbLog.Invoke(new Action<string, Color>(Log), msg, col);
+                    return;
+                }
+                if (rtbLog.IsDisposed) return;
+                if (rtbLog.TextLength > 50000) rtbLog.Clear();
+                rtbLog.SelectionStart = rtbLog.TextLength;
+                rtbLog.SelectionLength = 0;
+                rtbLog.SelectionColor = col;
+                rtbLog.AppendText(string.Format(CultureInfo.InvariantCulture, "[{0:HH:mm:ss.fff}] {1}\n", DateTime.Now, msg));
+                rtbLog.ScrollToCaret();
             }
-            if (rtbLog.TextLength > 50000) rtbLog.Clear();
-            rtbLog.SelectionStart = rtbLog.TextLength;
-            rtbLog.SelectionLength = 0;
-            rtbLog.SelectionColor = col;
-            rtbLog.AppendText(string.Format(CultureInfo.InvariantCulture, "[{0:HH:mm:ss.fff}] {1}\n", DateTime.Now, msg));
-            rtbLog.ScrollToCaret();
+            catch
+            {
+                // Logging must never take the app down (e.g. during shutdown).
+            }
         }
 
         private void RefreshDeviceConnection()
@@ -1648,9 +1812,20 @@ namespace RedgearA20ControlCenter
                 return;
             }
 
-            ushort uPage;
-            cachedDevicePath = HidTransport.FindTargetDevicePath(out uPage);
-            cachedUsagePage = uPage;
+            ushort uPage = 0;
+            try
+            {
+                cachedDevicePath = HidTransport.FindTargetDevicePath(out uPage);
+                cachedUsagePage = uPage;
+            }
+            catch (Exception ex)
+            {
+                // A transient SetupAPI failure must not take the UI down.
+                cachedDevicePath = null;
+                cachedUsagePage = 0;
+                Debug.WriteLine("Device enumeration error: " + ex.Message);
+                Log("Device enumeration error: " + ex.Message, Color.FromArgb(255, 80, 80));
+            }
 
             if (cachedDevicePath != null)
             {
@@ -1733,12 +1908,16 @@ namespace RedgearA20ControlCenter
             {
                 case 0:
                     return "Operation succeeded.";
+                case 2:
+                    return "The system cannot find the file specified (ERROR_FILE_NOT_FOUND). The HID device path is stale; reconnect the mouse and click Refresh.";
                 case 5:
                     return "Access denied (ERROR_ACCESS_DENIED). Another process (e.g. Gaming Mouse 2.0.exe) may be holding the HID endpoint.";
                 case 6:
                     return "Invalid handle (ERROR_INVALID_HANDLE). Device communication handle was closed or invalidated.";
                 case 31:
                     return "A device attached to the system is not functioning (ERROR_GEN_FAILURE). Microcontroller may have stalled.";
+                case 32:
+                    return "The device is being used by another process (ERROR_SHARING_VIOLATION). Close other mouse utilities and retry.";
                 case 87:
                     return "The parameter is incorrect (ERROR_INVALID_PARAMETER). USB report buffer length or Report ID mismatch.";
                 case 1167:
@@ -1746,6 +1925,13 @@ namespace RedgearA20ControlCenter
                 default:
                     return string.Format("System error code {0}", errCode);
             }
+        }
+
+        private static string DescribePipelineFailure(PipelineResult res)
+        {
+            if (res == null) return "Unknown hardware failure.";
+            if (res.Win32ErrorCode != 0) return TranslateWin32Error(res.Win32ErrorCode);
+            return string.IsNullOrEmpty(res.ErrorMessage) ? "Hardware operation failed." : res.ErrorMessage;
         }
 
         private static PipelineResult ExecuteHardwarePipeline(string devicePath, SaveParameters p, Action<string, Color> logCallback)
@@ -2059,7 +2245,7 @@ namespace RedgearA20ControlCenter
                 }
                 else
                 {
-                    string friendlyMsg = TranslateWin32Error(res.Win32ErrorCode);
+                    string friendlyMsg = DescribePipelineFailure(res);
                     Log(string.Format("❌ Apply failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
 
                     if (res.Win32ErrorCode == 1167 || res.Win32ErrorCode == 2 || res.Win32ErrorCode == 6)
@@ -2078,6 +2264,15 @@ namespace RedgearA20ControlCenter
                     }
                     return false;
                 }
+            }
+            catch (Exception ex)
+            {
+                Log("❌ Apply failed with an unexpected error: " + ex.Message, Color.FromArgb(255, 80, 80));
+                if (!silent)
+                {
+                    MessageBox.Show("Failed to apply settings:\n\n" + ex.Message, "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                return false;
             }
             finally
             {
@@ -2272,7 +2467,7 @@ namespace RedgearA20ControlCenter
                 }
                 else
                 {
-                    string friendlyMsg = TranslateWin32Error(res.Win32ErrorCode);
+                    string friendlyMsg = DescribePipelineFailure(res);
                     Log(string.Format("❌ Factory reset failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
                     if (res.Win32ErrorCode == 1167 || res.Win32ErrorCode == 2 || res.Win32ErrorCode == 6)
                     {
@@ -2301,7 +2496,13 @@ namespace RedgearA20ControlCenter
         // ─── UNVERIFIED / EXPERIMENTAL SECTION: DPI TESTING ───
         private async void BtnTestDpi_Click(object sender, EventArgs e)
         {
-            if (!cbEnableDpi.Checked) return;
+            if (cbEnableDpi == null || !cbEnableDpi.Checked) return;
+            if (cmbDpiStages == null) return;
+            if (isSavingInProgress)
+            {
+                Log("Another hardware operation is in progress. Please wait and retry.", Color.FromArgb(255, 200, 80));
+                return;
+            }
             if (string.IsNullOrEmpty(cachedDevicePath))
             {
                 MessageBox.Show("Redgear A20 is not connected.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
@@ -2340,7 +2541,15 @@ namespace RedgearA20ControlCenter
 
                         if (!lockAcquired) return false;
 
-                        ok = HidTransport.SendSinglePacket(targetPath, dpiPacket, out err);
+                        try
+                        {
+                            ok = HidTransport.SendSinglePacket(targetPath, dpiPacket, out err);
+                        }
+                        catch (Exception exSend)
+                        {
+                            ok = false;
+                            err = "Unexpected transport failure: " + exSend.Message;
+                        }
                         return true;
                     }
                     finally
@@ -2371,7 +2580,11 @@ namespace RedgearA20ControlCenter
             }
             finally
             {
-                btnTestDpi.Enabled = true;
+                if (btnTestDpi != null && !btnTestDpi.IsDisposed)
+                {
+                    // Respect the checkbox if the user disabled DPI testing mid-operation.
+                    btnTestDpi.Enabled = cbEnableDpi != null && cbEnableDpi.Checked;
+                }
             }
         }
 
@@ -2459,6 +2672,75 @@ namespace RedgearA20ControlCenter
                 File.AppendAllText(logFile, entry, Encoding.UTF8);
             }
             catch { }
+        }
+
+        // ─── Single-instance activation ───
+        // Primary channel: session-local named event (survives window-handle recreation).
+        // Fallback: direct PostMessage to the known control-center window, for older builds
+        // that only listen for the registered window message.
+        private static void SignalExistingInstanceToShow()
+        {
+            const int MAX_ATTEMPTS = 12;
+            const int RETRY_DELAY_MS = 150;
+
+            for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++)
+            {
+                try
+                {
+                    using (EventWaitHandle ev = EventWaitHandle.OpenExisting(TaskSchedulerHelper.SHOW_EVENT_NAME))
+                    {
+                        ev.Set();
+                        return;
+                    }
+                }
+                catch (WaitHandleCannotBeOpenedException) { }
+                catch (UnauthorizedAccessException) { }
+                catch { }
+
+                if (PostShowMessageToExistingWindow()) return;
+                Thread.Sleep(RETRY_DELAY_MS);
+            }
+        }
+
+        private static bool PostShowMessageToExistingWindow()
+        {
+            bool posted = false;
+            try
+            {
+                EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
+                {
+                    if (posted) return false;
+
+                    int len = GetWindowTextLength(hWnd);
+                    if (len <= 0) return true;
+
+                    StringBuilder title = new StringBuilder(len + 1);
+                    if (GetWindowText(hWnd, title, title.Capacity) <= 0) return true;
+                    if (!title.ToString().StartsWith("Redgear A20 Control Center", StringComparison.OrdinalIgnoreCase)) return true;
+
+                    uint pid;
+                    GetWindowThreadProcessId(hWnd, out pid);
+                    try
+                    {
+                        using (Process owner = Process.GetProcessById((int)pid))
+                        {
+                            if (!owner.ProcessName.StartsWith("RedgearA20", StringComparison.OrdinalIgnoreCase))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        return true;
+                    }
+
+                    posted = PostMessage(hWnd, wmShowControlCenter, IntPtr.Zero, IntPtr.Zero);
+                    return !posted;
+                }, IntPtr.Zero);
+            }
+            catch { }
+            return posted;
         }
 
         [STAThread]
@@ -2591,7 +2873,9 @@ namespace RedgearA20ControlCenter
             {
                 if (!startHidden)
                 {
-                    PostMessage(HWND_BROADCAST, wmShowControlCenter, IntPtr.Zero, IntPtr.Zero);
+                    // HWND_BROADCAST silently drops registered messages (>= WM_USER) on
+                    // modern Windows. Signal the running instance deterministically.
+                    SignalExistingInstanceToShow();
                 }
                 return;
             }
