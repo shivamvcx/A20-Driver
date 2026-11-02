@@ -1,4 +1,5 @@
-using System;
+﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
@@ -296,6 +297,147 @@ namespace RedgearA20ControlCenter
         public byte DpiMask;
         public bool CommitToFlash;
         public bool SendDpi;
+        public bool SendButtonBindings;
+        public ButtonBinding[] ButtonBindings;
+    }
+
+    // Verified hardware action codes for Command 0x10 (see AI-CONTEXT.md section 2.1).
+    // Derived from the vendor UI-index -> firmware-code translation at VA 0x004087A7-0x0040880F.
+    // Codes outside this set collapse to 0x00 in firmware (silent no-op), so they are never sent.
+    public enum ButtonAction : byte
+    {
+        LeftButton = 0x01,
+        MiddleClick = 0x02,
+        RightButton = 0x03,
+        Back = 0x04,
+        Forward = 0x05,
+        DpiLoop = 0x06,
+        ShowDesktop = 0x07,
+        DoubleClick = 0x08,
+        Fire = 0x09,
+        Disabled = 0x0A,
+        DpiUp = 0x0B,
+        DpiDown = 0x0C
+    }
+
+    public struct ButtonBinding
+    {
+        public byte ButtonId;
+        public ButtonAction Action;
+
+        public ButtonBinding(byte buttonId, ButtonAction action)
+        {
+            ButtonId = buttonId;
+            Action = action;
+        }
+    }
+
+    // Single source of truth for the physical button matrix. Button IDs come from the vendor's
+    // table at VA 0x005BB018 (01 02 03 05 04 08 06 09); factory actions from VA 0x005BB038.
+    public static class ButtonMap
+    {
+        // LAYER 2 of the Left/Right interlock: hardware IDs that may never be rebound.
+        // NOTE: 0x01 = Left, 0x03 = Right. 0x02 is the MIDDLE button and IS remappable.
+        public const byte BUTTON_ID_LEFT = 0x01;
+        public const byte BUTTON_ID_RIGHT = 0x03;
+
+        public static bool IsLocked(byte buttonId)
+        {
+            return buttonId == BUTTON_ID_LEFT || buttonId == BUTTON_ID_RIGHT;
+        }
+
+        public static bool IsKnownAction(ButtonAction action)
+        {
+            return Enum.IsDefined(typeof(ButtonAction), action);
+        }
+
+        public class ButtonInfo
+        {
+            public byte Id;
+            public string DisplayName;
+            public string ProfileKey;
+            public ButtonAction FactoryAction;
+            public bool Locked;
+        }
+
+        // Ordered exactly as presented in the Button Mapper UI.
+        public static readonly ButtonInfo[] All = new ButtonInfo[]
+        {
+            new ButtonInfo { Id = 0x01, DisplayName = "Left Click",    ProfileKey = "BindLeft",    FactoryAction = ButtonAction.LeftButton,  Locked = true  },
+            new ButtonInfo { Id = 0x03, DisplayName = "Right Click",   ProfileKey = "BindRight",   FactoryAction = ButtonAction.RightButton, Locked = true  },
+            new ButtonInfo { Id = 0x02, DisplayName = "Middle / Wheel",ProfileKey = "BindMiddle",  FactoryAction = ButtonAction.MiddleClick, Locked = false },
+            new ButtonInfo { Id = 0x05, DisplayName = "Forward",       ProfileKey = "BindForward", FactoryAction = ButtonAction.Forward,     Locked = false },
+            new ButtonInfo { Id = 0x04, DisplayName = "Back",          ProfileKey = "BindBack",    FactoryAction = ButtonAction.Back,        Locked = false },
+            new ButtonInfo { Id = 0x08, DisplayName = "DPI + (Upper)", ProfileKey = "BindDpiUp",   FactoryAction = ButtonAction.DpiUp,       Locked = false },
+            new ButtonInfo { Id = 0x06, DisplayName = "DPI − (Lower)", ProfileKey = "BindDpiDown", FactoryAction = ButtonAction.DpiDown,     Locked = false }
+        };
+
+        // Actions offered in the UI. Media keys (Cmd 0x17) are intentionally absent: that opcode
+        // carries no Button ID, so binding it cannot be verified from static analysis (v0.5.0).
+        public static readonly ButtonAction[] Selectable = new ButtonAction[]
+        {
+            ButtonAction.MiddleClick,
+            ButtonAction.Back,
+            ButtonAction.Forward,
+            ButtonAction.DpiLoop,
+            ButtonAction.DpiUp,
+            ButtonAction.DpiDown,
+            ButtonAction.DoubleClick,
+            ButtonAction.Fire,
+            ButtonAction.ShowDesktop,
+            ButtonAction.Disabled
+        };
+
+        public static string Describe(ButtonAction action)
+        {
+            switch (action)
+            {
+                case ButtonAction.LeftButton: return "Left Button";
+                case ButtonAction.MiddleClick: return "Middle Click";
+                case ButtonAction.RightButton: return "Right Button";
+                case ButtonAction.Back: return "Browser Back";
+                case ButtonAction.Forward: return "Browser Forward";
+                case ButtonAction.DpiLoop: return "DPI Cycle (Loop)";
+                case ButtonAction.ShowDesktop: return "Show Desktop";
+                case ButtonAction.DoubleClick: return "Double Click";
+                case ButtonAction.Fire: return "Rapid Fire (Triple Click)";
+                case ButtonAction.Disabled: return "Disabled (No Action)";
+                case ButtonAction.DpiUp: return "DPI Increase";
+                case ButtonAction.DpiDown: return "DPI Decrease";
+                default: return "Unknown";
+            }
+        }
+
+        public static ButtonInfo Find(byte buttonId)
+        {
+            for (int i = 0; i < All.Length; i++)
+            {
+                if (All[i].Id == buttonId) return All[i];
+            }
+            return null;
+        }
+
+        // Stable profile token, decoupled from the raw firmware code so a future code
+        // correction cannot silently repoint a saved binding (AI-CONTEXT.md decision 8.11).
+        public static string ToToken(ButtonAction action)
+        {
+            return action.ToString();
+        }
+
+        public static bool TryParseToken(string token, out ButtonAction action)
+        {
+            action = ButtonAction.Disabled;
+            if (string.IsNullOrEmpty(token)) return false;
+            try
+            {
+                object parsed = Enum.Parse(typeof(ButtonAction), token.Trim(), true);
+                ButtonAction candidate = (ButtonAction)parsed;
+                if (!IsKnownAction(candidate)) return false;
+                action = candidate;
+                return true;
+            }
+            catch { return false; }
+        }
     }
 
     public class PipelineResult
@@ -320,6 +462,54 @@ namespace RedgearA20ControlCenter
         public int ActiveDpiStage = 1; // Default 1000 DPI (Stage 1)
         public bool EnableDpi = false;
         public PersistenceMode Mode = PersistenceMode.StealthWatcher;
+
+        // Button remapping (Cmd 0x10). Absent/unparsable entries fall back to the factory
+        // action, so an older or hand-edited profile can never put an unknown byte on the wire.
+        public Dictionary<byte, ButtonAction> ButtonBindings = new Dictionary<byte, ButtonAction>();
+
+        public ButtonAction GetBinding(byte buttonId)
+        {
+            ButtonMap.ButtonInfo info = ButtonMap.Find(buttonId);
+            ButtonAction fallback = info != null ? info.FactoryAction : ButtonAction.Disabled;
+            if (ButtonBindings == null) return fallback;
+            ButtonAction stored;
+            return ButtonBindings.TryGetValue(buttonId, out stored) ? stored : fallback;
+        }
+
+        public void SetBinding(byte buttonId, ButtonAction action)
+        {
+            // LAYER 2 of the interlock: the model itself refuses to store a primary-click rebind.
+            if (ButtonMap.IsLocked(buttonId)) return;
+            if (!ButtonMap.IsKnownAction(action)) return;
+            if (ButtonBindings == null) ButtonBindings = new Dictionary<byte, ButtonAction>();
+            ButtonBindings[buttonId] = action;
+        }
+
+        public bool HasCustomBindings()
+        {
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i].Locked) continue;
+                if (GetBinding(all[i].Id) != all[i].FactoryAction) return true;
+            }
+            return false;
+        }
+
+        // Only non-factory bindings are transmitted, keeping the hotplug replay budget minimal.
+        public ButtonBinding[] GetBindingsToTransmit()
+        {
+            List<ButtonBinding> list = new List<ButtonBinding>();
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i].Locked) continue;
+                ButtonAction action = GetBinding(all[i].Id);
+                if (action == all[i].FactoryAction) continue;
+                list.Add(new ButtonBinding(all[i].Id, action));
+            }
+            return list.ToArray();
+        }
 
         public bool AutoStart
         {
@@ -361,6 +551,21 @@ namespace RedgearA20ControlCenter
 
                     Match mEnDpi = Regex.Match(json, "\"EnableDpi\"\\s*:\\s*(true|false)", RegexOptions.IgnoreCase);
                     if (mEnDpi.Success) p.EnableDpi = bool.Parse(mEnDpi.Groups[1].Value);
+
+                    // Flat per-button fields keep the regex parser dependency-free. Unknown action
+                    // tokens are skipped (factory fallback) rather than trusted.
+                    ButtonMap.ButtonInfo[] buttons = ButtonMap.All;
+                    for (int i = 0; i < buttons.Length; i++)
+                    {
+                        if (buttons[i].Locked) continue;
+                        Match mBind = Regex.Match(json, "\"" + buttons[i].ProfileKey + "\"\\s*:\\s*\"([^\"]*)\"");
+                        if (!mBind.Success) continue;
+                        ButtonAction action;
+                        if (ButtonMap.TryParseToken(mBind.Groups[1].Value, out action))
+                        {
+                            p.SetBinding(buttons[i].Id, action);
+                        }
+                    }
 
                     Match mMode = Regex.Match(json, "\"(?:PersistenceMode|Mode)\"\\s*:\\s*(\\d+)");
                     if (mMode.Success)
@@ -427,8 +632,17 @@ namespace RedgearA20ControlCenter
 
                 int bri = Math.Max(5, Math.Min(100, Brightness));
                 int dpi = Math.Max(0, Math.Min(5, ActiveDpiStage));
-                string json = string.Format("{{\n  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"ActiveDpiStage\": {2},\n  \"EnableDpi\": {3},\n  \"PersistenceMode\": {4}\n}}\n",
-                    HexColor, bri, dpi, EnableDpi.ToString().ToLower(), (int)Mode);
+
+                StringBuilder sbBinds = new StringBuilder();
+                ButtonMap.ButtonInfo[] buttons = ButtonMap.All;
+                for (int i = 0; i < buttons.Length; i++)
+                {
+                    if (buttons[i].Locked) continue;
+                    sbBinds.AppendFormat(",\n  \"{0}\": \"{1}\"", buttons[i].ProfileKey, ButtonMap.ToToken(GetBinding(buttons[i].Id)));
+                }
+
+                string json = string.Format("{{\n  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"ActiveDpiStage\": {2},\n  \"EnableDpi\": {3},\n  \"PersistenceMode\": {4}{5}\n}}\n",
+                    HexColor, bri, dpi, EnableDpi.ToString().ToLower(), (int)Mode, sbBinds.ToString());
 
                 tmpFile = file + ".tmp";
                 File.WriteAllText(tmpFile, json, Encoding.UTF8);
@@ -713,6 +927,10 @@ namespace RedgearA20ControlCenter
         private ComboBox cmbDpiStages;
         private Button btnTestDpi;
 
+        // Button remapping section
+        private Label lblRemapSummary;
+        private Button btnOpenMapper;
+
         // Diagnostic Log Panel
         private RichTextBox rtbLog;
         private Button btnClearLog;
@@ -791,7 +1009,23 @@ namespace RedgearA20ControlCenter
         private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
 
         [DllImport("uxtheme.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
-        private static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
+        internal static extern int SetWindowTheme(IntPtr hWnd, string pszSubAppName, string pszSubIdList);
+
+        internal static void ApplyDarkTitleBar(IntPtr hwnd)
+        {
+            try
+            {
+                if (Environment.OSVersion.Version.Major >= 10)
+                {
+                    int useDarkMode = 1;
+                    if (DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref useDarkMode, sizeof(int)) != 0)
+                    {
+                        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref useDarkMode, sizeof(int));
+                    }
+                }
+            }
+            catch { }
+        }
 
         // Registered message kept for backwards compatibility with older builds.
         private static int wmShowControlCenter = 0;
@@ -1710,19 +1944,52 @@ namespace RedgearA20ControlCenter
 
             body.Controls.Add(gbDpi);
 
-            // ─── Group 5: Live Diagnostic Log Panel ───
-            Panel gbLog = CreateSectionPanel(new Point(0, 433), new Size(535, 295), "5. Diagnostic USB Packet Log", "Report ID 0x07", false);
+            // ─── Group 5: Button Remapping (Cmd 0x10) ───
+            Panel gbRemap = CreateSectionPanel(new Point(0, 433), new Size(535, 62), "5. Button Remapping", "Experimental · Cmd 0x10", true);
+
+            lblRemapSummary = new Label
+            {
+                Location = new Point(14, 34),
+                Size = new Size(360, 20),
+                ForeColor = Theme.TextSecondary,
+                Font = Theme.FontBodySecondary,
+                AutoEllipsis = true
+            };
+            gbRemap.Controls.Add(lblRemapSummary);
+
+            btnOpenMapper = new Button
+            {
+                Text = "Open Button Mapper",
+                Location = new Point(383, 30),
+                Size = new Size(140, 26),
+                BackColor = Color.FromArgb(48, 32, 12),
+                ForeColor = Theme.Warning,
+                Font = Theme.FontBodyBold,
+                FlatStyle = FlatStyle.Flat,
+                TabIndex = 23,
+                AccessibleName = "Open the hardware button remapping window"
+            };
+            btnOpenMapper.FlatAppearance.BorderColor = Theme.WarningBorder;
+            btnOpenMapper.FlatAppearance.BorderSize = 1;
+            btnOpenMapper.Click += BtnOpenMapper_Click;
+            gbRemap.Controls.Add(btnOpenMapper);
+
+            body.Controls.Add(gbRemap);
+            UpdateRemapSummary();
+
+            // ─── Group 6: Live Diagnostic Log Panel ───
+            Panel gbLog = CreateSectionPanel(new Point(0, 503), new Size(535, 225), "6. Diagnostic USB Packet Log", "Report ID 0x07", false);
 
             rtbLog = new RichTextBox
             {
                 Location = new Point(12, 32),
-                Size = new Size(511, 224),
+                Size = new Size(511, 154),
                 ReadOnly = true,
                 BackColor = Theme.TerminalBg,
                 ForeColor = Theme.TerminalText,
                 Font = Theme.FontMono,
                 BorderStyle = BorderStyle.None,
-                TabIndex = 23,
+                TabIndex = 24,
                 AccessibleName = "Diagnostic USB HID packet return code log"
             };
             gbLog.Controls.Add(rtbLog);
@@ -1730,13 +1997,13 @@ namespace RedgearA20ControlCenter
             btnCopyLog = new Button
             {
                 Text = "Copy Log",
-                Location = new Point(355, 262),
+                Location = new Point(355, 192),
                 Size = new Size(80, 25),
                 BackColor = Theme.SurfaceElevated,
                 ForeColor = Theme.TextPrimary,
                 Font = Theme.FontBodySecondary,
                 FlatStyle = FlatStyle.Flat,
-                TabIndex = 24,
+                TabIndex = 25,
                 AccessibleName = "Copy diagnostic log to clipboard"
             };
             btnCopyLog.FlatAppearance.BorderColor = Theme.Border;
@@ -1762,13 +2029,13 @@ namespace RedgearA20ControlCenter
             btnClearLog = new Button
             {
                 Text = "Clear Log",
-                Location = new Point(443, 262),
+                Location = new Point(443, 192),
                 Size = new Size(80, 25),
                 BackColor = Theme.Surface,
                 ForeColor = Theme.TextSecondary,
                 Font = Theme.FontBodySecondary,
                 FlatStyle = FlatStyle.Flat,
-                TabIndex = 25,
+                TabIndex = 26,
                 AccessibleName = "Clear diagnostic log text"
             };
             btnClearLog.FlatAppearance.BorderColor = Theme.Border;
@@ -1934,6 +2201,83 @@ namespace RedgearA20ControlCenter
             return string.IsNullOrEmpty(res.ErrorMessage) ? "Hardware operation failed." : res.ErrorMessage;
         }
 
+        // Sends Cmd 0x10 packets with mandatory pacing. Caller must already hold the hardware mutex.
+        // Returns null on success, or the failure result.
+        private static PipelineResult TransmitButtonBindings(string devicePath, ButtonBinding[] binds, Action<string, Color> logCallback, ref int packetIndex)
+        {
+            if (binds == null) return null;
+            for (int i = 0; i < binds.Length; i++)
+            {
+                ButtonBinding bind = binds[i];
+
+                // LAYER 3 of the interlock: the dispatcher is the last gate before the wire.
+                // A corrupted profile or a future UI regression still cannot rebind a primary
+                // click or emit an action code the firmware would collapse to 0x00.
+                if (ButtonMap.IsLocked(bind.ButtonId))
+                {
+                    logCallback(string.Format("Cmd 0x10 BLOCKED: Button 0x{0:X2} is a protected primary click.", bind.ButtonId), Color.FromArgb(255, 120, 120));
+                    continue;
+                }
+                ButtonMap.ButtonInfo info = ButtonMap.Find(bind.ButtonId);
+                if (info == null || !ButtonMap.IsKnownAction(bind.Action))
+                {
+                    logCallback(string.Format("Cmd 0x10 BLOCKED: unverified binding (Button 0x{0:X2} -> 0x{1:X2}) discarded.", bind.ButtonId, (byte)bind.Action), Color.FromArgb(255, 120, 120));
+                    continue;
+                }
+
+                byte[] bindPacket = new byte[] { HidTransport.REPORT_ID, 0x10, bind.ButtonId, (byte)bind.Action, 0x00, 0x00, 0x00, 0x00 };
+                int win32Err;
+                string err;
+                bool ok = HidTransport.SendSinglePacket(devicePath, bindPacket, out win32Err, out err);
+                if (!ok)
+                {
+                    logCallback(string.Format("Cmd 0x10 [{0} -> {1}]: {2} -> FAIL ({3})", info.DisplayName, ButtonMap.Describe(bind.Action), FormatHex(bindPacket), err), Color.FromArgb(255, 80, 80));
+                    return new PipelineResult { Success = false, FailingPacketIndex = packetIndex, Win32ErrorCode = win32Err, ErrorMessage = err };
+                }
+
+                logCallback(string.Format("Cmd 0x10 [{0} -> {1}]: {2} -> OK", info.DisplayName, ButtonMap.Describe(bind.Action), FormatHex(bindPacket)), Color.FromArgb(255, 200, 80));
+                packetIndex++;
+                Thread.Sleep(50);
+            }
+            return null;
+        }
+
+        // Bindings-only dispatch used by the Button Mapper (no lighting/DPI resend, no latch).
+        private static PipelineResult ExecuteBindingPipeline(string devicePath, ButtonBinding[] binds, Action<string, Color> logCallback)
+        {
+            bool lockAcquired = false;
+            Mutex hwMutex = null;
+            try
+            {
+                try
+                {
+                    hwMutex = new Mutex(false, TaskSchedulerHelper.HARDWARE_MUTEX_NAME);
+                    try { lockAcquired = hwMutex.WaitOne(3000, false); }
+                    catch (AbandonedMutexException) { lockAcquired = true; }
+                }
+                catch { lockAcquired = false; }
+
+                if (!lockAcquired)
+                {
+                    return new PipelineResult { Success = false, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = "Hardware access lock timeout (Device busy)." };
+                }
+
+                logCallback("--- Applying Button Bindings to RAM (Cmd 0x10, No Latch) ---", Color.FromArgb(255, 220, 100));
+                int packetIndex = 0;
+                PipelineResult fail = TransmitButtonBindings(devicePath, binds, logCallback, ref packetIndex);
+                if (fail != null) return fail;
+                return new PipelineResult { Success = true, FailingPacketIndex = -1, Win32ErrorCode = 0, ErrorMessage = null };
+            }
+            finally
+            {
+                if (hwMutex != null)
+                {
+                    if (lockAcquired) { try { hwMutex.ReleaseMutex(); } catch { } }
+                    hwMutex.Close();
+                }
+            }
+        }
+
         private static PipelineResult ExecuteHardwarePipeline(string devicePath, SaveParameters p, Action<string, Color> logCallback)
         {
             bool lockAcquired = false;
@@ -2031,7 +2375,14 @@ namespace RedgearA20ControlCenter
                     Thread.Sleep(50);
                 }
 
-                // 5. If CommitToFlash, send Command 0x20 sync latch and verify MCU health
+                // 5. If enabled, transmit Command 0x10 button bindings (one packet per remapped button)
+                if (p.SendButtonBindings && p.ButtonBindings != null)
+                {
+                    PipelineResult bindFail = TransmitButtonBindings(devicePath, p.ButtonBindings, logCallback, ref packetIndex);
+                    if (bindFail != null) return bindFail;
+                }
+
+                // 6. If CommitToFlash, send Command 0x20 sync latch and verify MCU health
                 if (p.CommitToFlash)
                 {
                     byte[] commitPacket = new byte[] { HidTransport.REPORT_ID, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
@@ -2217,6 +2568,8 @@ namespace RedgearA20ControlCenter
                 if (cbEnableDpi != null) sendDpi = cbEnableDpi.Checked;
             }
 
+            ButtonBinding[] binds = currentProfile != null ? currentProfile.GetBindingsToTransmit() : new ButtonBinding[0];
+
             SaveParameters p = new SaveParameters
             {
                 Color = currentColor,
@@ -2224,7 +2577,9 @@ namespace RedgearA20ControlCenter
                 ActiveDpiIndex = activeDpi,
                 DpiMask = 0x3F,
                 CommitToFlash = false, // Volatile RAM - Instant A704 registers
-                SendDpi = sendDpi
+                SendDpi = sendDpi,
+                SendButtonBindings = binds.Length > 0,
+                ButtonBindings = binds
             };
 
             string targetPath = cachedDevicePath;
@@ -2588,7 +2943,104 @@ namespace RedgearA20ControlCenter
             }
         }
 
-        private static string FormatHex(byte[] bytes)
+        // ─── BUTTON REMAPPING ───
+        private void UpdateRemapSummary()
+        {
+            if (lblRemapSummary == null) return;
+            List<string> parts = new List<string>();
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i].Locked || currentProfile == null) continue;
+                ButtonAction a = currentProfile.GetBinding(all[i].Id);
+                if (a != all[i].FactoryAction) parts.Add(all[i].DisplayName + " → " + ButtonMap.Describe(a));
+            }
+            lblRemapSummary.Text = parts.Count == 0 ? "All buttons at factory defaults. Left / Right click are locked." : string.Join(" · ", parts.ToArray());
+            lblRemapSummary.ForeColor = parts.Count == 0 ? Theme.TextSecondary : Theme.TextPrimary;
+        }
+
+        private void BtnOpenMapper_Click(object sender, EventArgs e)
+        {
+            if (isSavingInProgress) return;
+            if (currentProfile == null) currentProfile = new AppProfile();
+            using (ButtonMapperForm mapper = new ButtonMapperForm(currentProfile, SendButtonBindingsAsync, PersistButtonBindings))
+            {
+                mapper.ShowDialog(this);
+            }
+            UpdateRemapSummary();
+            TrimMemory();
+        }
+
+        private async Task<bool> SendButtonBindingsAsync(ButtonBinding[] binds)
+        {
+            if (isSavingInProgress) return false;
+            if (string.IsNullOrEmpty(cachedDevicePath))
+            {
+                RefreshDeviceConnection();
+                if (string.IsNullOrEmpty(cachedDevicePath))
+                {
+                    MessageBox.Show("Redgear A20 is not connected. Connect via USB and click Refresh.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+            }
+
+            string targetPath = cachedDevicePath;
+            isSavingInProgress = true;
+            try
+            {
+                PipelineResult res = await Task.Run(() => ExecuteBindingPipeline(targetPath, binds, Log));
+                if (res.Success)
+                {
+                    Log("✅ Button bindings applied to mouse RAM. Unplugging the mouse restores factory buttons.", Color.FromArgb(140, 240, 255));
+                    return true;
+                }
+
+                string friendlyMsg = DescribePipelineFailure(res);
+                Log(string.Format("❌ Button binding failed at packet #{0}: {1} ({2})", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), Color.FromArgb(255, 80, 80));
+                if (res.Win32ErrorCode == 1167 || res.Win32ErrorCode == 2 || res.Win32ErrorCode == 6)
+                {
+                    cachedDevicePath = null;
+                    if (lblStatus != null)
+                    {
+                        lblStatus.Text = "○ Device Not Found. Is USB Connected?";
+                        lblStatus.ForeColor = Color.FromArgb(255, 100, 100);
+                    }
+                }
+                MessageBox.Show("Failed to apply button bindings.\n\n" + friendlyMsg, "Button Mapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Log("❌ Button binding failed with an unexpected error: " + ex.Message, Color.FromArgb(255, 80, 80));
+                return false;
+            }
+            finally
+            {
+                isSavingInProgress = false;
+            }
+        }
+
+        private bool PersistButtonBindings(Dictionary<byte, ButtonAction> bindings)
+        {
+            if (currentProfile == null) currentProfile = new AppProfile();
+            foreach (KeyValuePair<byte, ButtonAction> kv in bindings)
+            {
+                currentProfile.SetBinding(kv.Key, kv.Value);
+            }
+
+            string err;
+            if (!currentProfile.Save(out err))
+            {
+                Log("❌ Failed to save button bindings: " + err, Color.FromArgb(255, 80, 80));
+                MessageBox.Show("Failed to save profile to disk:\n\n" + err, "Save Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+            Log("Button bindings saved to " + AppProfile.GetProfilePath(), Color.FromArgb(140, 200, 255));
+            UpdateRemapSummary();
+            return true;
+        }
+
+        internal static string FormatHex(byte[] bytes)
         {
             if (bytes == null) return "";
             string[] hex = new string[bytes.Length];
@@ -2639,6 +3091,7 @@ namespace RedgearA20ControlCenter
 
                 AppProfile profile = AppProfile.Load();
                 Color color = ParseColor(profile.HexColor);
+                ButtonBinding[] binds = profile.GetBindingsToTransmit();
 
                 SaveParameters p = new SaveParameters
                 {
@@ -2647,7 +3100,9 @@ namespace RedgearA20ControlCenter
                     ActiveDpiIndex = (byte)Math.Max(0, Math.Min(5, profile.ActiveDpiStage)),
                     DpiMask = 0x3F,
                     CommitToFlash = false,
-                    SendDpi = profile.EnableDpi
+                    SendDpi = profile.EnableDpi,
+                    SendButtonBindings = binds.Length > 0,
+                    ButtonBindings = binds
                 };
 
                 PipelineResult res = ExecuteHardwarePipeline(devicePath, p, delegate(string s, Color c) { });
@@ -2894,6 +3349,363 @@ namespace RedgearA20ControlCenter
                     appMutex.Close();
                 }
             }
+        }
+    }
+
+    // Modal Button Mapper. Combobox changes are pure UI state; the mouse is only touched by the
+    // explicit Test / Save / Restore buttons (zero-spam rule). Being modal, it is the single
+    // dispatch source while binding packets are in flight.
+    public class ButtonMapperForm : Form
+    {
+        private class ActionItem
+        {
+            public ButtonAction Action;
+            public ActionItem(ButtonAction action) { Action = action; }
+            public override string ToString() { return ButtonMap.Describe(Action); }
+        }
+
+        private static bool testWarningAcknowledged = false;
+
+        private readonly Func<ButtonBinding[], Task<bool>> sendBindings;
+        private readonly Func<Dictionary<byte, ButtonAction>, bool> persistBindings;
+        private readonly Dictionary<byte, ButtonAction> savedBindings = new Dictionary<byte, ButtonAction>();
+        private readonly Dictionary<byte, ComboBox> combos = new Dictionary<byte, ComboBox>();
+
+        private Button btnTest;
+        private Button btnSaveBinds;
+        private Button btnDefaults;
+        private Label lblFooter;
+        private bool busy = false;
+        private bool ramDiffersFromSaved = false;
+        private bool closeConfirmed = false;
+
+        public ButtonMapperForm(AppProfile profile, Func<ButtonBinding[], Task<bool>> send, Func<Dictionary<byte, ButtonAction>, bool> persist)
+        {
+            sendBindings = send;
+            persistBindings = persist;
+
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (!all[i].Locked) savedBindings[all[i].Id] = profile.GetBinding(all[i].Id);
+            }
+
+            Text = "Button Mapper";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScaleDimensions = new SizeF(96F, 96F);
+            ClientSize = new Size(470, 406);
+            BackColor = Theme.Canvas;
+            ForeColor = Theme.TextPrimary;
+            Font = Theme.FontBodyPrimary;
+
+            BuildLayout();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            MainForm.ApplyDarkTitleBar(this.Handle);
+        }
+
+        private void BuildLayout()
+        {
+            Panel notice = new Panel
+            {
+                Location = new Point(12, 12),
+                Size = new Size(446, 50),
+                BackColor = Theme.WarningSurface
+            };
+            notice.Paint += delegate(object s, PaintEventArgs e)
+            {
+                e.Graphics.DrawRectangle(Theme.PenWarning, 0, 0, notice.Width - 1, notice.Height - 1);
+            };
+            notice.Controls.Add(new Label
+            {
+                Text = "Experimental · Left and Right click are hardware-locked to protect input.\nUnplugging the mouse always restores factory button behaviour.",
+                Location = new Point(10, 7),
+                Size = new Size(428, 38),
+                ForeColor = Theme.Warning,
+                Font = Theme.FontBodySecondary
+            });
+            Controls.Add(notice);
+
+            AddHeader("Button", 14);
+            AddHeader("HW ID", 150);
+            AddHeader("Action", 210);
+
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            int y = 96;
+            for (int i = 0; i < all.Length; i++)
+            {
+                ButtonMap.ButtonInfo info = all[i];
+                Controls.Add(new Label
+                {
+                    Text = info.DisplayName,
+                    Location = new Point(14, y + 4),
+                    Size = new Size(134, 20),
+                    ForeColor = info.Locked ? Theme.TextMuted : Theme.TextPrimary,
+                    Font = info.Locked ? Theme.FontBodySecondary : Theme.FontBodyBold
+                });
+                Controls.Add(new Label
+                {
+                    Text = string.Format("0x{0:X2}", info.Id),
+                    Location = new Point(150, y + 4),
+                    Size = new Size(56, 20),
+                    ForeColor = Theme.TextMuted,
+                    Font = Theme.FontMono
+                });
+
+                if (info.Locked)
+                {
+                    // LAYER 1 of the interlock: primary clicks get a read-only label, never a selector.
+                    Controls.Add(new Label
+                    {
+                        Text = "Locked · Primary input (" + ButtonMap.Describe(info.FactoryAction) + ")",
+                        Location = new Point(210, y + 4),
+                        Size = new Size(248, 20),
+                        ForeColor = Theme.TextMuted,
+                        Font = Theme.FontBodySecondary
+                    });
+                }
+                else
+                {
+                    ComboBox cmb = new ComboBox
+                    {
+                        Location = new Point(210, y),
+                        Size = new Size(248, 24),
+                        DropDownStyle = ComboBoxStyle.DropDownList,
+                        BackColor = Theme.SurfaceElevated,
+                        ForeColor = Theme.TextPrimary,
+                        Font = Theme.FontBodyPrimary,
+                        AccessibleName = info.DisplayName + " button action"
+                    };
+                    for (int a = 0; a < ButtonMap.Selectable.Length; a++)
+                    {
+                        cmb.Items.Add(new ActionItem(ButtonMap.Selectable[a]));
+                    }
+                    SelectAction(cmb, savedBindings[info.Id]);
+                    try { MainForm.SetWindowTheme(cmb.Handle, "DarkMode_Explorer", null); } catch { }
+                    combos[info.Id] = cmb;
+                    Controls.Add(cmb);
+                }
+                y += 32;
+            }
+
+            int barY = y + 10;
+            btnTest = CreateActionButton("Test on Mouse (RAM)", 12, barY, Color.FromArgb(48, 32, 12), Theme.Warning, Theme.WarningBorder);
+            btnTest.Click += BtnTest_Click;
+            btnSaveBinds = CreateActionButton("Save to Profile", 165, barY, Theme.Accent, Theme.AccentText, Theme.Accent);
+            btnSaveBinds.Click += BtnSaveBinds_Click;
+            btnDefaults = CreateActionButton("Restore Defaults", 318, barY, Theme.Surface, Theme.TextSecondary, Theme.Border);
+            btnDefaults.Click += BtnDefaults_Click;
+
+            lblFooter = new Label
+            {
+                Text = "Last packet: —",
+                Location = new Point(14, barY + 40),
+                Size = new Size(444, 18),
+                ForeColor = Theme.TerminalText,
+                Font = Theme.FontMono
+            };
+            Controls.Add(lblFooter);
+        }
+
+        private void AddHeader(string text, int x)
+        {
+            Controls.Add(new Label
+            {
+                Text = text.ToUpperInvariant(),
+                Location = new Point(x, 74),
+                Size = new Size(120, 16),
+                ForeColor = Theme.TextMuted,
+                Font = Theme.FontBadge
+            });
+        }
+
+        private Button CreateActionButton(string text, int x, int y, Color back, Color fore, Color border)
+        {
+            Button b = new Button
+            {
+                Text = text,
+                Location = new Point(x, y),
+                Size = new Size(140, 30),
+                BackColor = back,
+                ForeColor = fore,
+                Font = Theme.FontBodyBold,
+                FlatStyle = FlatStyle.Flat
+            };
+            b.FlatAppearance.BorderColor = border;
+            b.FlatAppearance.BorderSize = 1;
+            Controls.Add(b);
+            return b;
+        }
+
+        private static void SelectAction(ComboBox cmb, ButtonAction action)
+        {
+            for (int i = 0; i < cmb.Items.Count; i++)
+            {
+                if (((ActionItem)cmb.Items[i]).Action == action) { cmb.SelectedIndex = i; return; }
+            }
+            cmb.SelectedIndex = -1;
+        }
+
+        private Dictionary<byte, ButtonAction> ReadSelections()
+        {
+            Dictionary<byte, ButtonAction> result = new Dictionary<byte, ButtonAction>();
+            foreach (KeyValuePair<byte, ComboBox> kv in combos)
+            {
+                ActionItem item = kv.Value.SelectedItem as ActionItem;
+                ButtonMap.ButtonInfo info = ButtonMap.Find(kv.Key);
+                result[kv.Key] = item != null ? item.Action : info.FactoryAction;
+            }
+            return result;
+        }
+
+        // The full set is always sent (not just changes) so a previous RAM test is overwritten.
+        private static ButtonBinding[] ToPacketSet(Dictionary<byte, ButtonAction> map)
+        {
+            List<ButtonBinding> list = new List<ButtonBinding>();
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            for (int i = 0; i < all.Length; i++)
+            {
+                ButtonAction a;
+                if (all[i].Locked || !map.TryGetValue(all[i].Id, out a)) continue;
+                list.Add(new ButtonBinding(all[i].Id, a));
+            }
+            return list.ToArray();
+        }
+
+        private static Dictionary<byte, ButtonAction> FactoryMap()
+        {
+            Dictionary<byte, ButtonAction> map = new Dictionary<byte, ButtonAction>();
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (!all[i].Locked) map[all[i].Id] = all[i].FactoryAction;
+            }
+            return map;
+        }
+
+        private static bool SameBindings(Dictionary<byte, ButtonAction> a, Dictionary<byte, ButtonAction> b)
+        {
+            foreach (KeyValuePair<byte, ButtonAction> kv in a)
+            {
+                ButtonAction other;
+                if (!b.TryGetValue(kv.Key, out other) || other != kv.Value) return false;
+            }
+            return true;
+        }
+
+        private void SetBusy(bool value)
+        {
+            busy = value;
+            btnTest.Enabled = !value;
+            btnSaveBinds.Enabled = !value;
+            btnDefaults.Enabled = !value;
+            foreach (ComboBox c in combos.Values) c.Enabled = !value;
+            UseWaitCursor = value;
+        }
+
+        private async Task<bool> Dispatch(Dictionary<byte, ButtonAction> map)
+        {
+            ButtonBinding[] set = ToPacketSet(map);
+            SetBusy(true);
+            try
+            {
+                bool ok = await sendBindings(set);
+                if (ok && set.Length > 0)
+                {
+                    ButtonBinding last = set[set.Length - 1];
+                    byte[] pkt = new byte[] { HidTransport.REPORT_ID, 0x10, last.ButtonId, (byte)last.Action, 0, 0, 0, 0 };
+                    lblFooter.Text = string.Format("Sent {0} packet(s) · last: {1}", set.Length, MainForm.FormatHex(pkt));
+                }
+                else if (!ok)
+                {
+                    lblFooter.Text = "Last dispatch failed — see diagnostic log.";
+                }
+                return ok;
+            }
+            finally
+            {
+                if (!IsDisposed) SetBusy(false);
+            }
+        }
+
+        private async void BtnTest_Click(object sender, EventArgs e)
+        {
+            if (busy) return;
+            if (!testWarningAcknowledged)
+            {
+                DialogResult r = MessageBox.Show(
+                    "This sends experimental Cmd 0x10 button bindings to the mouse's volatile RAM.\n\n" +
+                    "Left and Right click are never modified. If anything behaves unexpectedly, unplug and replug the mouse to restore factory buttons.\n\nContinue?",
+                    "Test Button Bindings", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (r != DialogResult.Yes) return;
+                testWarningAcknowledged = true;
+            }
+
+            Dictionary<byte, ButtonAction> sel = ReadSelections();
+            if (await Dispatch(sel))
+            {
+                ramDiffersFromSaved = !SameBindings(sel, savedBindings);
+            }
+        }
+
+        private async void BtnSaveBinds_Click(object sender, EventArgs e)
+        {
+            if (busy) return;
+            Dictionary<byte, ButtonAction> sel = ReadSelections();
+            if (!await Dispatch(sel)) return;
+            if (persistBindings(sel))
+            {
+                foreach (KeyValuePair<byte, ButtonAction> kv in sel) savedBindings[kv.Key] = kv.Value;
+                ramDiffersFromSaved = false;
+                lblFooter.Text = "Saved · bindings will be restored automatically on every replug.";
+            }
+        }
+
+        private async void BtnDefaults_Click(object sender, EventArgs e)
+        {
+            if (busy) return;
+            Dictionary<byte, ButtonAction> factory = FactoryMap();
+            foreach (KeyValuePair<byte, ComboBox> kv in combos) SelectAction(kv.Value, factory[kv.Key]);
+            if (!await Dispatch(factory)) return;
+            if (persistBindings(factory))
+            {
+                foreach (KeyValuePair<byte, ButtonAction> kv in factory) savedBindings[kv.Key] = kv.Value;
+                ramDiffersFromSaved = false;
+                lblFooter.Text = "Factory button behaviour restored and saved.";
+            }
+        }
+
+        protected override async void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (busy) { e.Cancel = true; return; }
+            if (closeConfirmed || !ramDiffersFromSaved)
+            {
+                base.OnFormClosing(e);
+                return;
+            }
+
+            DialogResult r = MessageBox.Show(
+                "The mouse is still running tested bindings that were not saved.\n\nRevert the mouse to your saved bindings?",
+                "Unsaved Button Test", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (r == DialogResult.Cancel) { e.Cancel = true; return; }
+            if (r == DialogResult.No)
+            {
+                base.OnFormClosing(e);
+                return;
+            }
+
+            e.Cancel = true;
+            await Dispatch(new Dictionary<byte, ButtonAction>(savedBindings));
+            closeConfirmed = true;
+            if (!IsDisposed) Close();
         }
     }
 }
