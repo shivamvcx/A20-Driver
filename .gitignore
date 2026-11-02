@@ -45,6 +45,8 @@ assets/Before vs After.png
 .windsurf/
 .cline/
 .roo/
+AI-CONTEXT.md
+button-remapping-plan.md
 
 # Hardware USB captures & diagnostic crash dumps
 *.pcap
@@ -64,4 +66,4 @@ tmp/
 Thumbs.db
 ehthumbs.db
 $RECYCLE.BIN/
-docs/release-notes-v0.2.1.md
+assets/mouse.png
