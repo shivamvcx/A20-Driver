@@ -416,6 +416,9 @@ namespace RedgearA20ControlCenter
             {
                 case 0x08: return "Backspace";
                 case 0x0D: return "Enter";
+                case 0x14: return "Caps Lock";
+                case 0x90: return "Num Lock";
+                case 0x91: return "Scroll Lock";
                 case 0x1B: return "Esc";
                 case 0x21: return "Page Up";
                 case 0x22: return "Page Down";
@@ -1742,16 +1745,6 @@ namespace RedgearA20ControlCenter
         public static readonly Color TerminalBg = Color.FromArgb(14, 15, 18);
         public static readonly Color TerminalText = Color.FromArgb(16, 185, 129);
 
-        // ─── Fonts used by the point-scaled dialogs (Shortcut Picker) ───
-        public static readonly Font FontHeading = new Font("Segoe UI", 9.75f, FontStyle.Bold);
-        public static readonly Font FontBodyPrimary = new Font("Segoe UI", 9.0f, FontStyle.Regular);
-        public static readonly Font FontBodyBold = new Font("Segoe UI", 9.0f, FontStyle.Bold);
-        public static readonly Font FontBodySecondary = new Font("Segoe UI", 8.25f, FontStyle.Regular);
-        public static readonly Font FontBadge = new Font("Segoe UI", 7.5f, FontStyle.Bold);
-        public static readonly Font FontMono = new Font("Consolas", 8.25f, FontStyle.Regular);
-
-        public static Pen PenBorder, PenWarning, PenAccent;
-
         static Theme()
         {
             Apply(true);
@@ -1804,10 +1797,6 @@ namespace RedgearA20ControlCenter
                 DangerSurface = Color.FromArgb(253, 236, 236);
                 DangerBorder = Color.FromArgb(245, 185, 185);
             }
-            if (PenBorder != null) { PenBorder.Dispose(); PenWarning.Dispose(); PenAccent.Dispose(); }
-            PenBorder = new Pen(Border, 1);
-            PenWarning = new Pen(Warning, 1);
-            PenAccent = new Pen(Accent, 1);
         }
 
         // pref: 0 = follow Windows app theme, 1 = dark, 2 = light.
@@ -2007,7 +1996,7 @@ namespace RedgearA20ControlCenter
         public const string Lighting = "\uE706", Dpi = "\uEC4A", Buttons = "\uE962", Settings = "\uE713", Add = "\uE710",
             More = "\uE712", Refresh = "\uE72C", Lock = "\uE72E", Check = "\uE73E", Download = "\uE896", Warning = "\uE7BA",
             Play = "\uE768", Save = "\uE74E", Color = "\uE790", Copy = "\uE8C8", Delete = "\uE74D", Rename = "\uE8AC",
-            Power = "\uE7E8", Undo = "\uE7A7", ChevronDown = "\uE70D";
+            Power = "\uE7E8", Undo = "\uE7A7", ChevronDown = "\uE70D", Info = "\uE946";
     }
 
     public interface IBackgroundPainter
@@ -3172,12 +3161,48 @@ namespace RedgearA20ControlCenter
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         }
 
+        // Greyscale copy of Image for the disconnected state, built on first use.
+        private Bitmap greyImage;
+        private Bitmap greySource;
+
+        private Bitmap GreyImage()
+        {
+            if (Image == null) return null;
+            if (greyImage != null && greySource == Image) return greyImage;
+            if (greyImage != null) greyImage.Dispose();
+            greySource = Image;
+            greyImage = new Bitmap(Image.Width, Image.Height, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+            const float k = 0.8f;
+            System.Drawing.Imaging.ColorMatrix cm = new System.Drawing.Imaging.ColorMatrix(new float[][]
+            {
+                new float[] { 0.299f * k, 0.299f * k, 0.299f * k, 0, 0 },
+                new float[] { 0.587f * k, 0.587f * k, 0.587f * k, 0, 0 },
+                new float[] { 0.114f * k, 0.114f * k, 0.114f * k, 0, 0 },
+                new float[] { 0, 0, 0, 1, 0 },
+                new float[] { 0, 0, 0, 0, 1 }
+            });
+            using (System.Drawing.Imaging.ImageAttributes ia = new System.Drawing.Imaging.ImageAttributes())
+            using (Graphics g = Graphics.FromImage(greyImage))
+            {
+                ia.SetColorMatrix(cm);
+                g.DrawImage(Image, new Rectangle(0, 0, Image.Width, Image.Height), 0, 0, Image.Width, Image.Height, GraphicsUnit.Pixel, ia);
+            }
+            return greyImage;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && greyImage != null) { greyImage.Dispose(); greyImage = null; greySource = null; }
+            base.Dispose(disposing);
+        }
+
         private void PaintScene(Graphics g)
         {
-            float bf = 0.35f + 0.65f * Math.Max(5, Math.Min(100, Brightness)) / 100f;
+            float bf = Connected ? 0.35f + 0.65f * Math.Max(5, Math.Min(100, Brightness)) / 100f : 0.45f;
+            Color led = Connected ? Led : Color.FromArgb(128, 132, 140);
             Color baseC = Color.FromArgb(12, 13, 16);
-            Color top = Theme.Blend(baseC, Led, 0.50f * bf);
-            Color bottom = Theme.Blend(baseC, Led, 0.10f * bf);
+            Color top = Theme.Blend(baseC, led, 0.50f * bf);
+            Color bottom = Theme.Blend(baseC, led, 0.10f * bf);
             using (LinearGradientBrush lg = new LinearGradientBrush(new Rectangle(0, 0, Math.Max(1, Width), Math.Max(1, Height)), top, bottom, LinearGradientMode.Vertical))
                 g.FillRectangle(lg, 0, 0, Width, Height);
 
@@ -3189,8 +3214,8 @@ namespace RedgearA20ControlCenter
                     gp.AddEllipse(glow);
                     using (PathGradientBrush pg = new PathGradientBrush(gp))
                     {
-                        pg.CenterColor = Color.FromArgb((int)(150 * bf), Led);
-                        pg.SurroundColors = new Color[] { Color.FromArgb(0, Led) };
+                        pg.CenterColor = Color.FromArgb((int)(150 * bf), led);
+                        pg.SurroundColors = new Color[] { Color.FromArgb(0, led) };
                         pg.FocusScales = new PointF(0.15f, 0.35f);
                         g.FillPath(pg, gp);
                     }
@@ -3212,7 +3237,8 @@ namespace RedgearA20ControlCenter
             PaintScene(g);
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.InterpolationMode = InterpolationMode.NearestNeighbor;
-            if (Image != null) g.DrawImageUnscaled(Image, ImageRect.X, ImageRect.Y);
+            Bitmap img = Connected ? Image : GreyImage();
+            if (img != null) g.DrawImageUnscaled(img, ImageRect.X, ImageRect.Y);
 
             Color white = Color.White, soft = Color.FromArgb(200, 255, 255, 255), faint = Color.FromArgb(150, 255, 255, 255);
             Ui.Text(g, "REDGEAR", Ui.Brand, new Rectangle(Ui.S(24), Ui.S(22), Ui.S(200), Ui.S(16)), soft, TextFormatFlags.SingleLine);
@@ -4845,7 +4871,7 @@ namespace RedgearA20ControlCenter
         {
             if (hero == null) return;
             hero.Connected = connected;
-            hero.Invalidate();
+            hero.Invalidate(true);
         }
 
         private static string FormatHexColor(Color c)
@@ -6327,93 +6353,263 @@ namespace RedgearA20ControlCenter
         }
     }
 
+    // ─── Shortcut picker pieces ───
+    // Modifier chip (a checkbox drawn as a pill).
+    public class UiChip : CheckBox
+    {
+        private bool hover;
+        public UiChip(string text)
+        {
+            Text = text;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            Cursor = Cursors.Hand;
+            Font = Ui.BodyBold;
+        }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnCheckedChanged(EventArgs e) { Invalidate(); base.OnCheckedChanged(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            RectangleF r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+            float radius = Ui.Sf(6);
+            Color fill = Checked ? Theme.AccentDim : (hover ? Theme.SurfaceHover : Theme.SurfaceElevated);
+            Ui.FillRound(g, fill, r, radius);
+            Ui.DrawRound(g, Checked ? Theme.Accent : Theme.Border, r, radius, 1f);
+            if (Focused && ShowFocusCues) Ui.DrawRound(g, Theme.Accent, new RectangleF(1.5f, 1.5f, Width - 3.5f, Height - 3.5f), radius, Math.Max(1.5f, Ui.Sf(1.5f)));
+            Color fore = !Enabled ? Theme.TextDisabled : (Checked ? Theme.Accent : Theme.TextSecondary);
+            Size ts = TextRenderer.MeasureText(g, Text, Font, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+            int icon = Checked ? Ui.S(14) + Ui.S(6) : 0;
+            int x = (Width - ts.Width - icon) / 2;
+            if (Checked)
+            {
+                Ui.Glyph(g, Glyphs.Check, Ui.IconSmall, new Rectangle(x, 0, Ui.S(14), Height), fore);
+                x += icon;
+            }
+            Ui.Text(g, Text, Font, new Rectangle(x, 0, ts.Width + 2, Height), fore, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+        }
+    }
+
+    // Focusable field that swallows every key (Tab, Enter, Esc, Alt+F4 ...) and shows the combo as keycaps.
+    public class ShortcutCaptureBox : Control
+    {
+        private static readonly string[] ModNames = { "Ctrl", "Shift", "Alt", "Win" };
+        public KeyShortcut Value;
+        public bool HasValue, Invalid;
+        private byte held;
+        private bool winDown, hover;
+
+        public event KeyEventHandler KeyCaptured;
+        public bool WinHeld { get { return winDown; } }
+
+        public ShortcutCaptureBox()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            TabStop = true;
+            Cursor = Cursors.Hand;
+            AccessibleRole = AccessibleRole.Text;
+        }
+
+        public static bool IsModifierKey(Keys k)
+        {
+            return k == Keys.ControlKey || k == Keys.ShiftKey || k == Keys.Menu || k == Keys.LWin || k == Keys.RWin ||
+                   k == Keys.LControlKey || k == Keys.RControlKey || k == Keys.LShiftKey || k == Keys.RShiftKey ||
+                   k == Keys.LMenu || k == Keys.RMenu;
+        }
+
+        protected override bool IsInputKey(Keys keyData) { return true; }
+        protected override void OnMouseDown(MouseEventArgs e) { Focus(); base.OnMouseDown(e); }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnGotFocus(EventArgs e) { held = 0; winDown = false; Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { held = 0; winDown = false; Invalidate(); base.OnLostFocus(e); }
+
+        private void UpdateHeld(KeyEventArgs e)
+        {
+            byte m = 0;
+            if (e.Control) m |= KeyShortcuts.MOD_CTRL;
+            if (e.Shift) m |= KeyShortcuts.MOD_SHIFT;
+            if (e.Alt) m |= KeyShortcuts.MOD_ALT;
+            if (winDown) m |= KeyShortcuts.MOD_WIN;
+            if (m != held) { held = m; Invalidate(); }
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+            if (e.KeyCode == Keys.LWin || e.KeyCode == Keys.RWin) winDown = true;
+            if (IsModifierKey(e.KeyCode)) { UpdateHeld(e); return; }
+            if (KeyCaptured != null) KeyCaptured(this, e);
+        }
+
+        // Print Screen only produces a key-up in WinForms.
+        protected override void OnKeyUp(KeyEventArgs e)
+        {
+            e.Handled = true;
+            if (e.KeyCode == Keys.LWin || e.KeyCode == Keys.RWin) winDown = false;
+            if (e.KeyCode == Keys.PrintScreen && KeyCaptured != null) KeyCaptured(this, e);
+            UpdateHeld(e);
+        }
+
+        protected override void OnKeyPress(KeyPressEventArgs e) { e.Handled = true; }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            RectangleF r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+            float radius = Ui.Sf(8);
+            Ui.FillRound(g, hover && !Focused ? Theme.SurfaceHover : Theme.Surface, r, radius);
+            if (Focused) Ui.DrawRound(g, Theme.Accent, new RectangleF(1f, 1f, Width - 2.5f, Height - 2.5f), radius, Math.Max(1.5f, Ui.Sf(1.5f)));
+            else Ui.DrawRound(g, Invalid ? Theme.Danger : Theme.Border, r, radius, 1f);
+
+            List<string> caps = new List<string>();
+            bool pending = Focused && held != 0;
+            byte mods = pending ? held : Value.Mods;
+            if (pending || HasValue)
+            {
+                for (int bit = 0; bit < 4; bit++) if ((mods & (1 << bit)) != 0) caps.Add(ModNames[bit]);
+                caps.Add(pending ? null : KeyShortcuts.KeyName(Value.Vk));
+            }
+            else
+            {
+                Ui.Text(g, Focused ? "Press a key combination…" : "Click here, then press the keys", Ui.Body, ClientRectangle, Focused ? Theme.TextSecondary : Theme.TextMuted,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                return;
+            }
+
+            int capH = Ui.S(34), pad = Ui.S(12), plusW = Ui.S(22), depth = Ui.S(3);
+            int[] widths = new int[caps.Count];
+            int total = 0;
+            for (int i = 0; i < caps.Count; i++)
+            {
+                string t = caps[i] ?? "key";
+                widths[i] = Math.Max(capH, TextRenderer.MeasureText(g, t, Ui.BodyBold, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Width + pad * 2);
+                total += widths[i] + (i > 0 ? plusW : 0);
+            }
+            int x = (Width - total) / 2, y = (Height - capH - depth) / 2;
+            for (int i = 0; i < caps.Count; i++)
+            {
+                if (i > 0)
+                {
+                    Ui.Text(g, "+", Ui.Body, new Rectangle(x, y, plusW, capH), Theme.TextMuted, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                    x += plusW;
+                }
+                RectangleF cap = new RectangleF(x + 0.5f, y + 0.5f, widths[i] - 1f, capH - 1f);
+                if (caps[i] == null)
+                {
+                    using (GraphicsPath p = Ui.RoundRect(cap, Ui.Sf(6)))
+                    using (Pen pen = new Pen(Theme.TextMuted, 1f) { DashStyle = DashStyle.Dash })
+                        g.DrawPath(pen, p);
+                    Ui.Text(g, "key", Ui.Body, Rectangle.Round(cap), Theme.TextMuted, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                }
+                else
+                {
+                    Ui.FillRound(g, Theme.Border, new RectangleF(cap.X, cap.Y + depth, cap.Width, cap.Height), Ui.Sf(6));
+                    Ui.FillRound(g, Theme.SurfaceElevated, cap, Ui.Sf(6));
+                    Ui.DrawRound(g, Invalid && !pending ? Theme.Danger : Theme.Border, cap, Ui.Sf(6), 1f);
+                    Ui.Text(g, caps[i], Ui.BodyBold, Rectangle.Round(cap), Invalid && !pending ? Theme.Danger : Theme.TextPrimary,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                }
+                x += widths[i];
+            }
+        }
+    }
+
     // Captures one key combination. Rules: 0-4 modifiers plus exactly one allow-listed main key,
-    // Ctrl+Alt+Del refused, window-closing / lock combos confirmed. Win is a checkbox because the
+    // Ctrl+Alt+Del refused, window-closing / lock combos confirmed. Win is also a chip because the
     // Windows shell swallows most Win+key presses before any app can see them.
     public class ShortcutPickerForm : Form
     {
-        private readonly CheckBox[] modBoxes = new CheckBox[4];
-        private readonly TextBox txtCapture;
-        private readonly Label lblHint;
-        private readonly Button btnOk;
+        private static readonly string[] ModNames = { "Ctrl", "Shift", "Alt", "Win" };
+        private readonly UiChip[] modChips = new UiChip[4];
+        private readonly ShortcutCaptureBox capture;
+        private readonly Label lblHint, lblHintIcon;
+        private readonly UiButton btnOk;
         private byte vk;
+        private bool suppress;
 
         public KeyShortcut Result;
 
         public ShortcutPickerForm(string buttonName, KeyShortcut initial)
         {
-            Text = "Keyboard Shortcut · " + buttonName;
+            Text = "Keyboard shortcut · " + buttonName;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.CenterParent;
-            AutoScaleMode = AutoScaleMode.Dpi;
-            AutoScaleDimensions = new SizeF(96F, 96F);
-            ClientSize = new Size(380, 214);
+            AutoScaleMode = AutoScaleMode.None;
+            ClientSize = new Size(Ui.S(420), Ui.S(346));
             BackColor = Theme.Canvas;
             ForeColor = Theme.TextPrimary;
-            Font = Theme.FontBodyPrimary;
-            KeyPreview = false;
+            Font = Ui.Body;
 
-            Controls.Add(new Label
-            {
-                Text = "Click the box, then press the key combination:",
-                Location = new Point(14, 14),
-                Size = new Size(352, 18),
-                ForeColor = Theme.TextSecondary
-            });
+            AddLabel(this, "Keyboard shortcut", Ui.Big, Theme.TextPrimary, Ui.R(24, 20, 372, 26));
+            AddLabel(this, "Pressing " + buttonName + " sends this key combination.", Ui.Small, Theme.TextSecondary, Ui.R(24, 48, 372, 18));
 
-            txtCapture = new TextBox
-            {
-                Location = new Point(14, 36),
-                Size = new Size(352, 26),
-                BackColor = Theme.SurfaceElevated,
-                ForeColor = Theme.TextPrimary,
-                Font = Theme.FontHeading,
-                TextAlign = HorizontalAlignment.Center,
-                ShortcutsEnabled = false,
-                ContextMenu = new ContextMenu(),
-                AccessibleName = "Shortcut capture"
-            };
-            // Every key, including Tab / Enter / Esc / arrows, is captured instead of moving focus.
-            txtCapture.PreviewKeyDown += delegate(object s, PreviewKeyDownEventArgs e) { e.IsInputKey = true; };
-            txtCapture.KeyDown += Capture_KeyDown;
-            txtCapture.KeyUp += Capture_KeyUp;
-            txtCapture.KeyPress += delegate(object s, KeyPressEventArgs e) { e.Handled = true; };
-            Controls.Add(txtCapture);
+            capture = new ShortcutCaptureBox { Bounds = Ui.R(24, 80, 372, 76), AccessibleName = "Shortcut capture. Press the key combination." };
+            capture.KeyCaptured += Capture_KeyCaptured;
+            Controls.Add(capture);
 
-            string[] names = { "Ctrl", "Shift", "Alt", "Win" };
+            AddLabel(this, "MODIFIERS", Ui.Caption, Theme.TextMuted, Ui.R(24, 172, 372, 16));
             for (int i = 0; i < 4; i++)
             {
-                modBoxes[i] = new CheckBox
+                modChips[i] = new UiChip(ModNames[i])
                 {
-                    Text = names[i],
-                    Location = new Point(14 + i * 80, 72),
-                    Size = new Size(76, 22),
-                    ForeColor = Theme.TextPrimary,
+                    Bounds = Ui.R(24 + i * 96, 192, 84, 32),
                     Checked = (initial.Mods & (1 << i)) != 0
                 };
-                modBoxes[i].CheckedChanged += delegate { UpdateState(); };
-                Controls.Add(modBoxes[i]);
+                modChips[i].CheckedChanged += delegate { if (!suppress) UpdateState(); };
+                // Keep keyboard capture live after a chip is clicked with the mouse.
+                modChips[i].MouseUp += delegate { capture.Focus(); };
+                Controls.Add(modChips[i]);
             }
 
-            lblHint = new Label
-            {
-                Location = new Point(14, 102),
-                Size = new Size(352, 62),
-                ForeColor = Theme.TextSecondary,
-                Font = Theme.FontBodySecondary
-            };
-            Controls.Add(lblHint);
+            lblHintIcon = AddLabel(this, "", Ui.IconSmall, Theme.TextMuted, Ui.R(24, 240, 18, 18));
+            lblHint = AddLabel(this, "", Ui.Small, Theme.TextSecondary, Ui.R(48, 239, 348, 34));
 
-            btnOk = MakeButton("OK", 172, Theme.Accent, Theme.AccentText);
+            Panel footer = new Panel { Bounds = new Rectangle(0, Ui.S(282), ClientSize.Width, ClientSize.Height - Ui.S(282)), BackColor = Theme.Surface };
+            footer.Paint += delegate(object s, PaintEventArgs e)
+            {
+                using (Pen p = new Pen(Theme.Border)) e.Graphics.DrawLine(p, 0, 0, footer.Width, 0);
+            };
+            Controls.Add(footer);
+
+            UiButton btnClear = new UiButton(UiButtonKind.Ghost, "Clear", Glyphs.Delete) { Bounds = Ui.R(16, 14, 92, 36) };
+            btnClear.Click += delegate
+            {
+                vk = 0;
+                suppress = true;
+                for (int i = 0; i < 4; i++) modChips[i].Checked = false;
+                suppress = false;
+                UpdateState();
+                capture.Focus();
+            };
+            footer.Controls.Add(btnClear);
+
+            UiButton btnCancel = new UiButton(UiButtonKind.Secondary, "Cancel", null) { Bounds = Ui.R(188, 14, 100, 36), DialogResult = DialogResult.Cancel };
+            footer.Controls.Add(btnCancel);
+            btnOk = new UiButton(UiButtonKind.Primary, "Assign", Glyphs.Check) { Bounds = Ui.R(300, 14, 100, 36) };
             btnOk.Click += BtnOk_Click;
-            Button btnCancel = MakeButton("Cancel", 274, Theme.Surface, Theme.TextSecondary);
-            btnCancel.DialogResult = DialogResult.Cancel;
+            footer.Controls.Add(btnOk);
+            AcceptButton = btnOk;
+            CancelButton = btnCancel;
 
             vk = initial.Vk;
             UpdateState();
+        }
+
+        private static Label AddLabel(Control parent, string text, Font font, Color color, Rectangle bounds)
+        {
+            Label l = new Label { Text = text, Font = font, ForeColor = color, Bounds = bounds, AutoSize = false, UseMnemonic = false, BackColor = parent.BackColor };
+            parent.Controls.Add(l);
+            return l;
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -6425,54 +6621,17 @@ namespace RedgearA20ControlCenter
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            txtCapture.Focus();
+            capture.Focus();
         }
 
-        private Button MakeButton(string text, int x, Color back, Color fore)
+        private void Capture_KeyCaptured(object sender, KeyEventArgs e)
         {
-            Button b = new Button
-            {
-                Text = text,
-                Location = new Point(x, 172),
-                Size = new Size(92, 30),
-                BackColor = back,
-                ForeColor = fore,
-                Font = Theme.FontBodyBold,
-                FlatStyle = FlatStyle.Flat
-            };
-            b.FlatAppearance.BorderColor = Theme.Border;
-            Controls.Add(b);
-            return b;
-        }
-
-        private static bool IsModifierKey(Keys k)
-        {
-            return k == Keys.ControlKey || k == Keys.ShiftKey || k == Keys.Menu || k == Keys.LWin || k == Keys.RWin ||
-                   k == Keys.LControlKey || k == Keys.RControlKey || k == Keys.LShiftKey || k == Keys.RShiftKey ||
-                   k == Keys.LMenu || k == Keys.RMenu;
-        }
-
-        private void Capture_KeyDown(object sender, KeyEventArgs e)
-        {
-            // Swallow everything so Alt+F4, Enter, Esc etc. are recorded rather than acted on.
-            e.Handled = true;
-            e.SuppressKeyPress = true;
-            if (IsModifierKey(e.KeyCode)) return;
-            Take(e);
-        }
-
-        // Print Screen only produces a key-up in WinForms.
-        private void Capture_KeyUp(object sender, KeyEventArgs e)
-        {
-            e.Handled = true;
-            if (e.KeyCode == Keys.PrintScreen) Take(e);
-        }
-
-        private void Take(KeyEventArgs e)
-        {
-            modBoxes[0].Checked = e.Control;
-            modBoxes[1].Checked = e.Shift;
-            modBoxes[2].Checked = e.Alt;
+            suppress = true;
+            modChips[0].Checked = e.Control;
+            modChips[1].Checked = e.Shift;
+            modChips[2].Checked = e.Alt;
+            if (capture.WinHeld) modChips[3].Checked = true;
+            suppress = false;
             vk = (byte)((int)e.KeyCode & 0xFF);
             UpdateState();
         }
@@ -6480,7 +6639,7 @@ namespace RedgearA20ControlCenter
         private KeyShortcut Current()
         {
             byte mods = 0;
-            for (int i = 0; i < 4; i++) if (modBoxes[i].Checked) mods |= (byte)(1 << i);
+            for (int i = 0; i < 4; i++) if (modChips[i].Checked) mods |= (byte)(1 << i);
             return new KeyShortcut(mods, vk);
         }
 
@@ -6488,25 +6647,28 @@ namespace RedgearA20ControlCenter
         {
             KeyShortcut ks = Current();
             bool ok = false;
+            string hint;
             if (vk == 0)
-            {
-                txtCapture.Text = "Press a key…";
-                lblHint.Text = "Up to 4 modifiers plus exactly one key. The shortcut fires once per button press.";
-            }
+                hint = "Hold any modifiers and press one key. Windows grabs most Win + key presses, so add Win with its chip instead.";
+            else if (KeyShortcuts.VkToUsage(vk) == 0)
+                hint = KeyShortcuts.KeyName(vk) + " can't be used. Lock keys, media keys and lone modifiers are not supported.";
+            else if (KeyShortcuts.IsBlocked(ks))
+                hint = "Ctrl + Alt + Del is reserved by Windows and can't be assigned.";
             else
             {
-                txtCapture.Text = KeyShortcuts.Describe(ks);
-                if (KeyShortcuts.VkToUsage(vk) == 0)
-                    lblHint.Text = KeyShortcuts.KeyName(vk) + " can't be used. Lock keys, media keys and lone modifiers are not supported.";
-                else if (KeyShortcuts.IsBlocked(ks))
-                    lblHint.Text = "Ctrl + Alt + Del is reserved by Windows and can't be assigned.";
-                else
-                {
-                    ok = true;
-                    lblHint.Text = "Fires once per button press. Some combos (e.g. Win + key, Alt + Tab) are handled by Windows itself.";
-                }
+                ok = true;
+                hint = "Fires once per button press. Some combos (e.g. Alt + Tab) are handled by Windows itself.";
             }
+            capture.Value = ks;
+            capture.HasValue = vk != 0;
+            capture.Invalid = vk != 0 && !ok;
+            capture.AccessibleDescription = vk != 0 ? KeyShortcuts.Describe(ks) : "Empty";
+            capture.Invalidate();
+            lblHint.Text = hint;
+            Color c = ok ? Theme.Accent : (vk == 0 ? Theme.TextMuted : Theme.Danger);
             lblHint.ForeColor = ok || vk == 0 ? Theme.TextSecondary : Theme.Danger;
+            lblHintIcon.ForeColor = c;
+            lblHintIcon.Text = ok ? Glyphs.Check : (vk == 0 ? Glyphs.Info : Glyphs.Warning);
             btnOk.Enabled = ok;
         }
 
@@ -6517,7 +6679,7 @@ namespace RedgearA20ControlCenter
             string warning = KeyShortcuts.Warning(ks);
             if (warning != null)
             {
-                DialogResult r = MessageBox.Show(
+                DialogResult r = MessageBox.Show(this,
                     KeyShortcuts.Describe(ks) + " " + warning + "\n\nAssign it anyway?",
                     "Confirm Shortcut", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
                 if (r != DialogResult.Yes) return;
