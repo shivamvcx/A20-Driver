@@ -1,6 +1,6 @@
 # Redgear A20 Control Center
 
-[![Download Executable](https://img.shields.io/badge/Download%20.exe-v0.3.0-success)](https://github.com/shivamvcx/A20-Driver/releases)
+[![Download Executable](https://img.shields.io/badge/Download%20.exe-v0.4.0-success)](https://github.com/shivamvcx/A20-Driver/releases)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform: Windows x64](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20(64--bit)-0078D6.svg)](https://microsoft.com)
 [![Architecture: C# WinForms](https://img.shields.io/badge/Architecture-C%23%20WinForms-239120.svg)](src/Program.cs)
@@ -11,9 +11,7 @@
 
 It talks directly to the **Redgear A20 RGB Gaming Mouse** (`VID: 0x18F8 & PID: 0x0FC0`) and its Instant A704 microcontroller over USB HID Feature Reports.
 
-> **Latest version: [v0.3.0](https://github.com/shivamvcx/A20-Driver/releases/latest)** — adds Button Remapping and Keyboard Shortcuts.
->
-> **Next: v0.4.0** — complete UI redesign, multiple saved profiles, light/dark themes and a Setup installer ([details](#whats-new-in-v040)).
+> **Latest version: [v0.4.0](https://github.com/shivamvcx/A20-Driver/releases/latest)** — complete UI redesign, multiple saved profiles, light/dark themes, a new colour picker and a Setup installer ([details](#whats-new-in-v040)).
 
 <p align="center">
   <img src="assets/control-center-ui.png" alt="Redgear A20 Control Center UI" width="460">
@@ -85,7 +83,7 @@ Existing profiles carry over automatically.
 | :---: | :--- | :---: |
 | v0.1.0 – v0.2.1 | RGB engine, stealth persistence, industrial UI overhaul, stability hardening | Released |
 | v0.3.0 | Hardware button remapping + keyboard shortcuts on mouse buttons | Released |
-| v0.4.0 | Complete UI redesign, multiple profiles, themes, Setup installer | Ready |
+| v0.4.0 | Complete UI redesign, multiple profiles, themes, colour picker, Setup installer | Released |
 | Future | Extended RGB effects, sensor & polling rate, per-stage DPI customization, sniper mode | Planned |
 | v1.0.0 | Stable release + multi-device OEM support | Long-term |
 
