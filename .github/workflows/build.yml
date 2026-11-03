@@ -19,6 +19,12 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Ensure Inno Setup 6
+      run: |
+        if (!(Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe") -and !(Test-Path "$env:ProgramFiles\Inno Setup 6\ISCC.exe")) {
+          choco install innosetup -y --no-progress
+        }
+
     - name: Compile via build.bat
       run: |
         .\build.bat
@@ -30,6 +36,12 @@ jobs:
         }
         if (!(Test-Path "release\RedgearA20-win-x64.sha256")) {
           throw "Checksum file release\RedgearA20-win-x64.sha256 was not created."
+        }
+        if (!(Test-Path "release\RedgearA20-win-x64-setup.exe")) {
+          throw "Installer release\RedgearA20-win-x64-setup.exe was not created."
+        }
+        if (!(Test-Path "release\RedgearA20-win-x64-setup.sha256")) {
+          throw "Checksum file release\RedgearA20-win-x64-setup.sha256 was not created."
         }
         Write-Host "Build verification passed!"
 
@@ -46,5 +58,7 @@ jobs:
         files: |
           release/RedgearA20-win-x64.exe
           release/RedgearA20-win-x64.sha256
+          release/RedgearA20-win-x64-setup.exe
+          release/RedgearA20-win-x64-setup.sha256
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

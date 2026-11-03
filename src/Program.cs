@@ -1,7 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
 using System.Net;
@@ -20,8 +21,8 @@ using Microsoft.Win32.SafeHandles;
 [assembly: AssemblyDescription("Open-Source Hardware Control Utility for Redgear A20")]
 [assembly: AssemblyProduct("Redgear A20 Control Center")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 Redgear A20 Open Driver Project Contributors")]
-[assembly: AssemblyVersion("0.3.0.0")]
-[assembly: AssemblyFileVersion("0.3.0.0")]
+[assembly: AssemblyVersion("0.4.0.0")]
+[assembly: AssemblyFileVersion("0.4.0.0")]
 
 namespace RedgearA20ControlCenter
 {
@@ -833,6 +834,14 @@ namespace RedgearA20ControlCenter
         public bool EnableDpi = false;
         public PersistenceMode Mode = PersistenceMode.StealthWatcher;
 
+        // Library identity. profile.json carries the id/name of the profile it was applied from.
+        public string Id = null;
+        public string Name = "Profile 1";
+        public const int MAX_NAME_LENGTH = 32;
+
+        // Global UI preference stored in profile.json only: 0 = System, 1 = Dark, 2 = Light.
+        public int ThemePref = 0;
+
         // Button remapping (Cmd 0x10). Absent/unparsable entries fall back to the factory
         // action, so an older or hand-edited profile can never put an unknown byte on the wire.
         public Dictionary<byte, ButtonAction> ButtonBindings = new Dictionary<byte, ButtonAction>();
@@ -930,13 +939,54 @@ namespace RedgearA20ControlCenter
 
         public static AppProfile Load()
         {
+            return LoadFrom(GetProfilePath());
+        }
+
+        public static AppProfile LoadFrom(string file)
+        {
             AppProfile p = new AppProfile();
             try
             {
-                string file = GetProfilePath();
                 if (File.Exists(file))
                 {
-                    string json = File.ReadAllText(file);
+                    Parse(File.ReadAllText(file), p);
+                }
+            }
+            catch { }
+            return p;
+        }
+
+        public static string SanitizeName(string name)
+        {
+            if (name == null) return "";
+            StringBuilder sb = new StringBuilder();
+            foreach (char c in name)
+            {
+                if (c == '"' || c == '\\' || char.IsControl(c)) continue;
+                sb.Append(c);
+            }
+            string s = Regex.Replace(sb.ToString(), "\\s+", " ").Trim();
+            if (s.Length > MAX_NAME_LENGTH) s = s.Substring(0, MAX_NAME_LENGTH).Trim();
+            return s;
+        }
+
+        private static void Parse(string json, AppProfile p)
+        {
+            {
+                {
+                    Match mName = Regex.Match(json, "\"ProfileName\"\\s*:\\s*\"([^\"]*)\"");
+                    if (mName.Success)
+                    {
+                        string n = SanitizeName(mName.Groups[1].Value);
+                        if (n.Length > 0) p.Name = n;
+                    }
+
+                    Match mId = Regex.Match(json, "\"ProfileId\"\\s*:\\s*\"([0-9A-Fa-f]{8,32})\"");
+                    if (mId.Success) p.Id = mId.Groups[1].Value.ToLowerInvariant();
+
+                    Match mTheme = Regex.Match(json, "\"Theme\"\\s*:\\s*(\\d+)");
+                    if (mTheme.Success) p.ThemePref = ParseClampedInt(mTheme.Groups[1].Value, 0, 2, 0);
+
                     Match mHex = Regex.Match(json, "\"HexColor\"\\s*:\\s*\"([^\"]+)\"");
                     if (mHex.Success)
                     {
@@ -1011,8 +1061,50 @@ namespace RedgearA20ControlCenter
                     }
                 }
             }
-            catch { }
-            return p;
+        }
+
+        public AppProfile Clone()
+        {
+            AppProfile c = new AppProfile();
+            c.Id = Id;
+            c.Name = Name;
+            c.Mode = Mode;
+            c.ThemePref = ThemePref;
+            c.CopySettingsFrom(this);
+            return c;
+        }
+
+        // Device settings only (lighting, DPI, buttons). Identity, mode and theme are untouched.
+        public void CopySettingsFrom(AppProfile o)
+        {
+            HexColor = o.HexColor;
+            Brightness = o.Brightness;
+            ActiveDpiStage = o.ActiveDpiStage;
+            EnableDpi = o.EnableDpi;
+            ButtonBindings = o.ButtonBindings != null ? new Dictionary<byte, ButtonAction>(o.ButtonBindings) : new Dictionary<byte, ButtonAction>();
+            Shortcuts = o.Shortcuts != null ? new Dictionary<byte, KeyShortcut>(o.Shortcuts) : new Dictionary<byte, KeyShortcut>();
+        }
+
+        public bool SameSettings(AppProfile o)
+        {
+            if (o == null) return false;
+            if (!string.Equals(HexColor, o.HexColor, StringComparison.OrdinalIgnoreCase)) return false;
+            if (Brightness != o.Brightness || ActiveDpiStage != o.ActiveDpiStage || EnableDpi != o.EnableDpi) return false;
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i].Locked) continue;
+                ButtonAction a = GetBinding(all[i].Id);
+                if (a != o.GetBinding(all[i].Id)) return false;
+                if (a == ButtonAction.Shortcut)
+                {
+                    KeyShortcut k1, k2;
+                    TryGetShortcut(all[i].Id, out k1);
+                    o.TryGetShortcut(all[i].Id, out k2);
+                    if (k1.Mods != k2.Mods || k1.Vk != k2.Vk) return false;
+                }
+            }
+            return true;
         }
 
         // "BindForward" -> "ShortForward" ("mods:vk" hex token, e.g. "04:73" = Alt + F4).
@@ -1036,11 +1128,15 @@ namespace RedgearA20ControlCenter
 
         public bool Save(out string error)
         {
+            return SaveTo(GetProfilePath(), out error);
+        }
+
+        public bool SaveTo(string file, out string error)
+        {
             error = null;
             string tmpFile = null;
             try
             {
-                string file = GetProfilePath();
                 string dir = Path.GetDirectoryName(file);
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
 
@@ -1057,8 +1153,13 @@ namespace RedgearA20ControlCenter
                     if (TryGetShortcut(buttons[i].Id, out ks)) sbBinds.AppendFormat(",\n  \"{0}\": \"{1}\"", ShortcutKey(buttons[i]), KeyShortcuts.ToToken(ks));
                 }
 
-                string json = string.Format("{{\n  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"ActiveDpiStage\": {2},\n  \"EnableDpi\": {3},\n  \"PersistenceMode\": {4}{5}\n}}\n",
-                    HexColor, bri, dpi, EnableDpi.ToString().ToLower(), (int)Mode, sbBinds.ToString());
+                string name = SanitizeName(Name);
+                if (name.Length == 0) name = "Profile";
+                string idPart = (!string.IsNullOrEmpty(Id) && Regex.IsMatch(Id, "^[0-9a-fA-F]{8,32}$"))
+                    ? string.Format("  \"ProfileId\": \"{0}\",\n", Id) : "";
+
+                string json = string.Format("{{\n  \"ProfileName\": \"{6}\",\n{7}  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"ActiveDpiStage\": {2},\n  \"EnableDpi\": {3},\n  \"PersistenceMode\": {4},\n  \"Theme\": {8}{5}\n}}\n",
+                    HexColor, bri, dpi, EnableDpi.ToString().ToLower(), (int)Mode, sbBinds.ToString(), name, idPart, Math.Max(0, Math.Min(2, ThemePref)));
 
                 tmpFile = file + ".tmp";
                 File.WriteAllText(tmpFile, json, Encoding.UTF8);
@@ -1098,6 +1199,113 @@ namespace RedgearA20ControlCenter
         {
             string dummy;
             Save(out dummy);
+        }
+    }
+
+    // Named profiles live as individual files: %LocalAppData%\RedgearA20\profiles\<id>.json.
+    // profile.json stays the single source the watcher/headless paths read on hotplug.
+    public class ProfileLibrary
+    {
+        public readonly List<AppProfile> Items = new List<AppProfile>();
+
+        public static string GetDir()
+        {
+            string dir = Path.Combine(Path.GetDirectoryName(AppProfile.GetProfilePath()), "profiles");
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            return dir;
+        }
+
+        private static string PathFor(string id)
+        {
+            return Path.Combine(GetDir(), id + ".json");
+        }
+
+        private static long lastId = 0;
+        public static string NewId()
+        {
+            long t = DateTime.UtcNow.Ticks;
+            if (t <= lastId) t = lastId + 1;
+            lastId = t;
+            return t.ToString("x16");
+        }
+
+        public static ProfileLibrary Load(AppProfile active)
+        {
+            ProfileLibrary lib = new ProfileLibrary();
+            try
+            {
+                foreach (string f in Directory.GetFiles(GetDir(), "*.json"))
+                {
+                    string id = Path.GetFileNameWithoutExtension(f).ToLowerInvariant();
+                    if (!Regex.IsMatch(id, "^[0-9a-f]{8,32}$")) continue;
+                    AppProfile p = AppProfile.LoadFrom(f);
+                    p.Id = id;
+                    lib.Items.Add(p);
+                }
+            }
+            catch { }
+            lib.Items.Sort(delegate (AppProfile a, AppProfile b) { return string.CompareOrdinal(a.Id, b.Id); });
+
+            // First run (or the active profile's file is gone): seed from profile.json.
+            if (active != null && (active.Id == null || lib.Find(active.Id) == null))
+            {
+                AppProfile seed = active.Clone();
+                if (seed.Id == null || lib.Find(seed.Id) != null) seed.Id = NewId();
+                if (lib.Items.Count > 0 && active.Id == null) seed.Name = lib.UniqueName("Profile");
+                string err;
+                lib.Items.Add(seed);
+                lib.Write(seed, out err);
+                active.Id = seed.Id;
+                active.Name = seed.Name;
+                active.Save(out err);
+                lib.Items.Sort(delegate (AppProfile a, AppProfile b) { return string.CompareOrdinal(a.Id, b.Id); });
+            }
+            return lib;
+        }
+
+        public AppProfile Find(string id)
+        {
+            if (id == null) return null;
+            for (int i = 0; i < Items.Count; i++) if (Items[i].Id == id) return Items[i];
+            return null;
+        }
+
+        public int IndexOf(string id)
+        {
+            for (int i = 0; i < Items.Count; i++) if (Items[i].Id == id) return i;
+            return -1;
+        }
+
+        public string UniqueName(string baseName)
+        {
+            for (int n = 1; n < 1000; n++)
+            {
+                string candidate = AppProfile.SanitizeName(baseName + " " + n);
+                bool taken = false;
+                for (int i = 0; i < Items.Count; i++)
+                    if (string.Equals(Items[i].Name, candidate, StringComparison.OrdinalIgnoreCase)) { taken = true; break; }
+                if (!taken) return candidate;
+            }
+            return baseName;
+        }
+
+        public bool Write(AppProfile p, out string error)
+        {
+            if (p.Id == null) p.Id = NewId();
+            return p.SaveTo(PathFor(p.Id), out error);
+        }
+
+        public void Add(AppProfile p, out string error)
+        {
+            Items.Add(p);
+            Write(p, out error);
+        }
+
+        public void Delete(string id)
+        {
+            int i = IndexOf(id);
+            if (i >= 0) Items.RemoveAt(i);
+            try { string f = PathFor(id); if (File.Exists(f)) File.Delete(f); } catch { }
         }
     }
 
@@ -1407,12 +1615,31 @@ namespace RedgearA20ControlCenter
                     try { ReplaceFile(installed, tmp); }
                     catch (Exception ex) { result.Warning = "Could not update the auto-start copy at " + installed + ": " + ex.Message; }
                 }
+                RefreshInstallerVersion(info.Version);
                 return result;
             }
             finally
             {
                 try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
             }
+        }
+
+        // Setup.exe installs register under this key; keep "Apps & features" showing the right version.
+        public const string INSTALLER_UNINSTALL_KEY = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\{0D6C3141-13D7-410F-A775-B2301C4B7061}_is1";
+
+        private static void RefreshInstallerVersion(Version v)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(INSTALLER_UNINSTALL_KEY, true))
+                {
+                    if (key == null) return;
+                    string text = string.Format(CultureInfo.InvariantCulture, "{0}.{1}.{2}", v.Major, v.Minor, v.Build);
+                    key.SetValue("DisplayVersion", text);
+                    key.SetValue("DisplayName", "Redgear A20 Control Center " + text);
+                }
+            }
+            catch { }
         }
 
         private static void Download(string url, string dest)
@@ -1494,73 +1721,1423 @@ namespace RedgearA20ControlCenter
     }
 
     // ═════════════════════════════════════════════════════════════════════════
-    //  UI Design System Tokens (Zero-Allocation GDI+ Theme)
+    //  UI Design System Tokens (Dark / Light, swapped in place by Theme.Apply)
     // ═════════════════════════════════════════════════════════════════════════
     public static class Theme
     {
+        public static bool IsDark = true;
+
         // ─── Colors: Base Neutrals ───
-        public static readonly Color Canvas = Color.FromArgb(18, 19, 22);          // #121316
-        public static readonly Color Surface = Color.FromArgb(26, 28, 34);         // #1A1C22
-        public static readonly Color SurfaceElevated = Color.FromArgb(36, 39, 49); // #242731
-        public static readonly Color SurfaceHover = Color.FromArgb(45, 49, 62);    // #2D313E
-        public static readonly Color Border = Color.FromArgb(43, 47, 58);          // #2B2F3A
-        public static readonly Color BorderSubtle = Color.FromArgb(32, 35, 42);    // #20232A
-
+        public static Color Canvas, Surface, SurfaceElevated, SurfaceHover, Border, BorderSubtle;
         // ─── Colors: Text Neutrals ───
-        public static readonly Color TextPrimary = Color.FromArgb(241, 243, 247);  // #F1F3F7
-        public static readonly Color TextSecondary = Color.FromArgb(141, 147, 165);// #8D93A5
-        public static readonly Color TextMuted = Color.FromArgb(90, 96, 114);       // #5A6072
-        public static readonly Color TextDisabled = Color.FromArgb(82, 88, 102);   // #525866
-
+        public static Color TextPrimary, TextSecondary, TextMuted, TextDisabled;
         // ─── Colors: Single Primary Accent (Emerald / Hardware Mint) ───
-        public static readonly Color Accent = Color.FromArgb(16, 185, 129);        // #10B981
-        public static readonly Color AccentHover = Color.FromArgb(5, 150, 105);    // #059669
-        public static readonly Color AccentText = Color.White;                     // #FFFFFF
-        public static readonly Color AccentDim = Color.FromArgb(6, 78, 59);        // #064E3B
-
+        public static Color Accent, AccentHover, AccentDim;
+        public static readonly Color AccentText = Color.White;
         // ─── Colors: Functional Semantic States ───
-        public static readonly Color Warning = Color.FromArgb(245, 158, 11);       // #F59E0B
-        public static readonly Color WarningSurface = Color.FromArgb(35, 28, 19);  // #231C13
-        public static readonly Color WarningBorder = Color.FromArgb(92, 61, 16);   // #5C3D10
-        public static readonly Color Danger = Color.FromArgb(239, 68, 68);         // #EF4444
-        public static readonly Color DangerSurface = Color.FromArgb(40, 20, 22);   // #281416
-        public static readonly Color DangerBorder = Color.FromArgb(77, 29, 34);    // #4D1D22
-        public static readonly Color TerminalBg = Color.FromArgb(14, 15, 18);      // #0E0F12
-        public static readonly Color TerminalText = Color.FromArgb(16, 185, 129);  // #10B981
+        public static Color Warning, WarningSurface, WarningBorder, Danger, DangerSurface, DangerBorder;
+        // The diagnostic terminal stays dark in both themes.
+        public static readonly Color TerminalBg = Color.FromArgb(14, 15, 18);
+        public static readonly Color TerminalText = Color.FromArgb(16, 185, 129);
 
-        // ─── Fonts: System Fonts Only (Pre-allocated Static Instances) ───
-        public static readonly Font FontHeading = new Font("Segoe UI", 9.75f, FontStyle.Bold);      // 13px bold
-        public static readonly Font FontBodyPrimary = new Font("Segoe UI", 9.0f, FontStyle.Regular);// 12px
-        public static readonly Font FontBodyBold = new Font("Segoe UI", 9.0f, FontStyle.Bold);       // 12px bold
-        public static readonly Font FontBodySecondary = new Font("Segoe UI", 8.25f, FontStyle.Regular); // 11px
-        public static readonly Font FontBadge = new Font("Segoe UI", 7.5f, FontStyle.Bold);         // 10px bold
-        public static readonly Font FontMono = new Font("Consolas", 8.25f, FontStyle.Regular);      // 11px mono
+        // ─── Fonts used by the point-scaled dialogs (Button Mapper, Shortcut Picker) ───
+        public static readonly Font FontHeading = new Font("Segoe UI", 9.75f, FontStyle.Bold);
+        public static readonly Font FontBodyPrimary = new Font("Segoe UI", 9.0f, FontStyle.Regular);
+        public static readonly Font FontBodyBold = new Font("Segoe UI", 9.0f, FontStyle.Bold);
+        public static readonly Font FontBodySecondary = new Font("Segoe UI", 8.25f, FontStyle.Regular);
+        public static readonly Font FontBadge = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+        public static readonly Font FontMono = new Font("Consolas", 8.25f, FontStyle.Regular);
 
-        // ─── Cached GDI Brushes & Pens (Never reallocated in Paint) ───
-        public static readonly SolidBrush BrushCanvas = new SolidBrush(Canvas);
-        public static readonly SolidBrush BrushSurface = new SolidBrush(Surface);
-        public static readonly SolidBrush BrushSurfaceElevated = new SolidBrush(SurfaceElevated);
-        public static readonly SolidBrush BrushAccent = new SolidBrush(Accent);
-        public static readonly SolidBrush BrushWarning = new SolidBrush(Warning);
-        public static readonly SolidBrush BrushDanger = new SolidBrush(Danger);
-        public static readonly SolidBrush BrushTextPrimary = new SolidBrush(TextPrimary);
-        public static readonly SolidBrush BrushTextSecondary = new SolidBrush(TextSecondary);
-        public static readonly Pen PenBorder = new Pen(Border, 1);
-        public static readonly Pen PenBorderSubtle = new Pen(BorderSubtle, 1);
-        public static readonly Pen PenAccent = new Pen(Accent, 1);
-        public static readonly Pen PenWarning = new Pen(Warning, 1);
-        public static readonly Pen PenDanger = new Pen(Danger, 1);
+        public static Pen PenBorder, PenWarning, PenAccent;
 
-        // ─── Spacing Scale (Pixels) ───
-        public const int Space1 = 4;
-        public const int Space2 = 8;
-        public const int Space3 = 12;
-        public const int Space4 = 16;
-        public const int Space5 = 20;
+        static Theme()
+        {
+            Apply(true);
+        }
 
-        // ─── Geometry ───
-        public const int RadiusDefault = 4;
-        public const int BorderWidth = 1;
+        public static void Apply(bool dark)
+        {
+            IsDark = dark;
+            if (dark)
+            {
+                Canvas = Color.FromArgb(18, 19, 22);
+                Surface = Color.FromArgb(26, 28, 34);
+                SurfaceElevated = Color.FromArgb(36, 39, 49);
+                SurfaceHover = Color.FromArgb(45, 49, 62);
+                Border = Color.FromArgb(43, 47, 58);
+                BorderSubtle = Color.FromArgb(32, 35, 42);
+                TextPrimary = Color.FromArgb(241, 243, 247);
+                TextSecondary = Color.FromArgb(141, 147, 165);
+                TextMuted = Color.FromArgb(100, 106, 124);
+                TextDisabled = Color.FromArgb(82, 88, 102);
+                Accent = Color.FromArgb(16, 185, 129);
+                AccentHover = Color.FromArgb(5, 150, 105);
+                AccentDim = Color.FromArgb(14, 52, 42);
+                Warning = Color.FromArgb(245, 158, 11);
+                WarningSurface = Color.FromArgb(40, 30, 16);
+                WarningBorder = Color.FromArgb(92, 61, 16);
+                Danger = Color.FromArgb(239, 68, 68);
+                DangerSurface = Color.FromArgb(40, 20, 22);
+                DangerBorder = Color.FromArgb(77, 29, 34);
+            }
+            else
+            {
+                Canvas = Color.FromArgb(243, 244, 246);
+                Surface = Color.White;
+                SurfaceElevated = Color.FromArgb(236, 238, 242);
+                SurfaceHover = Color.FromArgb(225, 228, 234);
+                Border = Color.FromArgb(220, 223, 230);
+                BorderSubtle = Color.FromArgb(232, 234, 238);
+                TextPrimary = Color.FromArgb(22, 24, 29);
+                TextSecondary = Color.FromArgb(84, 90, 104);
+                TextMuted = Color.FromArgb(120, 126, 140);
+                TextDisabled = Color.FromArgb(165, 170, 180);
+                Accent = Color.FromArgb(5, 150, 105);
+                AccentHover = Color.FromArgb(4, 120, 87);
+                AccentDim = Color.FromArgb(220, 245, 235);
+                Warning = Color.FromArgb(176, 100, 0);
+                WarningSurface = Color.FromArgb(254, 245, 228);
+                WarningBorder = Color.FromArgb(240, 200, 130);
+                Danger = Color.FromArgb(205, 38, 38);
+                DangerSurface = Color.FromArgb(253, 236, 236);
+                DangerBorder = Color.FromArgb(245, 185, 185);
+            }
+            if (PenBorder != null) { PenBorder.Dispose(); PenWarning.Dispose(); PenAccent.Dispose(); }
+            PenBorder = new Pen(Border, 1);
+            PenWarning = new Pen(Warning, 1);
+            PenAccent = new Pen(Accent, 1);
+        }
+
+        // pref: 0 = follow Windows app theme, 1 = dark, 2 = light.
+        public static bool ResolveDark(int pref)
+        {
+            if (pref == 1) return true;
+            if (pref == 2) return false;
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object v = key != null ? key.GetValue("AppsUseLightTheme") : null;
+                    if (v is int) return (int)v == 0;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        public static Color Blend(Color a, Color b, float t)
+        {
+            t = Math.Max(0f, Math.Min(1f, t));
+            return Color.FromArgb(
+                (int)Math.Round(a.R + (b.R - a.R) * t),
+                (int)Math.Round(a.G + (b.G - a.G) * t),
+                (int)Math.Round(a.B + (b.B - a.B) * t));
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  Pixel scaling + pixel-unit fonts for the main window (AutoScaleMode.None)
+    // ═════════════════════════════════════════════════════════════════════════
+    public static class Ui
+    {
+        public static float Scale = 1f;
+        public static Font Title, Subtitle, Body, BodyBold, Small, Caption, Mono, Icon, IconSmall, IconLarge, HeroName, Brand, Big;
+        public static string IconFamily;
+        private static bool iconProbed = false;
+
+        public static int S(int v) { return (int)Math.Round(v * Scale); }
+        public static float Sf(float v) { return v * Scale; }
+        public static Rectangle R(int x, int y, int w, int h) { return new Rectangle(S(x), S(y), S(w), S(h)); }
+
+        public static void Init(float scale)
+        {
+            Scale = Math.Max(1f, Math.Min(4f, scale));
+            if (!iconProbed)
+            {
+                iconProbed = true;
+                string[] names = { "Segoe Fluent Icons", "Segoe MDL2 Assets" };
+                for (int i = 0; i < names.Length && IconFamily == null; i++)
+                {
+                    try { using (FontFamily f = new FontFamily(names[i])) IconFamily = names[i]; } catch { }
+                }
+            }
+            Font[] old = { Title, Subtitle, Body, BodyBold, Small, Caption, Mono, Icon, IconSmall, IconLarge, HeroName, Brand, Big };
+            Title = Px("Segoe UI Semibold", 20, FontStyle.Regular);
+            Subtitle = Px("Segoe UI", 12.5f, FontStyle.Regular);
+            Body = Px("Segoe UI", 13, FontStyle.Regular);
+            BodyBold = Px("Segoe UI Semibold", 13, FontStyle.Regular);
+            Small = Px("Segoe UI", 12, FontStyle.Regular);
+            Caption = Px("Segoe UI", 11, FontStyle.Bold);
+            Mono = Px("Consolas", 11.5f, FontStyle.Regular);
+            HeroName = Px("Segoe UI Semibold", 19, FontStyle.Regular);
+            Brand = Px("Segoe UI", 11, FontStyle.Bold);
+            Big = Px("Segoe UI Semibold", 17, FontStyle.Regular);
+            string iconName = IconFamily ?? "Segoe UI Symbol";
+            Icon = Px(iconName, 16, FontStyle.Regular);
+            IconSmall = Px(iconName, 13, FontStyle.Regular);
+            IconLarge = Px(iconName, 20, FontStyle.Regular);
+            for (int i = 0; i < old.Length; i++) if (old[i] != null) old[i].Dispose();
+        }
+
+        private static Font Px(string family, float px, FontStyle style)
+        {
+            return new Font(family, px * Scale, style, GraphicsUnit.Pixel);
+        }
+
+        public static GraphicsPath RoundRect(RectangleF r, float radius)
+        {
+            GraphicsPath p = new GraphicsPath();
+            float d = Math.Min(radius * 2, Math.Min(r.Width, r.Height));
+            if (d <= 0.5f) { p.AddRectangle(r); return p; }
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        public static void FillRound(Graphics g, Color c, RectangleF r, float radius)
+        {
+            using (GraphicsPath p = RoundRect(r, radius))
+            using (SolidBrush b = new SolidBrush(c))
+                g.FillPath(b, p);
+        }
+
+        public static void DrawRound(Graphics g, Color c, RectangleF r, float radius, float width)
+        {
+            using (GraphicsPath p = RoundRect(r, radius))
+            using (Pen pen = new Pen(c, width))
+                g.DrawPath(pen, p);
+        }
+
+        public static void Text(Graphics g, string s, Font f, Rectangle r, Color c, TextFormatFlags flags)
+        {
+            TextRenderer.DrawText(g, s, f, r, c, flags | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding);
+        }
+
+        public static void Glyph(Graphics g, string glyph, Font f, Rectangle r, Color c)
+        {
+            if (string.IsNullOrEmpty(glyph) || IconFamily == null) return;
+            TextRenderer.DrawText(g, glyph, f, r, c, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+        }
+
+        public static void PaintParentBackground(Control c, Graphics g)
+        {
+            IBackgroundPainter painter = c.Parent as IBackgroundPainter;
+            if (painter != null) painter.PaintBackgroundFor(c, g);
+            else g.Clear(c.Parent != null ? c.Parent.BackColor : Theme.Canvas);
+        }
+
+        // Classic 16x16 octicon "mark-github" path (M/C/c/L/Z + one circular A segment).
+        private const string GITHUB_PATH = "M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.89-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z";
+
+        public static GraphicsPath GitHubMark()
+        {
+            GraphicsPath path = new GraphicsPath(FillMode.Alternate);
+            MatchCollection tokens = Regex.Matches(GITHUB_PATH, "[MmCcLlZzA]|-?(?:\\d+\\.?\\d*|\\.\\d+)");
+            char cmd = 'M';
+            float cx = 0, cy = 0, sx = 0, sy = 0;
+            List<float> nums = new List<float>();
+            int i = 0;
+            while (i < tokens.Count)
+            {
+                string t = tokens[i].Value;
+                if (char.IsLetter(t[0]))
+                {
+                    cmd = t[0];
+                    i++;
+                    if (cmd == 'Z' || cmd == 'z') { path.CloseFigure(); cx = sx; cy = sy; }
+                    continue;
+                }
+                int need = (cmd == 'C' || cmd == 'c') ? 6 : (cmd == 'A' ? 7 : 2);
+                nums.Clear();
+                while (nums.Count < need && i < tokens.Count && !char.IsLetter(tokens[i].Value[0]))
+                {
+                    nums.Add(float.Parse(tokens[i].Value, CultureInfo.InvariantCulture));
+                    i++;
+                }
+                if (nums.Count < need) break;
+                switch (cmd)
+                {
+                    case 'M':
+                        path.StartFigure(); cx = sx = nums[0]; cy = sy = nums[1]; cmd = 'L'; break;
+                    case 'L':
+                        path.AddLine(cx, cy, nums[0], nums[1]); cx = nums[0]; cy = nums[1]; break;
+                    case 'l':
+                        path.AddLine(cx, cy, cx + nums[0], cy + nums[1]); cx += nums[0]; cy += nums[1]; break;
+                    case 'C':
+                        path.AddBezier(cx, cy, nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]); cx = nums[4]; cy = nums[5]; break;
+                    case 'c':
+                        path.AddBezier(cx, cy, cx + nums[0], cy + nums[1], cx + nums[2], cy + nums[3], cx + nums[4], cy + nums[5]);
+                        cx += nums[4]; cy += nums[5]; break;
+                    case 'A':
+                        AddSvgArc(path, cx, cy, nums[0], nums[3] != 0, nums[4] != 0, nums[5], nums[6]);
+                        cx = nums[5]; cy = nums[6]; break;
+                }
+            }
+            return path;
+        }
+
+        // Circular SVG arc (rx == ry, no rotation) via endpoint-to-center conversion.
+        private static void AddSvgArc(GraphicsPath path, float x0, float y0, float r, bool large, bool sweep, float x, float y)
+        {
+            double x1 = (x0 - x) / 2.0, y1 = (y0 - y) / 2.0;
+            double d2 = x1 * x1 + y1 * y1;
+            if (d2 < 1e-9) return;
+            double rr = Math.Max(r, Math.Sqrt(d2));
+            double coef = Math.Sqrt(Math.Max(0, (rr * rr - d2) / d2));
+            if (large == sweep) coef = -coef;
+            double ccx = coef * y1, ccy = -coef * x1;
+            double centerX = ccx + (x0 + x) / 2.0, centerY = ccy + (y0 + y) / 2.0;
+            double t1 = Math.Atan2((y1 - ccy) / rr, (x1 - ccx) / rr);
+            double t2 = Math.Atan2((-y1 - ccy) / rr, (-x1 - ccx) / rr);
+            double dt = t2 - t1;
+            if (!sweep && dt > 0) dt -= 2 * Math.PI;
+            if (sweep && dt < 0) dt += 2 * Math.PI;
+            path.AddArc((float)(centerX - rr), (float)(centerY - rr), (float)(2 * rr), (float)(2 * rr),
+                (float)(t1 * 180 / Math.PI), (float)(dt * 180 / Math.PI));
+        }
+    }
+
+    public static class Glyphs
+    {
+        public const string Lighting = "\uE706", Dpi = "\uEC4A", Buttons = "\uE962", Settings = "\uE713", Add = "\uE710",
+            More = "\uE712", Refresh = "\uE72C", Lock = "\uE72E", Check = "\uE73E", Download = "\uE896", Warning = "\uE7BA",
+            Play = "\uE768", Save = "\uE74E", Color = "\uE790", Copy = "\uE8C8", Delete = "\uE74D", Rename = "\uE8AC",
+            Power = "\uE7E8", Undo = "\uE7A7";
+    }
+
+    public interface IBackgroundPainter
+    {
+        void PaintBackgroundFor(Control child, Graphics g);
+    }
+
+    // ─── Context menus (profile actions, update pill) ───
+    public class UiColorTable : ProfessionalColorTable
+    {
+        public override Color ToolStripDropDownBackground { get { return Theme.Surface; } }
+        public override Color MenuBorder { get { return Theme.Border; } }
+        public override Color MenuItemBorder { get { return Theme.SurfaceHover; } }
+        public override Color MenuItemSelected { get { return Theme.SurfaceHover; } }
+        public override Color MenuItemSelectedGradientBegin { get { return Theme.SurfaceHover; } }
+        public override Color MenuItemSelectedGradientEnd { get { return Theme.SurfaceHover; } }
+        public override Color ImageMarginGradientBegin { get { return Theme.Surface; } }
+        public override Color ImageMarginGradientMiddle { get { return Theme.Surface; } }
+        public override Color ImageMarginGradientEnd { get { return Theme.Surface; } }
+        public override Color SeparatorDark { get { return Theme.Border; } }
+        public override Color SeparatorLight { get { return Theme.Border; } }
+    }
+
+    public class UiMenuRenderer : ToolStripProfessionalRenderer
+    {
+        public UiMenuRenderer() : base(new UiColorTable()) { RoundedEdges = false; }
+
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            e.TextColor = !e.Item.Enabled ? Theme.TextDisabled : (e.Item.Tag as string == "danger" ? Theme.Danger : Theme.TextPrimary);
+            base.OnRenderItemText(e);
+        }
+
+        public static ContextMenuStrip Create()
+        {
+            ContextMenuStrip m = new ContextMenuStrip();
+            m.Renderer = new UiMenuRenderer();
+            m.Font = Ui.Body;
+            m.ShowImageMargin = false;
+            m.Padding = new Padding(0, Ui.S(4), 0, Ui.S(4));
+            return m;
+        }
+
+        public static ToolStripMenuItem Item(ContextMenuStrip m, string text, EventHandler click)
+        {
+            ToolStripMenuItem it = new ToolStripMenuItem(text);
+            it.Padding = new Padding(Ui.S(6), Ui.S(4), Ui.S(6), Ui.S(4));
+            it.Click += click;
+            m.Items.Add(it);
+            return it;
+        }
+    }
+
+    // ─── Buttons ───
+    public enum UiButtonKind { Primary, Secondary, Ghost, Danger, Warning, HeroIcon, HeroChip }
+
+    public class UiButton : Button
+    {
+        public UiButtonKind Kind;
+        public string Glyph;
+        public GraphicsPath IconPath; // 16x16 design units, owned by the button
+        public bool Active;
+        private bool hover, down;
+
+        public UiButton(UiButtonKind kind, string text, string glyph)
+        {
+            Kind = kind;
+            Text = text ?? "";
+            Glyph = glyph;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            FlatStyle = FlatStyle.Flat;
+            Cursor = Cursors.Hand;
+            Font = kind == UiButtonKind.Primary ? Ui.BodyBold : Ui.Body;
+            UseVisualStyleBackColor = false;
+            if (string.IsNullOrEmpty(text) && glyph != null) AccessibleName = glyph;
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; down = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left) { down = true; Invalidate(); } base.OnMouseDown(e); }
+        protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); base.OnMouseUp(e); }
+        protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && IconPath != null) { IconPath.Dispose(); IconPath = null; }
+            base.Dispose(disposing);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            Color fill = Color.Empty, border = Color.Empty, fore;
+            bool hi = Enabled && (hover || Focused && ShowFocusCues);
+            switch (Kind)
+            {
+                case UiButtonKind.Primary:
+                    fill = !Enabled ? Theme.SurfaceElevated : (down ? Theme.AccentHover : (hover ? Theme.Blend(Theme.Accent, Theme.AccentHover, 0.5f) : Theme.Accent));
+                    fore = Enabled ? Theme.AccentText : Theme.TextDisabled;
+                    break;
+                case UiButtonKind.Secondary:
+                    fill = down ? Theme.Border : (hover && Enabled ? Theme.SurfaceHover : Theme.SurfaceElevated);
+                    border = Theme.Border;
+                    fore = Enabled ? Theme.TextPrimary : Theme.TextDisabled;
+                    break;
+                case UiButtonKind.Ghost:
+                    if (Enabled && (hover || Active)) fill = down ? Theme.SurfaceHover : Theme.SurfaceElevated;
+                    fore = !Enabled ? Theme.TextDisabled : (hover || Active ? Theme.TextPrimary : Theme.TextSecondary);
+                    break;
+                case UiButtonKind.Danger:
+                    fill = hover && Enabled ? Theme.Blend(Theme.DangerSurface, Theme.DangerBorder, 0.4f) : Theme.DangerSurface;
+                    border = Theme.DangerBorder;
+                    fore = Enabled ? Theme.Danger : Theme.TextDisabled;
+                    break;
+                case UiButtonKind.Warning:
+                    fill = hover && Enabled ? Theme.Blend(Theme.WarningSurface, Theme.WarningBorder, 0.35f) : Theme.WarningSurface;
+                    border = Theme.WarningBorder;
+                    fore = Enabled ? Theme.Warning : Theme.TextDisabled;
+                    break;
+                case UiButtonKind.HeroIcon:
+                    int a = Active ? 46 : (down ? 56 : (hover ? 34 : 0));
+                    if (a > 0) fill = Color.FromArgb(a, 255, 255, 255);
+                    fore = Color.FromArgb(Enabled ? (hover || Active ? 255 : 210) : 90, 255, 255, 255);
+                    break;
+                default: // HeroChip
+                    fill = Color.FromArgb(down ? 70 : (hover ? 54 : 36), 255, 255, 255);
+                    border = Color.FromArgb(60, 255, 255, 255);
+                    fore = Color.White;
+                    break;
+            }
+
+            RectangleF rect = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+            float radius = (Kind == UiButtonKind.HeroChip || Kind == UiButtonKind.HeroIcon) ? Height / 2f : Ui.Sf(6);
+            if (!fill.IsEmpty) Ui.FillRound(g, fill, rect, radius);
+            if (!border.IsEmpty) Ui.DrawRound(g, border, rect, radius, 1f);
+            if (Focused && ShowFocusCues && Enabled)
+                Ui.DrawRound(g, Kind == UiButtonKind.Primary ? Theme.TextPrimary : Theme.Accent, new RectangleF(1.5f, 1.5f, Width - 3.5f, Height - 3.5f), radius, Math.Max(1.5f, Ui.Sf(1.5f)));
+
+            bool hasIcon = (Glyph != null && Ui.IconFamily != null) || IconPath != null;
+            int iconSize = Kind == UiButtonKind.HeroIcon ? Ui.S(20) : Ui.S(15);
+            int gap = Text.Length > 0 && hasIcon ? Ui.S(8) : 0;
+            Size ts = Text.Length > 0 ? TextRenderer.MeasureText(g, Text, Font, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix) : Size.Empty;
+            int total = (hasIcon ? iconSize : 0) + gap + ts.Width;
+            int x = (Width - total) / 2;
+            if (hasIcon)
+            {
+                Rectangle ir = new Rectangle(x, (Height - iconSize) / 2, iconSize, iconSize);
+                if (IconPath != null)
+                {
+                    GraphicsState st = g.Save();
+                    g.TranslateTransform(ir.X, ir.Y);
+                    g.ScaleTransform(iconSize / 16f, iconSize / 16f);
+                    using (SolidBrush b = new SolidBrush(fore)) g.FillPath(b, IconPath);
+                    g.Restore(st);
+                }
+                else
+                {
+                    Ui.Glyph(g, Glyph, Kind == UiButtonKind.HeroIcon ? Ui.IconLarge : Ui.IconSmall, ir, fore);
+                }
+                x += iconSize + gap;
+            }
+            if (ts.Width > 0)
+            {
+                Ui.Text(g, Text, Font, new Rectangle(x, 0, ts.Width + 2, Height), fore, TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            }
+        }
+    }
+
+    // ─── Toggle switch ───
+    public class UiToggle : CheckBox
+    {
+        private bool hover;
+        public UiToggle(string text)
+        {
+            Text = text;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            Cursor = Cursors.Hand;
+            Font = Ui.BodyBold;
+        }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnCheckedChanged(EventArgs e) { Invalidate(); base.OnCheckedChanged(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            int tw = Ui.S(40), th = Ui.S(22);
+            RectangleF track = new RectangleF(0.5f, (Height - th) / 2f, tw, th);
+            Color fill = Checked ? (hover ? Theme.AccentHover : Theme.Accent) : (hover ? Theme.SurfaceHover : Theme.SurfaceElevated);
+            Ui.FillRound(g, fill, track, th / 2f);
+            if (!Checked) Ui.DrawRound(g, Theme.Border, track, th / 2f, 1f);
+            float k = th - Ui.Sf(8);
+            float kx = Checked ? track.Right - Ui.Sf(4) - k : track.X + Ui.Sf(4);
+            using (SolidBrush b = new SolidBrush(Checked ? Color.White : Theme.TextSecondary))
+                g.FillEllipse(b, kx, track.Y + Ui.Sf(4), k, k);
+            if (Focused && ShowFocusCues) Ui.DrawRound(g, Theme.Accent, RectangleF.Inflate(track, 2, 2), th / 2f + 2, 1.5f);
+            Ui.Text(g, Text, Font, new Rectangle(tw + Ui.S(12), 0, Width - tw - Ui.S(12), Height), Enabled ? Theme.TextPrimary : Theme.TextDisabled,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+        }
+    }
+
+    // ─── Slider ───
+    public class UiSlider : Control
+    {
+        private int min = 0, max = 100, value = 50;
+        private bool dragging, hover;
+        public event EventHandler ValueChanged;
+        public event EventHandler ValueCommitted;
+
+        public UiSlider()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            TabStop = true;
+            Cursor = Cursors.Hand;
+        }
+
+        public int Minimum { get { return min; } set { min = value; Value = this.value; } }
+        public int Maximum { get { return max; } set { max = value; Value = this.value; } }
+        public int Value
+        {
+            get { return value; }
+            set
+            {
+                int v = Math.Max(min, Math.Min(max, value));
+                if (v == this.value) return;
+                this.value = v;
+                Invalidate();
+                if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+            }
+        }
+
+        private float Pad { get { return Ui.Sf(10); } }
+
+        private void SetFromX(int x)
+        {
+            float w = Width - 2 * Pad;
+            if (w <= 0) return;
+            float t = Math.Max(0, Math.Min(1, (x - Pad) / w));
+            Value = min + (int)Math.Round(t * (max - min));
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            Keys k = keyData & Keys.KeyCode;
+            if (k == Keys.Left || k == Keys.Right || k == Keys.Up || k == Keys.Down) return true;
+            return base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            int step = 0;
+            switch (e.KeyCode)
+            {
+                case Keys.Left: case Keys.Down: step = -1; break;
+                case Keys.Right: case Keys.Up: step = 1; break;
+                case Keys.PageDown: step = -10; break;
+                case Keys.PageUp: step = 10; break;
+                case Keys.Home: Value = min; Commit(); e.Handled = true; return;
+                case Keys.End: Value = max; Commit(); e.Handled = true; return;
+            }
+            if (step != 0) { Value += step; Commit(); e.Handled = true; }
+            base.OnKeyDown(e);
+        }
+
+        private void Commit() { if (ValueCommitted != null) ValueCommitted(this, EventArgs.Empty); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button != MouseButtons.Left) return;
+            Focus();
+            dragging = true;
+            Capture = true;
+            SetFromX(e.X);
+        }
+        protected override void OnMouseMove(MouseEventArgs e) { base.OnMouseMove(e); if (dragging) SetFromX(e.X); }
+        protected override void OnMouseUp(MouseEventArgs e) { base.OnMouseUp(e); if (dragging) { dragging = false; Capture = false; Commit(); } }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float th = Ui.Sf(4), cy = Height / 2f;
+            float w = Width - 2 * Pad;
+            float t = max > min ? (value - min) / (float)(max - min) : 0;
+            Ui.FillRound(g, Theme.SurfaceHover, new RectangleF(Pad, cy - th / 2, w, th), th / 2);
+            Ui.FillRound(g, Enabled ? Theme.Accent : Theme.TextDisabled, new RectangleF(Pad, cy - th / 2, Math.Max(th, w * t), th), th / 2);
+            float kr = Ui.Sf(dragging || hover ? 9 : 8);
+            float kx = Pad + w * t;
+            if (Focused && ShowFocusCues)
+                using (SolidBrush ring = new SolidBrush(Color.FromArgb(60, Theme.Accent)))
+                    g.FillEllipse(ring, kx - kr - Ui.Sf(4), cy - kr - Ui.Sf(4), 2 * kr + Ui.Sf(8), 2 * kr + Ui.Sf(8));
+            using (SolidBrush b = new SolidBrush(Color.White)) g.FillEllipse(b, kx - kr, cy - kr, 2 * kr, 2 * kr);
+            using (Pen p = new Pen(Enabled ? Theme.Accent : Theme.TextDisabled, Ui.Sf(2.5f))) g.DrawEllipse(p, kx - kr, cy - kr, 2 * kr, 2 * kr);
+        }
+    }
+
+    // ─── Segmented control (theme picker) ───
+    public class UiSegmented : Control
+    {
+        public string[] Items = new string[0];
+        private int selected = 0, hoverIndex = -1;
+        public event EventHandler SelectedIndexChanged;
+
+        public UiSegmented()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            TabStop = true;
+            Cursor = Cursors.Hand;
+            Font = Ui.Body;
+        }
+
+        public int SelectedIndex
+        {
+            get { return selected; }
+            set
+            {
+                if (value == selected || value < 0 || value >= Items.Length) return;
+                selected = value;
+                Invalidate();
+                if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
+            }
+        }
+
+        private int IndexAt(int x) { return Items.Length == 0 ? -1 : Math.Max(0, Math.Min(Items.Length - 1, x * Items.Length / Math.Max(1, Width))); }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            Keys k = keyData & Keys.KeyCode;
+            return k == Keys.Left || k == Keys.Right || base.IsInputKey(keyData);
+        }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Left && selected > 0) SelectedIndex = selected - 1;
+            else if (e.KeyCode == Keys.Right && selected < Items.Length - 1) SelectedIndex = selected + 1;
+            base.OnKeyDown(e);
+        }
+        protected override void OnMouseMove(MouseEventArgs e) { int h = IndexAt(e.X); if (h != hoverIndex) { hoverIndex = h; Invalidate(); } base.OnMouseMove(e); }
+        protected override void OnMouseLeave(EventArgs e) { hoverIndex = -1; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { base.OnMouseDown(e); if (e.Button == MouseButtons.Left) { Focus(); SelectedIndex = IndexAt(e.X); } }
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            RectangleF outer = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+            float r = Ui.Sf(8);
+            Ui.FillRound(g, Theme.SurfaceElevated, outer, r);
+            if (Items.Length == 0) return;
+            float segW = (Width - Ui.Sf(8)) / (float)Items.Length;
+            for (int i = 0; i < Items.Length; i++)
+            {
+                RectangleF seg = new RectangleF(Ui.Sf(4) + i * segW, Ui.Sf(4), segW, Height - Ui.Sf(8));
+                if (i == selected)
+                {
+                    Ui.FillRound(g, Theme.IsDark ? Theme.SurfaceHover : Color.White, seg, r - Ui.Sf(3));
+                    if (!Theme.IsDark) Ui.DrawRound(g, Theme.Border, seg, r - Ui.Sf(3), 1f);
+                    if (Focused && ShowFocusCues) Ui.DrawRound(g, Theme.Accent, seg, r - Ui.Sf(3), 1.5f);
+                }
+                Color fc = i == selected ? Theme.TextPrimary : (i == hoverIndex ? Theme.TextPrimary : Theme.TextSecondary);
+                Ui.Text(g, Items[i], i == selected ? Ui.BodyBold : Font, Rectangle.Round(seg), fc,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            }
+        }
+    }
+
+    // ─── Bottom icon tab bar ───
+    public class UiTabBar : Control
+    {
+        private readonly string[] labels, glyphs;
+        private int selected = 0, hoverIndex = -1;
+        public event EventHandler SelectedIndexChanged;
+
+        public UiTabBar(string[] labels, string[] glyphs)
+        {
+            this.labels = labels;
+            this.glyphs = glyphs;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            TabStop = true;
+            Cursor = Cursors.Hand;
+            AccessibleRole = AccessibleRole.PageTabList;
+        }
+
+        // -1 = no tab highlighted (Settings is open).
+        public int SelectedIndex
+        {
+            get { return selected; }
+            set { if (value != selected) { selected = value; Invalidate(); } }
+        }
+
+        private void Pick(int i)
+        {
+            selected = i;
+            Invalidate();
+            if (SelectedIndexChanged != null) SelectedIndexChanged(this, EventArgs.Empty);
+        }
+
+        private int IndexAt(int x) { return Math.Max(0, Math.Min(labels.Length - 1, x * labels.Length / Math.Max(1, Width))); }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            Keys k = keyData & Keys.KeyCode;
+            return k == Keys.Left || k == Keys.Right || base.IsInputKey(keyData);
+        }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            int cur = selected < 0 ? 0 : selected;
+            if (e.KeyCode == Keys.Left) Pick(Math.Max(0, cur - 1));
+            else if (e.KeyCode == Keys.Right) Pick(Math.Min(labels.Length - 1, cur + 1));
+            else if ((e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) && selected < 0) Pick(0);
+            base.OnKeyDown(e);
+        }
+        protected override void OnMouseMove(MouseEventArgs e) { int h = IndexAt(e.X); if (h != hoverIndex) { hoverIndex = h; Invalidate(); } base.OnMouseMove(e); }
+        protected override void OnMouseLeave(EventArgs e) { hoverIndex = -1; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { base.OnMouseDown(e); if (e.Button == MouseButtons.Left) Pick(IndexAt(e.X)); }
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(Theme.Surface);
+            using (Pen p = new Pen(Theme.Border)) g.DrawLine(p, 0, 0, Width, 0);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float w = Width / (float)labels.Length;
+            for (int i = 0; i < labels.Length; i++)
+            {
+                Rectangle cell = new Rectangle((int)(i * w), 0, (int)w, Height);
+                bool sel = i == selected;
+                Color c = sel ? Theme.Accent : (i == hoverIndex ? Theme.TextPrimary : Theme.TextSecondary);
+                if (sel) Ui.FillRound(g, Theme.Accent, new RectangleF(cell.X + cell.Width / 2f - Ui.Sf(18), 0, Ui.Sf(36), Ui.Sf(3)), Ui.Sf(1.5f));
+                Ui.Glyph(g, glyphs[i], Ui.Icon, new Rectangle(cell.X, Ui.S(12), cell.Width, Ui.S(22)), c);
+                Ui.Text(g, labels[i], sel ? Ui.BodyBold : Ui.Small, new Rectangle(cell.X, Ui.S(36), cell.Width, Ui.S(18)), c,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                if (Focused && ShowFocusCues && (sel || (selected < 0 && i == 0)))
+                    Ui.DrawRound(g, Theme.Accent, new RectangleF(cell.X + Ui.Sf(8), Ui.Sf(6), cell.Width - Ui.Sf(16), Height - Ui.Sf(12)), Ui.Sf(6), 1.5f);
+            }
+        }
+    }
+
+    // ─── Rounded card container ───
+    public class RoundPanel : Panel
+    {
+        public Color Fill = Color.Empty, Stroke = Color.Empty;
+        public int Radius = 8;
+
+        public RoundPanel()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e) { }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(Parent != null ? Parent.BackColor : Theme.Canvas);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            RectangleF r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+            Ui.FillRound(g, Fill.IsEmpty ? BackColor : Fill, r, Ui.Sf(Radius));
+            if (!Stroke.IsEmpty) Ui.DrawRound(g, Stroke, r, Ui.Sf(Radius), 1f);
+            base.OnPaint(e);
+        }
+    }
+
+    // ─── Colour swatches + custom "+" swatch ───
+    public class SwatchRow : Control
+    {
+        public Color[] Colors = new Color[0];
+        public string[] Names = new string[0];
+        private Color selectedColor = Color.Empty;
+        private int hoverIndex = -1, focusIndex = 0;
+        public event EventHandler ColorPicked;     // preset chosen (SelectedColor holds it)
+        public event EventHandler CustomRequested; // "+" chosen
+        private readonly ToolTip tip = new ToolTip();
+        private int tipIndex = -2;
+
+        public SwatchRow()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            TabStop = true;
+            Cursor = Cursors.Hand;
+        }
+
+        public Color SelectedColor
+        {
+            get { return selectedColor; }
+            set { selectedColor = value; Invalidate(); }
+        }
+
+        private int Count { get { return Colors.Length + 1; } }
+        private float Cell { get { return Width / (float)Count; } }
+
+        private int IndexAt(int x) { return Math.Max(0, Math.Min(Count - 1, (int)(x / Cell))); }
+
+        private int PresetIndexOf(Color c)
+        {
+            for (int i = 0; i < Colors.Length; i++) if (Colors[i].ToArgb() == c.ToArgb()) return i;
+            return -1;
+        }
+
+        private void Choose(int i)
+        {
+            if (i < Colors.Length)
+            {
+                selectedColor = Colors[i];
+                Invalidate();
+                if (ColorPicked != null) ColorPicked(this, EventArgs.Empty);
+            }
+            else if (CustomRequested != null) CustomRequested(this, EventArgs.Empty);
+        }
+
+        protected override void Dispose(bool disposing) { if (disposing) tip.Dispose(); base.Dispose(disposing); }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            Keys k = keyData & Keys.KeyCode;
+            return k == Keys.Left || k == Keys.Right || base.IsInputKey(keyData);
+        }
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.KeyCode == Keys.Left) { focusIndex = Math.Max(0, focusIndex - 1); Invalidate(); }
+            else if (e.KeyCode == Keys.Right) { focusIndex = Math.Min(Count - 1, focusIndex + 1); Invalidate(); }
+            else if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space) { Choose(focusIndex); e.Handled = true; }
+            base.OnKeyDown(e);
+        }
+        protected override void OnGotFocus(EventArgs e)
+        {
+            int p = PresetIndexOf(selectedColor);
+            focusIndex = p >= 0 ? p : Count - 1;
+            Invalidate();
+            base.OnGotFocus(e);
+        }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            int h = IndexAt(e.X);
+            if (h != hoverIndex) { hoverIndex = h; Invalidate(); }
+            if (h != tipIndex)
+            {
+                tipIndex = h;
+                tip.SetToolTip(this, h < Names.Length ? Names[h] : "Custom colour…");
+            }
+            base.OnMouseMove(e);
+        }
+        protected override void OnMouseLeave(EventArgs e) { hoverIndex = -1; tipIndex = -2; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { base.OnMouseDown(e); if (e.Button == MouseButtons.Left) { focusIndex = IndexAt(e.X); Choose(focusIndex); } }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float d = Math.Min(Cell - Ui.Sf(8), Height - Ui.Sf(8));
+            int sel = PresetIndexOf(selectedColor);
+            for (int i = 0; i < Count; i++)
+            {
+                float cx = i * Cell + Cell / 2f, cy = Height / 2f;
+                float dd = d - (i == hoverIndex ? 0 : Ui.Sf(2));
+                RectangleF r = new RectangleF(cx - dd / 2, cy - dd / 2, dd, dd);
+                bool isSel = i < Colors.Length ? i == sel : (sel < 0 && !selectedColor.IsEmpty);
+                if (i < Colors.Length)
+                {
+                    using (SolidBrush b = new SolidBrush(Colors[i])) g.FillEllipse(b, r);
+                }
+                else if (isSel)
+                {
+                    using (SolidBrush b = new SolidBrush(selectedColor)) g.FillEllipse(b, r);
+                    Ui.Glyph(g, Glyphs.Color, Ui.IconSmall, Rectangle.Round(r), selectedColor.GetBrightness() > 0.6f ? Color.Black : Color.White);
+                }
+                else
+                {
+                    using (Pen p = new Pen(Theme.TextMuted, Ui.Sf(1.5f)) { DashStyle = DashStyle.Dash }) g.DrawEllipse(p, r);
+                    Ui.Glyph(g, Glyphs.Add, Ui.IconSmall, Rectangle.Round(r), Theme.TextSecondary);
+                }
+                if (i < Colors.Length && Colors[i].GetBrightness() > 0.85f)
+                    using (Pen p = new Pen(Theme.Border)) g.DrawEllipse(p, r);
+                if (isSel)
+                {
+                    float o = Ui.Sf(4);
+                    using (Pen p = new Pen(Theme.TextPrimary, Ui.Sf(2))) g.DrawEllipse(p, r.X - o, r.Y - o, r.Width + 2 * o, r.Height + 2 * o);
+                }
+                else if (Focused && ShowFocusCues && i == focusIndex)
+                {
+                    float o = Ui.Sf(4);
+                    using (Pen p = new Pen(Theme.Accent, Ui.Sf(1.5f))) g.DrawEllipse(p, r.X - o, r.Y - o, r.Width + 2 * o, r.Height + 2 * o);
+                }
+            }
+        }
+    }
+
+    // ─── Card-style radio button (background mode) ───
+    // RadioButton "clicks" itself whenever it gains focus without a mouse or Tab (e.g. when the window
+    // is re-activated), which would silently change a setting. These only check on explicit input.
+    public class ExplicitRadio : RadioButton
+    {
+        public ExplicitRadio() { AutoCheck = false; }
+
+        public void Choose()
+        {
+            if (Checked) return;
+            if (Parent != null)
+                foreach (Control c in Parent.Controls)
+                {
+                    ExplicitRadio o = c as ExplicitRadio;
+                    if (o != null && o != this && o.GetType() == GetType()) o.Checked = false;
+                }
+            Checked = true;
+        }
+        protected override void OnMouseClick(MouseEventArgs e) { base.OnMouseClick(e); if (e.Button == MouseButtons.Left) Choose(); }
+        protected override void OnKeyDown(KeyEventArgs e) { base.OnKeyDown(e); if (e.KeyCode == Keys.Space || e.KeyCode == Keys.Enter) { e.Handled = true; Choose(); } }
+    }
+
+    public class OptionCard : ExplicitRadio
+    {
+        public string Description;
+        public string Badge;
+        private bool hover;
+
+        public OptionCard(string title, string description, string badge)
+        {
+            Text = title;
+            Description = description;
+            Badge = badge;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            Cursor = Cursors.Hand;
+            Font = Ui.BodyBold;
+        }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnCheckedChanged(EventArgs e) { Invalidate(); base.OnCheckedChanged(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            RectangleF r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+            Ui.FillRound(g, Checked ? Theme.AccentDim : (hover ? Theme.SurfaceElevated : Theme.Surface), r, Ui.Sf(8));
+            Ui.DrawRound(g, Checked ? Theme.Accent : (Focused && ShowFocusCues ? Theme.Accent : Theme.Border), r, Ui.Sf(8), Checked ? 1.5f : 1f);
+            float d = Ui.Sf(18), cx = Ui.Sf(16), cy = Ui.Sf(16);
+            using (Pen p = new Pen(Checked ? Theme.Accent : Theme.TextMuted, Ui.Sf(1.5f))) g.DrawEllipse(p, cx, cy, d, d);
+            if (Checked) using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillEllipse(b, cx + Ui.Sf(4.5f), cy + Ui.Sf(4.5f), d - Ui.Sf(9), d - Ui.Sf(9));
+            int tx = Ui.S(46);
+            Size ts = TextRenderer.MeasureText(g, Text, Font, Size.Empty, TextFormatFlags.NoPadding);
+            Ui.Text(g, Text, Font, new Rectangle(tx, Ui.S(14), Width - tx - Ui.S(12), Ui.S(20)), Theme.TextPrimary, TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter);
+            if (!string.IsNullOrEmpty(Badge))
+            {
+                Size bs = TextRenderer.MeasureText(g, Badge, Ui.Caption, Size.Empty, TextFormatFlags.NoPadding);
+                RectangleF br = new RectangleF(tx + ts.Width + Ui.S(8), Ui.S(15), bs.Width + Ui.S(12), Ui.S(18));
+                Ui.FillRound(g, Checked ? Theme.Accent : Theme.SurfaceHover, br, br.Height / 2);
+                Ui.Text(g, Badge, Ui.Caption, Rectangle.Round(br), Checked ? Color.White : Theme.TextSecondary,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            }
+            Ui.Text(g, Description, Ui.Small, new Rectangle(tx, Ui.S(36), Width - tx - Ui.S(14), Height - Ui.S(40)), Theme.TextSecondary, TextFormatFlags.WordBreak);
+        }
+    }
+
+    // ─── DPI stage tile ───
+    public class StageTile : ExplicitRadio
+    {
+        public int Dpi;
+        public Color StageColor;
+        private bool hover;
+
+        public StageTile(int dpi, Color stageColor)
+        {
+            Dpi = dpi;
+            StageColor = stageColor;
+            Text = dpi + " DPI";
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            Cursor = Cursors.Hand;
+        }
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnCheckedChanged(EventArgs e) { Invalidate(); base.OnCheckedChanged(e); }
+        protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            bool on = Checked && Enabled;
+            RectangleF r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+            Ui.FillRound(g, on ? Theme.AccentDim : (hover && Enabled ? Theme.SurfaceElevated : Theme.Surface), r, Ui.Sf(8));
+            Ui.DrawRound(g, on ? Theme.Accent : (Focused && ShowFocusCues ? Theme.Accent : Theme.Border), r, Ui.Sf(8), on ? 1.5f : 1f);
+            Color fc = Enabled ? Theme.TextPrimary : Theme.TextDisabled;
+            Ui.Text(g, Dpi.ToString(CultureInfo.InvariantCulture), Ui.Big, new Rectangle(Ui.S(14), Ui.S(12), Width - Ui.S(28), Ui.S(26)), fc, TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter);
+            Ui.Text(g, "DPI", Ui.Caption, new Rectangle(Ui.S(14), Ui.S(40), Width - Ui.S(28), Ui.S(16)), Enabled ? Theme.TextSecondary : Theme.TextDisabled, TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter);
+            using (SolidBrush b = new SolidBrush(Enabled ? StageColor : Theme.TextDisabled))
+                g.FillEllipse(b, Width - Ui.Sf(24), Ui.Sf(14), Ui.Sf(10), Ui.Sf(10));
+            if (on) Ui.Glyph(g, Glyphs.Check, Ui.IconSmall, new Rectangle(Width - Ui.S(30), Height - Ui.S(28), Ui.S(20), Ui.S(20)), Theme.Accent);
+        }
+    }
+
+    // ─── Read-only button binding summary ───
+    public class BindingListView : Control
+    {
+        private AppProfile profile;
+        public int RowHeight { get { return Ui.S(38); } }
+
+        public BindingListView()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        public AppProfile Profile { get { return profile; } set { profile = value; Invalidate(); } }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Ui.FillRound(g, Theme.Surface, new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), Ui.Sf(8));
+            Ui.DrawRound(g, Theme.Border, new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), Ui.Sf(8), 1f);
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            int rh = RowHeight;
+            using (Pen sep = new Pen(Theme.BorderSubtle))
+            {
+                for (int i = 0; i < all.Length; i++)
+                {
+                    ButtonMap.ButtonInfo info = all[i];
+                    int y = i * rh;
+                    if (i > 0) g.DrawLine(sep, Ui.S(14), y, Width - Ui.S(14), y);
+                    string action;
+                    bool custom = false;
+                    if (info.Locked) action = ButtonMap.Describe(info.FactoryAction);
+                    else
+                    {
+                        ButtonAction a = profile != null ? profile.GetBinding(info.Id) : info.FactoryAction;
+                        KeyShortcut ks;
+                        if (a == ButtonAction.Shortcut && profile.TryGetShortcut(info.Id, out ks)) action = KeyShortcuts.Describe(ks);
+                        else action = ButtonMap.Describe(a);
+                        custom = a != info.FactoryAction;
+                    }
+                    Rectangle row = new Rectangle(Ui.S(16), y, Width - Ui.S(32), rh);
+                    Ui.Text(g, info.DisplayName, info.Locked ? Ui.Body : Ui.BodyBold, row, info.Locked ? Theme.TextSecondary : Theme.TextPrimary,
+                        TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                    Rectangle right = new Rectangle(row.X + row.Width / 2 - Ui.S(20), y, row.Width / 2 + Ui.S(20), rh);
+                    if (info.Locked)
+                    {
+                        Ui.Glyph(g, Glyphs.Lock, Ui.IconSmall, new Rectangle(right.Right - Ui.S(16), y, Ui.S(16), rh), Theme.TextMuted);
+                        right.Width -= Ui.S(24);
+                    }
+                    else if (custom)
+                    {
+                        using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillEllipse(b, right.Right - Ui.Sf(8), y + rh / 2f - Ui.Sf(4), Ui.Sf(8), Ui.Sf(8));
+                        right.Width -= Ui.S(18);
+                    }
+                    Ui.Text(g, action, Ui.Body, right, custom ? Theme.Accent : Theme.TextSecondary,
+                        TextFormatFlags.VerticalCenter | TextFormatFlags.Right | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+                }
+            }
+        }
+    }
+
+    // ─── Saved profiles list ───
+    public class ProfileListView : Control
+    {
+        public List<AppProfile> Items = new List<AppProfile>();
+        public string ActiveId;
+        public bool ActiveDirty;
+        public AppProfile ActiveDraft; // live values shown for the active row
+        private int hoverIndex = -1, focusIndex = 0, scrollY = 0;
+        private bool hoverMore;
+        private TextBox editor;
+        private string editingId;
+
+        public event Action<string> ProfileClicked;
+        public event Action<string, Point> MenuRequested;
+        public event Action<string, string> RenameCommitted;
+        public event Action<string> DeleteRequested;
+
+        public ProfileListView()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            TabStop = true;
+            AccessibleRole = AccessibleRole.List;
+            AccessibleName = "Saved profiles";
+        }
+
+        private int RowH { get { return Ui.S(60); } }
+        private int Gap { get { return Ui.S(6); } }
+        private int ContentHeight { get { return Items.Count * (RowH + Gap); } }
+
+        private Rectangle RowRect(int i) { return new Rectangle(Ui.S(12), i * (RowH + Gap) - scrollY, Width - Ui.S(24), RowH); }
+        private Rectangle MoreRect(Rectangle row) { return new Rectangle(row.Right - Ui.S(36), row.Y + (row.Height - Ui.S(28)) / 2, Ui.S(28), Ui.S(28)); }
+
+        private int IndexAt(Point p)
+        {
+            for (int i = 0; i < Items.Count; i++) if (RowRect(i).Contains(p)) return i;
+            return -1;
+        }
+
+        public void RefreshItems()
+        {
+            if (focusIndex >= Items.Count) focusIndex = Math.Max(0, Items.Count - 1);
+            ClampScroll();
+            Invalidate();
+        }
+
+        public void EnsureVisible(string id)
+        {
+            for (int i = 0; i < Items.Count; i++)
+            {
+                if (Items[i].Id != id) continue;
+                focusIndex = i;
+                Rectangle r = RowRect(i);
+                if (r.Top < 0) scrollY += r.Top;
+                else if (r.Bottom > Height) scrollY += r.Bottom - Height + Gap;
+                ClampScroll();
+                Invalidate();
+                return;
+            }
+        }
+
+        private void ClampScroll()
+        {
+            scrollY = Math.Max(0, Math.Min(scrollY, Math.Max(0, ContentHeight - Height)));
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            CommitEdit();
+            scrollY -= e.Delta / 120 * (RowH + Gap);
+            ClampScroll();
+            Invalidate();
+            base.OnMouseWheel(e);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            int h = IndexAt(e.Location);
+            bool m = h >= 0 && MoreRect(RowRect(h)).Contains(e.Location);
+            if (h != hoverIndex || m != hoverMore) { hoverIndex = h; hoverMore = m; Invalidate(); }
+            Cursor = h >= 0 ? Cursors.Hand : Cursors.Default;
+            base.OnMouseMove(e);
+        }
+        protected override void OnMouseLeave(EventArgs e) { hoverIndex = -1; hoverMore = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            Focus();
+            int i = IndexAt(e.Location);
+            if (i < 0) return;
+            focusIndex = i;
+            Invalidate();
+            Rectangle row = RowRect(i);
+            if (e.Button == MouseButtons.Right || MoreRect(row).Contains(e.Location))
+            {
+                Rectangle mr = MoreRect(row);
+                if (MenuRequested != null) MenuRequested(Items[i].Id, PointToScreen(e.Button == MouseButtons.Right ? e.Location : new Point(mr.Left, mr.Bottom)));
+                return;
+            }
+            if (e.Button == MouseButtons.Left && ProfileClicked != null) ProfileClicked(Items[i].Id);
+        }
+
+        protected override void OnDoubleClick(EventArgs e)
+        {
+            base.OnDoubleClick(e);
+            Point p = PointToClient(Cursor.Position);
+            int i = IndexAt(p);
+            if (i >= 0 && !MoreRect(RowRect(i)).Contains(p)) BeginRename(Items[i].Id);
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            Keys k = keyData & Keys.KeyCode;
+            return k == Keys.Up || k == Keys.Down || base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (Items.Count == 0) { base.OnKeyDown(e); return; }
+            string id = Items[Math.Min(focusIndex, Items.Count - 1)].Id;
+            switch (e.KeyCode)
+            {
+                case Keys.Up: focusIndex = Math.Max(0, focusIndex - 1); EnsureVisible(Items[focusIndex].Id); e.Handled = true; break;
+                case Keys.Down: focusIndex = Math.Min(Items.Count - 1, focusIndex + 1); EnsureVisible(Items[focusIndex].Id); e.Handled = true; break;
+                case Keys.Enter: case Keys.Space: if (ProfileClicked != null) ProfileClicked(id); e.Handled = true; break;
+                case Keys.F2: BeginRename(id); e.Handled = true; break;
+                case Keys.Delete: if (DeleteRequested != null) DeleteRequested(id); e.Handled = true; break;
+                case Keys.Apps:
+                    {
+                        Rectangle r = RowRect(focusIndex);
+                        if (MenuRequested != null) MenuRequested(id, PointToScreen(new Point(MoreRect(r).Left, MoreRect(r).Bottom)));
+                        e.Handled = true;
+                        break;
+                    }
+            }
+            if (e.KeyCode == Keys.F10 && e.Shift)
+            {
+                Rectangle r = RowRect(focusIndex);
+                if (MenuRequested != null) MenuRequested(id, PointToScreen(new Point(MoreRect(r).Left, MoreRect(r).Bottom)));
+                e.Handled = true;
+            }
+            base.OnKeyDown(e);
+        }
+
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+        protected override void OnResize(EventArgs e) { ClampScroll(); base.OnResize(e); }
+
+        public void BeginRename(string id)
+        {
+            CommitEdit();
+            int i = -1;
+            for (int k = 0; k < Items.Count; k++) if (Items[k].Id == id) i = k;
+            if (i < 0) return;
+            EnsureVisible(id);
+            Rectangle row = RowRect(i);
+            editingId = id;
+            editor = new TextBox
+            {
+                Text = Items[i].Name,
+                MaxLength = AppProfile.MAX_NAME_LENGTH,
+                BorderStyle = BorderStyle.None,
+                Font = Ui.BodyBold,
+                BackColor = Theme.IsDark ? Theme.Canvas : Color.White,
+                ForeColor = Theme.TextPrimary,
+                Location = new Point(row.X + Ui.S(40), row.Y + Ui.S(12)),
+                Width = row.Width - Ui.S(84),
+                AccessibleName = "Profile name"
+            };
+            editor.KeyDown += delegate(object s, KeyEventArgs ke)
+            {
+                if (ke.KeyCode == Keys.Enter) { ke.SuppressKeyPress = true; CommitEdit(); Focus(); }
+                else if (ke.KeyCode == Keys.Escape) { ke.SuppressKeyPress = true; CancelEdit(); Focus(); }
+            };
+            editor.LostFocus += delegate { CommitEdit(); };
+            Controls.Add(editor);
+            editor.Focus();
+            editor.SelectAll();
+            Invalidate();
+        }
+
+        public void CommitEdit()
+        {
+            if (editor == null) return;
+            TextBox ed = editor;
+            string id = editingId, text = ed.Text;
+            editor = null;
+            editingId = null;
+            Controls.Remove(ed);
+            ed.Dispose();
+            if (RenameCommitted != null) RenameCommitted(id, text);
+            Invalidate();
+        }
+
+        private void CancelEdit()
+        {
+            if (editor == null) return;
+            TextBox ed = editor;
+            editor = null;
+            editingId = null;
+            Controls.Remove(ed);
+            ed.Dispose();
+            Invalidate();
+        }
+
+        private static readonly int[] StageDpi = { 600, 1000, 1200, 1600, 2400, 3200 };
+
+        public static string Describe(AppProfile p)
+        {
+            string s = p.Brightness + "%";
+            if (p.EnableDpi) s += " · " + StageDpi[Math.Max(0, Math.Min(5, p.ActiveDpiStage))] + " DPI";
+            int remaps = 0;
+            ButtonMap.ButtonInfo[] all = ButtonMap.All;
+            for (int i = 0; i < all.Length; i++) if (!all[i].Locked && p.GetBinding(all[i].Id) != all[i].FactoryAction) remaps++;
+            if (remaps > 0) s += " · " + remaps + (remaps == 1 ? " remap" : " remaps");
+            return s;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(BackColor);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            for (int i = 0; i < Items.Count; i++)
+            {
+                Rectangle row = RowRect(i);
+                if (row.Bottom < 0 || row.Top > Height) continue;
+                AppProfile p = Items[i];
+                bool active = p.Id == ActiveId;
+                AppProfile shown = active && ActiveDraft != null ? ActiveDraft : p;
+                bool hov = i == hoverIndex;
+                Color fill = active ? Theme.SurfaceElevated : (hov ? (Theme.IsDark ? Color.FromArgb(31, 34, 42) : Color.FromArgb(244, 245, 248)) : BackColor);
+                RectangleF rf = new RectangleF(row.X + 0.5f, row.Y + 0.5f, row.Width - 1, row.Height - 1);
+                Ui.FillRound(g, fill, rf, Ui.Sf(8));
+                if (active) Ui.DrawRound(g, Theme.Accent, rf, Ui.Sf(8), 1.5f);
+                else if (Focused && ShowFocusCues && i == focusIndex) Ui.DrawRound(g, Theme.Accent, rf, Ui.Sf(8), 1f);
+                if (active && Focused && ShowFocusCues && i == focusIndex)
+                    Ui.DrawRound(g, Theme.TextPrimary, RectangleF.Inflate(rf, -Ui.Sf(3), -Ui.Sf(3)), Ui.Sf(6), 1f);
+
+                Color led = ParseHex(shown.HexColor);
+                float d = Ui.Sf(14);
+                using (SolidBrush b = new SolidBrush(led)) g.FillEllipse(b, row.X + Ui.Sf(16), row.Y + (row.Height - d) / 2f, d, d);
+                if (led.GetBrightness() > 0.85f) using (Pen pn = new Pen(Theme.Border)) g.DrawEllipse(pn, row.X + Ui.Sf(16), row.Y + (row.Height - d) / 2f, d, d);
+
+                int tx = row.X + Ui.S(42);
+                int tw = row.Width - Ui.S(42) - Ui.S(44);
+                if (p.Id != editingId)
+                {
+                    string name = p.Name;
+                    if (active && ActiveDirty) name += " •";
+                    Ui.Text(g, name, Ui.BodyBold, new Rectangle(tx, row.Y + Ui.S(10), tw, Ui.S(20)), Theme.TextPrimary, TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter);
+                }
+                string sub = active ? (ActiveDirty ? "Active · unsaved changes" : "Active · " + Describe(shown)) : Describe(p);
+                Ui.Text(g, sub, Ui.Small, new Rectangle(tx, row.Y + Ui.S(31), tw, Ui.S(18)), active ? (ActiveDirty ? Theme.Warning : Theme.Accent) : Theme.TextSecondary,
+                    TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter);
+
+                if (hov || active || (Focused && i == focusIndex))
+                {
+                    Rectangle mr = MoreRect(row);
+                    if (hov && hoverMore) Ui.FillRound(g, Theme.SurfaceHover, mr, Ui.Sf(6));
+                    Ui.Glyph(g, Glyphs.More, Ui.IconSmall, mr, hov && hoverMore ? Theme.TextPrimary : Theme.TextSecondary);
+                }
+            }
+
+            if (ContentHeight > Height && Height > 0)
+            {
+                float h = Math.Max(Ui.Sf(24), Height * Height / (float)ContentHeight);
+                float y = (Height - h) * scrollY / (float)Math.Max(1, ContentHeight - Height);
+                Ui.FillRound(g, Theme.SurfaceHover, new RectangleF(Width - Ui.Sf(6), y, Ui.Sf(3), h), Ui.Sf(1.5f));
+            }
+        }
+
+        public static Color ParseHex(string hex)
+        {
+            try
+            {
+                string c = (hex ?? "").Trim().TrimStart('#');
+                if (c.Length == 6) return Color.FromArgb(Convert.ToInt32(c.Substring(0, 2), 16), Convert.ToInt32(c.Substring(2, 2), 16), Convert.ToInt32(c.Substring(4, 2), 16));
+            }
+            catch { }
+            return Color.FromArgb(190, 89, 255);
+        }
+    }
+
+    // ─── Left hero: LED-tinted gradient, mouse render, brand, live readout ───
+    public class HeroPanel : Control, IBackgroundPainter
+    {
+        public Bitmap Image;
+        public Color Led = Color.FromArgb(190, 89, 255);
+        public int Brightness = 100;
+        public bool Connected;
+        public string ProfileName = "";
+        public string Readout = "";
+        public string Version = "";
+        public Rectangle ImageRect;
+
+        public HeroPanel()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        private void PaintScene(Graphics g)
+        {
+            float bf = 0.35f + 0.65f * Math.Max(5, Math.Min(100, Brightness)) / 100f;
+            Color baseC = Color.FromArgb(12, 13, 16);
+            Color top = Theme.Blend(baseC, Led, 0.50f * bf);
+            Color bottom = Theme.Blend(baseC, Led, 0.10f * bf);
+            using (LinearGradientBrush lg = new LinearGradientBrush(new Rectangle(0, 0, Math.Max(1, Width), Math.Max(1, Height)), top, bottom, LinearGradientMode.Vertical))
+                g.FillRectangle(lg, 0, 0, Width, Height);
+
+            if (ImageRect.Width > 0)
+            {
+                RectangleF glow = RectangleF.Inflate(ImageRect, ImageRect.Width * 0.75f, ImageRect.Height * 0.18f);
+                using (GraphicsPath gp = new GraphicsPath())
+                {
+                    gp.AddEllipse(glow);
+                    using (PathGradientBrush pg = new PathGradientBrush(gp))
+                    {
+                        pg.CenterColor = Color.FromArgb((int)(150 * bf), Led);
+                        pg.SurroundColors = new Color[] { Color.FromArgb(0, Led) };
+                        pg.FocusScales = new PointF(0.15f, 0.35f);
+                        g.FillPath(pg, gp);
+                    }
+                }
+            }
+        }
+
+        public void PaintBackgroundFor(Control child, Graphics g)
+        {
+            GraphicsState st = g.Save();
+            g.TranslateTransform(-child.Left, -child.Top);
+            PaintScene(g);
+            g.Restore(st);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            PaintScene(g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            if (Image != null) g.DrawImageUnscaled(Image, ImageRect.X, ImageRect.Y);
+
+            Color white = Color.White, soft = Color.FromArgb(200, 255, 255, 255), faint = Color.FromArgb(150, 255, 255, 255);
+            Ui.Text(g, "REDGEAR", Ui.Brand, new Rectangle(Ui.S(24), Ui.S(22), Ui.S(200), Ui.S(16)), soft, TextFormatFlags.SingleLine);
+            Ui.Text(g, "A20", Ui.Title, new Rectangle(Ui.S(24), Ui.S(38), Ui.S(200), Ui.S(28)), white, TextFormatFlags.SingleLine);
+
+            Color dot = Connected ? Color.FromArgb(52, 211, 153) : Color.FromArgb(248, 113, 113);
+            using (SolidBrush b = new SolidBrush(dot)) g.FillEllipse(b, Ui.Sf(25), Ui.Sf(76), Ui.Sf(8), Ui.Sf(8));
+            Ui.Text(g, Connected ? "Connected" : "Not connected", Ui.Small, new Rectangle(Ui.S(40), Ui.S(70), Ui.S(160), Ui.S(20)), soft,
+                TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter);
+
+            Ui.Text(g, ProfileName, Ui.HeroName, new Rectangle(Ui.S(16), Ui.S(470), Width - Ui.S(32), Ui.S(28)), white,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter);
+            Ui.Text(g, Readout, Ui.Small, new Rectangle(Ui.S(16), Ui.S(500), Width - Ui.S(32), Ui.S(20)), faint,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter);
+
+            Ui.Text(g, Version, Ui.Small, new Rectangle(Width - Ui.S(120), Height - Ui.S(52), Ui.S(96), Ui.S(32)), faint,
+                TextFormatFlags.Right | TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter);
+        }
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -1568,52 +3145,68 @@ namespace RedgearA20ControlCenter
     // ═════════════════════════════════════════════════════════════════════════
     public class MainForm : Form
     {
-        // UI Controls
-        private Panel body;
-        private Label lblStatus;
-        private Panel pnlColorPreview;
+        // ─── UI (built when the window is shown, torn down when hidden; null while hidden) ───
+        private bool uiBuilt = false;
+        private bool rebuildPending = false;
+        private bool suppressUiEvents = false;
+        private bool systemThemeHooked = false;
+        private ToolTip tips;
+        private Bitmap heroImage;
+        private HeroPanel hero;
+        private UiButton btnGitHub, btnSettings, btnRefresh, btnUpdatePill;
+        private Panel pnlProfiles, pnlRight, pnlActions, pnlSettings;
+        private Panel[] pages;
+        private ProfileListView profileList;
+        private UiButton btnNewProfile;
+        private Label lblPageTitle, lblPageSubtitle, lblDirty;
+        private UiButton btnPreview, btnSave;
+        private UiTabBar tabBar;
+        private int currentPage = 0; // 0 Lighting, 1 DPI, 2 Buttons, 3 Settings
+        private int lastTabPage = 0;
+        private string statusText;
+
+        // Lighting
+        private SwatchRow swatches;
         private TextBox txtHex;
-        private Button btnPickColor;
-        private TrackBar tbBrightness;
+        private UiSlider sliderBrightness;
         private Label lblBrightnessVal;
-        private Button btnApply;
-        private Button btnSave;
-        private Button btnReset;
-
-        // Persistence & Startup UI (3-Mode Selection)
-        private Panel gbPersistence;
-        private RadioButton rbStealth;
-        private RadioButton rbTrayAgent;
-        private RadioButton rbDisabled;
-
-        // Experimental DPI section
-        private CheckBox cbEnableDpi;
-        private Panel gbDpi;
-        private ComboBox cmbDpiStages;
-        private Button btnTestDpi;
-
-        // Button remapping section
-        private Label lblRemapSummary;
-        private Button btnOpenMapper;
-
-        // Diagnostic Log Panel
+        // DPI
+        private UiToggle tglDpi;
+        private StageTile[] stageTiles;
+        private UiButton btnTestDpi;
+        // Buttons
+        private BindingListView bindingList;
+        private UiButton btnOpenMapper;
+        // Settings
+        private UiSegmented segTheme;
+        private OptionCard rbStealth, rbTrayAgent, rbDisabled;
+        private Label lblUpdateStatus;
+        private UiButton btnCheckUpdates, btnFactoryReset;
         private RichTextBox rtbLog;
-        private Button btnClearLog;
-        private Button btnCopyLog;
-        private Button btnRefresh;
-        private Button btnExit;
-        private Button[] presetButtons;
+
+        private static readonly string[] PresetNames = { "Lavender", "Purple", "Cyan", "Ice Blue", "Mint", "Green", "Gold", "Pink", "White" };
+        private static readonly Color[] PresetColors = {
+            Color.FromArgb(190, 89, 255), Color.FromArgb(180, 0, 255), Color.FromArgb(0, 255, 255),
+            Color.FromArgb(64, 165, 255), Color.FromArgb(50, 255, 150), Color.FromArgb(0, 255, 0),
+            Color.FromArgb(255, 180, 0), Color.FromArgb(255, 50, 140), Color.FromArgb(255, 255, 255)
+        };
+        private static readonly int[] StageDpi = { 600, 1000, 1200, 1600, 2400, 3200 };
+        private static readonly Color[] StageColors = {
+            Color.FromArgb(59, 130, 246), Color.FromArgb(250, 204, 21), Color.FromArgb(34, 197, 94),
+            Color.FromArgb(168, 85, 247), Color.FromArgb(34, 211, 238), Color.FromArgb(229, 231, 235)
+        };
+        private const string REPO_URL = "https://github.com/" + UpdateManager.REPO;
+
+        // Diagnostic log: bounded in-memory ring, mirrored into the Settings terminal when it exists.
+        private struct LogLine { public string Text; public Color Color; }
+        private readonly Queue<LogLine> logLines = new Queue<LogLine>();
+        private const int LOG_CAPACITY = 300;
 
         // Updates (stable channel via GitHub Releases)
-        private Panel pnlHeader;
-        private Panel pnlUpdateBanner;
-        private Label lblUpdate;
-        private Button btnUpdateNow;
-        private Button btnUpdateNotes;
-        private Button btnUpdateLater;
-        private Button btnCheckUpdates;
         private System.Windows.Forms.Timer updateTimer;
         private UpdateInfo pendingUpdate;
+        private bool updatePillHidden = false;
+        private string updateProgressText;
         private Version balloonNotifiedVersion;
         private bool updateBalloonActive = false;
         private bool isCheckingUpdate = false;
@@ -1626,24 +3219,30 @@ namespace RedgearA20ControlCenter
         private ContextMenuStrip trayMenu;
         private System.Windows.Forms.Timer usbDebounceTimer;
 
-        // Cross-process "show control center" signal (replaces unreliable HWND_BROADCAST IPC)
+        // Cross-process "show control center" / "exit" signals (named events)
         private EventWaitHandle showSignalEvent;
         private RegisteredWaitHandle showSignalWait;
+        private EventWaitHandle exitSignalEvent;
+        private RegisteredWaitHandle exitSignalWait;
+        public const string EXIT_EVENT_NAME = @"Local\RedgearA20_Exit_Event";
+        public const string SINGLE_INSTANCE_MUTEX = "RedgearA20ControlCenter_SingleInstance";
 
         // Internal State
-        private Color currentColor = Color.FromArgb(190, 89, 255); // Soft Lavender default
-        private int currentBrightness = 100;
         // volatile: written from background stealth-startup Task.Run and hotplug retries,
         // read from the UI thread (Win32 message pump + async continuations).
         private volatile string cachedDevicePath = null;
         private volatile int cachedUsagePage = 0;
         private volatile bool isSavingInProgress = false;
-        private AppProfile currentProfile;
+        private AppProfile currentProfile; // saved active profile (what the watcher applies)
+        private AppProfile draft;          // editor copy of the active profile
+        private ProfileLibrary library;
+        private bool mouseShowsDraft = false;
         private bool startHidden = false;
         private bool isStealth = false;
         private bool isExplicitlyRestoring = false;
         private bool balloonShownOnce = false;
         private volatile bool isExiting = false;
+        private volatile bool forcedExit = false;
         private bool isHotplugHandling = false;
         private volatile bool pendingShowSignal = false;
 
@@ -1699,7 +3298,7 @@ namespace RedgearA20ControlCenter
             {
                 if (Environment.OSVersion.Version.Major >= 10)
                 {
-                    int useDarkMode = 1;
+                    int useDarkMode = Theme.IsDark ? 1 : 0;
                     if (DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ref useDarkMode, sizeof(int)) != 0)
                     {
                         DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref useDarkMode, sizeof(int));
@@ -1715,18 +3314,7 @@ namespace RedgearA20ControlCenter
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            try
-            {
-                if (Environment.OSVersion.Version.Major >= 10)
-                {
-                    int useDarkMode = 1;
-                    if (DwmSetWindowAttribute(this.Handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref useDarkMode, sizeof(int)) != 0)
-                    {
-                        DwmSetWindowAttribute(this.Handle, DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20H1, ref useDarkMode, sizeof(int));
-                    }
-                }
-            }
-            catch { }
+            ApplyDarkTitleBar(this.Handle);
 
             // A second instance may signal before this form has a window handle.
             // Remember it and replay the request as soon as the handle exists.
@@ -1742,7 +3330,8 @@ namespace RedgearA20ControlCenter
             // Windows shutdown / Task Manager must never be blocked by our
             // "keep running in background" behavior.
             bool systemClose = e.CloseReason == CloseReason.WindowsShutDown ||
-                               e.CloseReason == CloseReason.TaskManagerClosing;
+                               e.CloseReason == CloseReason.TaskManagerClosing ||
+                               forcedExit;
             bool exitAuthorized = isExiting ||
                                   e.CloseReason == CloseReason.ApplicationExitCall ||
                                   systemClose;
@@ -1755,6 +3344,13 @@ namespace RedgearA20ControlCenter
                 // must still minimize to the watcher as usual.
                 isExiting = false;
                 return;
+            }
+
+            if (!systemClose && !isUpdating && uiBuilt && this.Visible)
+            {
+                if (profileList != null) profileList.CommitEdit();
+                CommitHexEdit(false);
+                if (IsDirty() && !ResolveDirtyOnClose(e)) return;
             }
 
             if (!exitAuthorized && currentProfile != null && (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
@@ -1778,6 +3374,53 @@ namespace RedgearA20ControlCenter
             }
 
             base.OnFormClosing(e);
+        }
+
+        // Returns true when closing may continue right away; otherwise the close is cancelled
+        // and (for Save / revert) re-issued once the async work has finished.
+        private bool ResolveDirtyOnClose(FormClosingEventArgs e)
+        {
+            DialogResult dr = MessageBox.Show(this,
+                string.Format("Save the changes to \"{0}\"?", currentProfile.Name),
+                "Unsaved Changes", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            bool wasExit = isExiting || e.CloseReason == CloseReason.ApplicationExitCall;
+            if (dr == DialogResult.Cancel)
+            {
+                e.Cancel = true;
+                isExiting = false;
+                return false;
+            }
+
+            Func<Task<bool>> work;
+            if (dr == DialogResult.Yes)
+            {
+                work = SaveDraftAsync;
+            }
+            else
+            {
+                draft = currentProfile.Clone();
+                statusText = null;
+                LoadDraftIntoUi();
+                if (!mouseShowsDraft || string.IsNullOrEmpty(cachedDevicePath))
+                {
+                    mouseShowsDraft = false;
+                    return true;
+                }
+                // The mouse still shows the discarded preview: put the saved profile back first.
+                mouseShowsDraft = false;
+                work = delegate { return ApplyProfileAsync(currentProfile, true); };
+            }
+
+            e.Cancel = true;
+            isExiting = false;
+            BeginInvoke(new Action(async delegate
+            {
+                bool ok = await work();
+                if (dr == DialogResult.Yes && !ok) return;
+                if (wasExit) RequestExit();
+                else Close();
+            }));
+            return false;
         }
 
         protected override void Dispose(bool disposing)
@@ -1817,6 +3460,23 @@ namespace RedgearA20ControlCenter
                     try { showSignalEvent.Close(); } catch { }
                     showSignalEvent = null;
                 }
+                if (exitSignalWait != null)
+                {
+                    try { exitSignalWait.Unregister(null); } catch { }
+                    exitSignalWait = null;
+                }
+                if (exitSignalEvent != null)
+                {
+                    try { exitSignalEvent.Close(); } catch { }
+                    exitSignalEvent = null;
+                }
+                if (systemThemeHooked)
+                {
+                    SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+                    systemThemeHooked = false;
+                }
+                if (heroImage != null) { heroImage.Dispose(); heroImage = null; }
+                if (tips != null) { tips.Dispose(); tips = null; }
             }
             base.Dispose(disposing);
         }
@@ -1837,11 +3497,41 @@ namespace RedgearA20ControlCenter
                 value = false;
                 if (!this.IsHandleCreated) CreateHandle();
             }
+            if (value && !uiBuilt)
+            {
+                if (!this.IsHandleCreated) CreateHandle(); // per-monitor DPI needs the window handle
+                BuildUi();
+            }
             base.SetVisibleCore(value);
         }
 
+        private const int WM_DPICHANGED = 0x02E0;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT { public int Left, Top, Right, Bottom; }
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOZORDER = 0x0004;
+        private const uint SWP_NOACTIVATE = 0x0010;
+
         protected override void WndProc(ref Message m)
         {
+            if (m.Msg == WM_DPICHANGED)
+            {
+                // Rebuild at the new scale, then take the position Windows suggests.
+                if (uiBuilt)
+                {
+                    rebuildPending = true;
+                    RebuildUi();
+                }
+                RECT r = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
+                SetWindowPos(Handle, IntPtr.Zero, r.Left, r.Top, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+                m.Result = IntPtr.Zero;
+                return;
+            }
+
             base.WndProc(ref m);
 
             if (m.Msg == WM_DEVICECHANGE)
@@ -1928,7 +3618,7 @@ namespace RedgearA20ControlCenter
             trayMenu.Items.Add(miOpen);
 
             ToolStripMenuItem miApply = new ToolStripMenuItem("Apply Profile Now");
-            miApply.Click += async delegate { await ApplyCurrentProfileAsync(silent: false); };
+            miApply.Click += async delegate { await ApplyProfileAsync(currentProfile, false); };
             trayMenu.Items.Add(miApply);
 
             ToolStripMenuItem miUpdates = new ToolStripMenuItem("Check for Updates");
@@ -2042,25 +3732,16 @@ namespace RedgearA20ControlCenter
 
         private void ShowUpdateBanner(UpdateInfo info)
         {
+            bool isNew = pendingUpdate == null || !pendingUpdate.Version.Equals(info.Version);
             pendingUpdate = info;
-            lblUpdate.Text = string.Format("⬆  {0} is available", UpdateManager.Display(info.Version));
-            btnUpdateNow.Text = info.DownloadUrl != null ? "Update Now" : "Download";
-            btnUpdateNow.Enabled = btnUpdateLater.Enabled = true;
-            if (pnlUpdateBanner.Visible) return;
-
-            int shift = pnlUpdateBanner.Height + (pnlUpdateBanner.Top - pnlHeader.Bottom);
-            pnlUpdateBanner.Visible = true;
-            body.Top += shift;
-            this.ClientSize = new Size(this.ClientSize.Width, this.ClientSize.Height + shift);
+            if (isNew) updatePillHidden = false;
+            RefreshUpdatePill();
         }
 
         private void HideUpdateBanner()
         {
-            if (!pnlUpdateBanner.Visible) return;
-            int shift = pnlUpdateBanner.Height + (pnlUpdateBanner.Top - pnlHeader.Bottom);
-            pnlUpdateBanner.Visible = false;
-            body.Top -= shift;
-            this.ClientSize = new Size(this.ClientSize.Width, this.ClientSize.Height - shift);
+            updatePillHidden = true;
+            RefreshUpdatePill();
         }
 
         // Stealth mode has no tray icon, so it is shown just long enough to carry the notification.
@@ -2114,15 +3795,16 @@ namespace RedgearA20ControlCenter
             // isSavingInProgress blocks hardware operations and exit while files are being swapped.
             isUpdating = true;
             isSavingInProgress = true;
-            body.Enabled = false;
-            btnUpdateNow.Enabled = btnUpdateLater.Enabled = false;
+            SetUiBusy(true);
+            updateProgressText = "Updating…";
+            RefreshUpdatePill();
             bool restarting = false;
 
             try
             {
                 Action<string> progress = delegate(string s)
                 {
-                    try { BeginInvoke(new Action(delegate { lblUpdate.Text = s; Log(s, Theme.TextSecondary); })); } catch { }
+                    try { BeginInvoke(new Action(delegate { updateProgressText = s; RefreshUpdatePill(); Log(s, Theme.TextSecondary); })); } catch { }
                 };
 
                 UpdateResult result;
@@ -2179,8 +3861,9 @@ namespace RedgearA20ControlCenter
                 if (!restarting)
                 {
                     isSavingInProgress = false;
-                    if (!body.IsDisposed) body.Enabled = true;
-                    if (!btnUpdateNow.IsDisposed) btnUpdateNow.Enabled = btnUpdateLater.Enabled = true;
+                    updateProgressText = null;
+                    SetUiBusy(false);
+                    RefreshUpdatePill();
                 }
             }
         }
@@ -2216,7 +3899,12 @@ namespace RedgearA20ControlCenter
                     balloonShownOnce = true;
                 }
             }
-            TrimMemory();
+            // Free the whole UI while hidden (unless there are unsaved edits to keep).
+            if (uiBuilt && !IsDirty())
+            {
+                try { BeginInvoke(new Action(TearDownUi)); } catch { TrimMemory(); }
+            }
+            else TrimMemory();
         }
 
         private void RestoreGui()
@@ -2231,7 +3919,7 @@ namespace RedgearA20ControlCenter
             this.BringToFront();
             this.Activate();
             RefreshDeviceConnection();
-            UpdateColorPreview();
+            RefreshDraftState();
         }
 
         private void InitUsbWatcher()
@@ -2260,6 +3948,53 @@ namespace RedgearA20ControlCenter
             {
                 Debug.WriteLine("Show-signal init error: " + ex.Message);
             }
+
+            // "RedgearA20.exe --shutdown" (used by Setup and the uninstaller) asks us to quit cleanly.
+            try
+            {
+                exitSignalEvent = new EventWaitHandle(false, EventResetMode.AutoReset, EXIT_EVENT_NAME);
+                exitSignalWait = ThreadPool.RegisterWaitForSingleObject(exitSignalEvent, OnExitSignalFired, null, Timeout.Infinite, true);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("Exit-signal init error: " + ex.Message);
+            }
+        }
+
+        private void OnExitSignalFired(object state, bool timedOut)
+        {
+            if (timedOut) return;
+            forcedExit = true;
+            isExiting = true;
+            try
+            {
+                if (this.IsDisposed || !this.IsHandleCreated) return;
+                this.BeginInvoke(new Action(delegate { Application.Exit(); }));
+            }
+            catch { }
+        }
+
+        // Signals a running instance to exit and waits (up to ~5 s) for it to release its lock.
+        public static int SignalShutdown()
+        {
+            try
+            {
+                EventWaitHandle ev;
+                if (EventWaitHandle.TryOpenExisting(EXIT_EVENT_NAME, out ev))
+                {
+                    using (ev) ev.Set();
+                }
+                else return 0;
+                for (int i = 0; i < 50; i++)
+                {
+                    Mutex m;
+                    if (!Mutex.TryOpenExisting(SINGLE_INSTANCE_MUTEX, out m)) return 0;
+                    m.Dispose();
+                    Thread.Sleep(100);
+                }
+                return 1;
+            }
+            catch { return 1; }
         }
 
         private void OnShowSignalFired(object state, bool timedOut)
@@ -2310,8 +4045,8 @@ namespace RedgearA20ControlCenter
                     }
                     else
                     {
-                        await ApplyCurrentProfileAsync(silent: true);
-                        TrimMemory();
+                        if (await ApplyProfileAsync(currentProfile, true)) mouseShowsDraft = false;
+                        if (!this.Visible) TrimMemory();
                     }
                 }
             }
@@ -2335,8 +4070,6 @@ namespace RedgearA20ControlCenter
             this.isStealth = stealth;
             this.justUpdated = updated;
             this.currentProfile = AppProfile.Load();
-            this.currentColor = ParseColor(currentProfile.HexColor);
-            this.currentBrightness = Math.Max(5, Math.Min(100, currentProfile.Brightness));
 
             InitForm();
             ShortcutEngine.Log = Log;
@@ -2346,7 +4079,6 @@ namespace RedgearA20ControlCenter
             InitUpdateChecker();
 
             RefreshDeviceConnection();
-            UpdateColorPreview();
 
             if (justUpdated)
             {
@@ -2361,7 +4093,7 @@ namespace RedgearA20ControlCenter
                 {
                     if (currentProfile != null && currentProfile.Mode != PersistenceMode.Disabled)
                     {
-                        await ApplyCurrentProfileAsync(silent: true);
+                        await ApplyProfileAsync(currentProfile, true);
                     }
                 };
             }
@@ -2388,7 +4120,7 @@ namespace RedgearA20ControlCenter
                         if (!string.IsNullOrEmpty(cachedDevicePath) && currentProfile != null &&
                             (currentProfile.Mode == PersistenceMode.StealthWatcher || currentProfile.Mode == PersistenceMode.TrayAgent))
                         {
-                            await ApplyCurrentProfileAsync(silent: true);
+                            await ApplyProfileAsync(currentProfile, true);
                         }
                         await Task.Delay(1000);
                         TrimMemory();
@@ -2401,711 +4133,719 @@ namespace RedgearA20ControlCenter
             }
         }
 
-        private Panel CreateSectionPanel(Point loc, Size size, string title, string badge, bool isWarning)
-        {
-            Panel pnl = new Panel
-            {
-                Location = loc,
-                Size = size,
-                BackColor = isWarning ? Theme.WarningSurface : Theme.Surface,
-                BorderStyle = BorderStyle.None
-            };
-
-            Pen pen = isWarning ? Theme.PenWarning : Theme.PenBorder;
-            pnl.Paint += delegate(object s, PaintEventArgs e)
-            {
-                e.Graphics.DrawRectangle(pen, 0, 0, pnl.Width - 1, pnl.Height - 1);
-            };
-
-            Label lblTitle = new Label
-            {
-                Text = title,
-                Location = new Point(12, 8),
-                AutoSize = true,
-                Font = Theme.FontHeading,
-                ForeColor = isWarning ? Theme.Warning : Theme.TextPrimary
-            };
-            pnl.Controls.Add(lblTitle);
-
-            if (!string.IsNullOrEmpty(badge))
-            {
-                int badgeWidth = badge.Length * 7 + 16;
-                Label lblBadge = new Label
-                {
-                    Text = badge,
-                    Location = new Point(size.Width - 12 - badgeWidth, 8),
-                    Size = new Size(badgeWidth, 18),
-                    TextAlign = ContentAlignment.MiddleCenter,
-                    Font = Theme.FontBadge,
-                    BackColor = isWarning ? Color.FromArgb(48, 34, 16) : Theme.SurfaceElevated,
-                    ForeColor = isWarning ? Theme.Warning : Theme.TextSecondary
-                };
-                Pen badgePen = isWarning ? Theme.PenWarning : Theme.PenBorderSubtle;
-                lblBadge.Paint += delegate(object s, PaintEventArgs e)
-                {
-                    e.Graphics.DrawRectangle(badgePen, 0, 0, lblBadge.Width - 1, lblBadge.Height - 1);
-                };
-                pnl.Controls.Add(lblBadge);
-            }
-
-            return pnl;
-        }
-
-        private void OnPresetButtonClick(Button b, Color color)
-        {
-            currentColor = color;
-            txtHex.Text = string.Format("#{0:X2}{1:X2}{2:X2}", currentColor.R, currentColor.G, currentColor.B);
-            UpdateColorPreview();
-
-            if (presetButtons != null)
-            {
-                for (int j = 0; j < presetButtons.Length; j++)
-                {
-                    bool isActive = (presetButtons[j] == b);
-                    presetButtons[j].FlatAppearance.BorderColor = isActive ? Theme.Accent : Theme.Border;
-                    presetButtons[j].ForeColor = isActive ? Color.White : Theme.TextSecondary;
-                }
-            }
-        }
-
         private void InitForm()
         {
             this.Text = "Redgear A20 Control Center " + UpdateManager.Display(UpdateManager.CurrentVersion);
-            this.Size = new Size(580, 835);
+            this.AutoScaleMode = AutoScaleMode.None;
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
             this.MaximizeBox = false;
             this.BackColor = Theme.Canvas;
-            this.ForeColor = Theme.TextPrimary;
-            this.Font = Theme.FontBodyPrimary;
-            this.AutoScaleMode = AutoScaleMode.Dpi;
+            this.ClientSize = new Size(1060, 640);
+        }
 
-            // 1. Connection Header Banner
-            pnlHeader = new Panel
-            {
-                Dock = DockStyle.Top,
-                Height = 44,
-                BackColor = Color.FromArgb(24, 26, 32)
-            };
-            pnlHeader.Paint += delegate(object s, PaintEventArgs e)
-            {
-                e.Graphics.DrawLine(Theme.PenBorderSubtle, 0, pnlHeader.Height - 1, pnlHeader.Width, pnlHeader.Height - 1);
-            };
+        // ─── LAZY UI LIFECYCLE ───
+        [DllImport("user32.dll")]
+        private static extern uint GetDpiForWindow(IntPtr hwnd);
 
-            lblStatus = new Label
+        private float GetWindowScale()
+        {
+            try
             {
-                Text = "● Searching for Redgear A20...",
+                if (IsHandleCreated)
+                {
+                    uint dpi = GetDpiForWindow(Handle);
+                    if (dpi > 0) return dpi / 96f;
+                }
+            }
+            catch { }
+            try
+            {
+                using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) return g.DpiX / 96f;
+            }
+            catch { return 1f; }
+        }
+
+        private static Bitmap LoadHeroImage(int targetHeight)
+        {
+            try
+            {
+                using (Stream s = typeof(MainForm).Assembly.GetManifestResourceStream("RedgearA20.mouse.png"))
+                {
+                    if (s == null) return null;
+                    using (Image src = Image.FromStream(s))
+                    {
+                        int h = targetHeight;
+                        int w = Math.Max(1, (int)Math.Round(src.Width * (double)h / src.Height));
+                        Bitmap bmp = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+                        using (Graphics g = Graphics.FromImage(bmp))
+                        {
+                            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                            g.CompositingQuality = CompositingQuality.HighQuality;
+                            g.DrawImage(src, new Rectangle(0, 0, w, h));
+                        }
+                        return bmp;
+                    }
+                }
+            }
+            catch { return null; }
+        }
+
+        private void BuildUi()
+        {
+            if (uiBuilt) return;
+            uiBuilt = true;
+            if (currentProfile == null) currentProfile = new AppProfile();
+            if (library == null) library = ProfileLibrary.Load(currentProfile);
+            if (draft == null) { draft = currentProfile.Clone(); mouseShowsDraft = false; }
+
+            Theme.Apply(Theme.ResolveDark(currentProfile.ThemePref));
+            Ui.Init(GetWindowScale());
+
+            SuspendLayout();
+            BackColor = Theme.Canvas;
+            ForeColor = Theme.TextPrimary;
+            Font = Ui.Body;
+            ClientSize = new Size(Ui.S(1060), Ui.S(640));
+            tips = new ToolTip();
+
+            BuildHero();
+            BuildProfilesColumn();
+            BuildRightColumn();
+            ResumeLayout(false);
+
+            if (IsHandleCreated) ApplyDarkTitleBar(Handle);
+            if (!systemThemeHooked)
+            {
+                SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+                systemThemeHooked = true;
+            }
+
+            LoadDraftIntoUi();
+            RefreshUpdatePill();
+            ShowPage(currentPage);
+        }
+
+        private void DisposeUiControls()
+        {
+            uiBuilt = false;
+            if (systemThemeHooked)
+            {
+                SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+                systemThemeHooked = false;
+            }
+            SuspendLayout();
+            List<Control> old = new List<Control>();
+            foreach (Control c in Controls) old.Add(c);
+            Controls.Clear();
+            foreach (Control c in old) c.Dispose();
+            ResumeLayout(false);
+            if (tips != null) { tips.Dispose(); tips = null; }
+            if (heroImage != null) { heroImage.Dispose(); heroImage = null; }
+
+            hero = null; btnGitHub = btnSettings = btnRefresh = btnUpdatePill = null;
+            pnlProfiles = pnlRight = pnlActions = pnlSettings = null; pages = null;
+            profileList = null; btnNewProfile = null;
+            lblPageTitle = lblPageSubtitle = lblDirty = null;
+            btnPreview = btnSave = null; tabBar = null;
+            swatches = null; txtHex = null; sliderBrightness = null; lblBrightnessVal = null;
+            tglDpi = null; stageTiles = null; btnTestDpi = null;
+            bindingList = null; btnOpenMapper = null;
+            segTheme = null; rbStealth = rbTrayAgent = rbDisabled = null;
+            lblUpdateStatus = null; btnCheckUpdates = btnFactoryReset = null; rtbLog = null;
+        }
+
+        private void TearDownUi()
+        {
+            if (!uiBuilt || this.Visible || IsDirty()) return;
+            DisposeUiControls();
+            draft = null;
+            library = null;
+            mouseShowsDraft = false;
+            TrimMemory();
+        }
+
+        private void RebuildUi()
+        {
+            rebuildPending = false;
+            if (!uiBuilt) return;
+            if (profileList != null) profileList.CommitEdit();
+            CommitHexEdit(false);
+            DisposeUiControls();
+            BuildUi();
+        }
+
+        private void ScheduleRebuild()
+        {
+            if (rebuildPending || !uiBuilt) return;
+            rebuildPending = true;
+            try { BeginInvoke(new Action(RebuildUi)); } catch { rebuildPending = false; }
+        }
+
+        private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (e.Category != UserPreferenceCategory.General) return;
+            if (currentProfile == null || currentProfile.ThemePref != 0) return;
+            try
+            {
+                BeginInvoke(new Action(delegate
+                {
+                    if (uiBuilt && Theme.ResolveDark(0) != Theme.IsDark) ScheduleRebuild();
+                }));
+            }
+            catch { }
+        }
+
+        // ─── UI CONSTRUCTION ───
+        private Label MakeLabel(Control parent, string text, Font font, Color color, Rectangle bounds)
+        {
+            Label l = new Label
+            {
+                Text = text,
+                Font = font,
+                ForeColor = color,
+                Bounds = bounds,
                 AutoSize = false,
-                Dock = DockStyle.Fill,
-                TextAlign = ContentAlignment.MiddleLeft,
-                Padding = new Padding(14, 0, 175, 0),
-                Font = Theme.FontBodyBold,
-                ForeColor = Theme.TextSecondary
+                UseMnemonic = false,
+                BackColor = parent.BackColor
             };
+            parent.Controls.Add(l);
+            return l;
+        }
 
-            btnRefresh = new Button
+        private Label Caption(Control parent, string text, int x, int y)
+        {
+            return MakeLabel(parent, text.ToUpperInvariant(), Ui.Caption, Theme.TextMuted, Ui.R(x, y, 416, 18));
+        }
+
+        private Label Note(Control parent, string text, int x, int y, int h, Color color)
+        {
+            return MakeLabel(parent, text, Ui.Small, color, Ui.R(x, y, 416, h));
+        }
+
+        private UiButton MakeButton(Control parent, UiButtonKind kind, string text, string glyph, Rectangle bounds, string tip)
+        {
+            UiButton b = new UiButton(kind, text, glyph) { Bounds = bounds };
+            if (!string.IsNullOrEmpty(tip))
             {
-                Text = "Refresh",
-                Size = new Size(75, 26),
-                Location = new Point(390, 9),
-                BackColor = Theme.SurfaceElevated,
-                ForeColor = Theme.TextPrimary,
-                Font = Theme.FontBodySecondary,
-                FlatStyle = FlatStyle.Flat,
-                TabIndex = 0,
-                AccessibleName = "Refresh USB HID connection status"
+                tips.SetToolTip(b, tip);
+                if (string.IsNullOrEmpty(text)) b.AccessibleName = tip;
+            }
+            parent.Controls.Add(b);
+            return b;
+        }
+
+        private void BuildHero()
+        {
+            hero = new HeroPanel
+            {
+                Bounds = Ui.R(0, 0, 316, 640),
+                Version = UpdateManager.Display(UpdateManager.CurrentVersion),
+                Connected = !string.IsNullOrEmpty(cachedDevicePath)
             };
-            btnRefresh.FlatAppearance.BorderColor = Theme.Border;
-            btnRefresh.FlatAppearance.BorderSize = 1;
+            heroImage = LoadHeroImage(Ui.S(300));
+            hero.Image = heroImage;
+            if (heroImage != null)
+                hero.ImageRect = new Rectangle((hero.Width - heroImage.Width) / 2, Ui.S(130), heroImage.Width, heroImage.Height);
+
+            btnGitHub = MakeButton(hero, UiButtonKind.HeroIcon, "", null, Ui.R(20, 580, 40, 40), "Open the project on GitHub");
+            btnGitHub.IconPath = Ui.GitHubMark();
+            btnGitHub.Click += delegate { UpdateManager.OpenInBrowser(REPO_URL); };
+
+            btnSettings = MakeButton(hero, UiButtonKind.HeroIcon, "", Glyphs.Settings, Ui.R(66, 580, 40, 40), "Settings");
+            btnSettings.Click += delegate { ShowPage(currentPage == 3 ? lastTabPage : 3); };
+
+            btnRefresh = MakeButton(hero, UiButtonKind.HeroIcon, "", Glyphs.Refresh, Ui.R(112, 580, 40, 40), "Refresh mouse connection");
             btnRefresh.Click += delegate { RefreshDeviceConnection(); };
 
-            btnExit = new Button
+            btnUpdatePill = MakeButton(hero, UiButtonKind.HeroChip, "", Glyphs.Download, Ui.R(150, 22, 142, 30), "A new version is available");
+            btnUpdatePill.Font = Ui.Small;
+            btnUpdatePill.Visible = false;
+            btnUpdatePill.Click += delegate { ShowUpdateMenu(); };
+
+            Controls.Add(hero);
+        }
+
+        private void BuildProfilesColumn()
+        {
+            pnlProfiles = new Panel { Bounds = Ui.R(316, 0, 264, 640), BackColor = Theme.Surface };
+            pnlProfiles.Paint += delegate(object s, PaintEventArgs e)
             {
-                Text = "Exit App",
-                Size = new Size(75, 26),
-                Location = new Point(475, 9),
-                BackColor = Theme.DangerSurface,
-                ForeColor = Theme.Danger,
-                Font = Theme.FontBodySecondary,
-                FlatStyle = FlatStyle.Flat,
-                TabIndex = 1,
-                AccessibleName = "Completely exit application and stop background watcher"
-            };
-            btnExit.FlatAppearance.BorderColor = Theme.DangerBorder;
-            btnExit.FlatAppearance.BorderSize = 1;
-
-            ToolTip tipExit = new ToolTip();
-            tipExit.SetToolTip(btnExit, "Completely stops the driver and background persistence.\nTo close this window while keeping persistence active, click the [X] button.");
-            btnExit.Click += delegate
-            {
-                string warningText =
-                    "⚠️ WARNING: This will completely SHUT DOWN Redgear A20 Control Center AND STOP the background persistence watcher!\n\n" +
-                    "• If you terminate the driver, your mouse settings will NOT persist across USB unplugs, port switches, or system reboots.\n\n" +
-                    "💡 RECOMMENDED ACTION:\n" +
-                    "If you only want to close this window and keep auto-apply persistence running silently in the background (~1.8 MB RAM, 0% CPU):\n" +
-                    "👉 Click 'No' and simply close this window using the Windows Close [X] button in the top-right corner.\n\n" +
-                    "Are you sure you want to completely exit and STOP the persistence facility?";
-
-                DialogResult dr = MessageBox.Show(
-                    warningText,
-                    "⚠️ Stop Driver Persistence & Exit?",
-                    MessageBoxButtons.YesNo,
-                    MessageBoxIcon.Warning,
-                    MessageBoxDefaultButton.Button2
-                );
-
-                if (dr == DialogResult.Yes)
-                {
-                    RequestExit();
-                }
+                using (Pen p = new Pen(Theme.Border)) e.Graphics.DrawLine(p, pnlProfiles.Width - 1, 0, pnlProfiles.Width - 1, pnlProfiles.Height);
             };
 
-            pnlHeader.Controls.Add(btnRefresh);
-            pnlHeader.Controls.Add(btnExit);
-            pnlHeader.Controls.Add(lblStatus);
-            this.Controls.Add(pnlHeader);
+            MakeLabel(pnlProfiles, "Profiles", Ui.Title, Theme.TextPrimary, Ui.R(24, 22, 170, 30));
+            MakeLabel(pnlProfiles, "Click a profile to apply it", Ui.Small, Theme.TextSecondary, Ui.R(24, 54, 190, 20));
 
-            // Update banner: hidden until a newer stable release is found; pushes the body down.
-            pnlUpdateBanner = new Panel
-            {
-                Location = new Point(15, 52),
-                Size = new Size(535, 36),
-                BackColor = Theme.AccentDim,
-                Visible = false
-            };
-            pnlUpdateBanner.Paint += delegate(object s, PaintEventArgs e)
-            {
-                e.Graphics.DrawRectangle(Theme.PenAccent, 0, 0, pnlUpdateBanner.Width - 1, pnlUpdateBanner.Height - 1);
-            };
+            btnNewProfile = MakeButton(pnlProfiles, UiButtonKind.Ghost, "", Glyphs.Add, Ui.R(212, 26, 36, 36), "New profile from the current settings");
+            btnNewProfile.Click += delegate { NewProfile(); };
 
-            lblUpdate = new Label
-            {
-                Location = new Point(12, 0),
-                Size = new Size(250, 36),
-                TextAlign = ContentAlignment.MiddleLeft,
-                Font = Theme.FontBodyBold,
-                ForeColor = Theme.TextPrimary,
-                AutoEllipsis = true,
-                BackColor = Color.Transparent
-            };
-            pnlUpdateBanner.Controls.Add(lblUpdate);
+            profileList = new ProfileListView { Bounds = Ui.R(0, 88, 263, 540), BackColor = Theme.Surface };
+            profileList.ProfileClicked += ActivateProfile;
+            profileList.MenuRequested += ShowProfileMenu;
+            profileList.RenameCommitted += RenameProfile;
+            profileList.DeleteRequested += DeleteProfile;
+            pnlProfiles.Controls.Add(profileList);
 
-            btnUpdateNotes = new Button
-            {
-                Text = "What's New",
-                Location = new Point(267, 5),
-                Size = new Size(90, 26),
-                BackColor = Theme.SurfaceElevated,
-                ForeColor = Theme.TextPrimary,
-                Font = Theme.FontBodySecondary,
-                FlatStyle = FlatStyle.Flat,
-                AccessibleName = "Open the release notes for the new version"
-            };
-            btnUpdateNotes.FlatAppearance.BorderColor = Theme.Border;
-            btnUpdateNotes.FlatAppearance.BorderSize = 1;
-            btnUpdateNotes.Click += delegate
-            {
-                UpdateManager.OpenInBrowser(pendingUpdate != null ? pendingUpdate.PageUrl : UpdateManager.RELEASES_PAGE);
-            };
-            pnlUpdateBanner.Controls.Add(btnUpdateNotes);
+            Controls.Add(pnlProfiles);
+        }
 
-            btnUpdateNow = new Button
+        private void BuildRightColumn()
+        {
+            pnlRight = new Panel { Bounds = Ui.R(580, 0, 480, 640), BackColor = Theme.Canvas };
+
+            lblPageTitle = MakeLabel(pnlRight, "", Ui.Title, Theme.TextPrimary, Ui.R(32, 22, 416, 30));
+            lblPageSubtitle = MakeLabel(pnlRight, "", Ui.Subtitle, Theme.TextSecondary, Ui.R(32, 54, 416, 20));
+
+            pages = new Panel[3];
+            for (int i = 0; i < 3; i++)
             {
-                Text = "Update Now",
-                Location = new Point(363, 5),
-                Size = new Size(100, 26),
-                BackColor = Theme.Accent,
-                ForeColor = Theme.AccentText,
-                Font = Theme.FontBodyBold,
-                FlatStyle = FlatStyle.Flat,
-                AccessibleName = "Download and install the newest stable version"
-            };
-            btnUpdateNow.FlatAppearance.BorderColor = Theme.AccentHover;
-            btnUpdateNow.FlatAppearance.BorderSize = 1;
-            btnUpdateNow.Click += BtnUpdateNow_Click;
-            pnlUpdateBanner.Controls.Add(btnUpdateNow);
+                pages[i] = new Panel { Bounds = Ui.R(0, 84, 480, 428), BackColor = Theme.Canvas, Visible = false };
+                pnlRight.Controls.Add(pages[i]);
+            }
+            BuildLightingPage(pages[0]);
+            BuildDpiPage(pages[1]);
+            BuildButtonsPage(pages[2]);
 
-            btnUpdateLater = new Button
+            pnlSettings = new Panel { Bounds = Ui.R(0, 84, 480, 492), BackColor = Theme.Canvas, AutoScroll = true, Visible = false };
+            BuildSettingsPage(pnlSettings);
+            pnlRight.Controls.Add(pnlSettings);
+
+            pnlActions = new Panel { Bounds = Ui.R(0, 512, 480, 64), BackColor = Theme.Canvas };
+            lblDirty = MakeLabel(pnlActions, "", Ui.Small, Theme.Warning, Ui.R(32, 0, 160, 64));
+            lblDirty.TextAlign = ContentAlignment.MiddleLeft;
+            lblDirty.AutoEllipsis = true;
+            btnPreview = MakeButton(pnlActions, UiButtonKind.Secondary, "Preview", Glyphs.Play, Ui.R(196, 14, 110, 36), "Send these settings to the mouse's RAM without saving");
+            btnPreview.Click += BtnPreview_Click;
+            btnSave = MakeButton(pnlActions, UiButtonKind.Primary, "Save Profile", Glyphs.Save, Ui.R(316, 14, 132, 36), "Save this profile and apply it (Ctrl+S)");
+            btnSave.Click += BtnSave_Click;
+            pnlRight.Controls.Add(pnlActions);
+
+            tabBar = new UiTabBar(new string[] { "Lighting", "DPI", "Buttons" }, new string[] { Glyphs.Lighting, Glyphs.Dpi, Glyphs.Buttons })
             {
-                Text = "Later",
-                Location = new Point(469, 5),
-                Size = new Size(54, 26),
-                BackColor = Theme.Surface,
-                ForeColor = Theme.TextSecondary,
-                Font = Theme.FontBodySecondary,
-                FlatStyle = FlatStyle.Flat,
-                AccessibleName = "Hide the update notice for now"
+                Bounds = Ui.R(0, 576, 480, 64),
+                AccessibleName = "Settings sections"
             };
-            btnUpdateLater.FlatAppearance.BorderColor = Theme.Border;
-            btnUpdateLater.FlatAppearance.BorderSize = 1;
-            btnUpdateLater.Click += delegate { HideUpdateBanner(); };
-            pnlUpdateBanner.Controls.Add(btnUpdateLater);
+            tabBar.SelectedIndexChanged += delegate { ShowPage(tabBar.SelectedIndex); };
+            pnlRight.Controls.Add(tabBar);
 
-            this.Controls.Add(pnlUpdateBanner);
+            Controls.Add(pnlRight);
+        }
 
-            // Container Panel
-            body = new Panel { Location = new Point(15, 52), Size = new Size(535, 735) };
+        private void BuildLightingPage(Panel p)
+        {
+            Caption(p, "Colour", 32, 8);
+            swatches = new SwatchRow { Bounds = Ui.R(28, 30, 424, 48), Colors = PresetColors, Names = PresetNames, AccessibleName = "Colour presets" };
+            swatches.ColorPicked += delegate { if (!suppressUiEvents) SetDraftColor(swatches.SelectedColor); };
+            swatches.CustomRequested += delegate { PickCustomColor(); };
+            p.Controls.Add(swatches);
 
-            // ─── Group 1: Colour Selection ───
-            Panel gbColor = CreateSectionPanel(new Point(0, 0), new Size(535, 115), "1. LED Colour Selection", "Verified Cmd 0x14", false);
-
-            pnlColorPreview = new Panel
-            {
-                Location = new Point(12, 34),
-                Size = new Size(52, 32),
-                BorderStyle = BorderStyle.None,
-                BackColor = currentColor,
-                AccessibleName = "Current RGB Color Swatch Preview"
-            };
-            pnlColorPreview.Paint += delegate(object s, PaintEventArgs e)
-            {
-                e.Graphics.DrawRectangle(Theme.PenBorder, 0, 0, pnlColorPreview.Width - 1, pnlColorPreview.Height - 1);
-            };
-            gbColor.Controls.Add(pnlColorPreview);
-
-            btnPickColor = new Button
-            {
-                Text = "Pick Colour...",
-                Location = new Point(72, 35),
-                Size = new Size(95, 28),
-                BackColor = Theme.SurfaceElevated,
-                ForeColor = Theme.TextPrimary,
-                Font = Theme.FontBodySecondary,
-                FlatStyle = FlatStyle.Flat,
-                TabIndex = 2,
-                AccessibleName = "Open Windows Color Picker dialog"
-            };
-            btnPickColor.FlatAppearance.BorderColor = Theme.Border;
-            btnPickColor.FlatAppearance.BorderSize = 1;
-            btnPickColor.Click += BtnPickColor_Click;
-            gbColor.Controls.Add(btnPickColor);
-
-            Label lblHex = new Label
-            {
-                Text = "Hex:",
-                Location = new Point(178, 41),
-                AutoSize = true,
-                ForeColor = Theme.TextSecondary,
-                Font = Theme.FontBodySecondary
-            };
+            RoundPanel hexBox = new RoundPanel { Bounds = Ui.R(32, 92, 132, 36), Fill = Theme.SurfaceElevated, Stroke = Theme.Border, BackColor = Theme.SurfaceElevated };
             txtHex = new TextBox
             {
-                Text = currentProfile != null ? currentProfile.HexColor : "#BE59FF",
-                Location = new Point(212, 37),
-                Size = new Size(85, 24),
+                BorderStyle = BorderStyle.None,
+                Font = Ui.Body,
                 BackColor = Theme.SurfaceElevated,
                 ForeColor = Theme.TextPrimary,
-                BorderStyle = BorderStyle.FixedSingle,
-                Font = Theme.FontMono,
-                TextAlign = HorizontalAlignment.Center,
                 MaxLength = 7,
-                TabIndex = 3,
-                AccessibleName = "Hex Color Code"
+                TextAlign = HorizontalAlignment.Center,
+                AccessibleName = "Hex colour code"
             };
-            txtHex.Leave += TxtHex_Leave;
-            txtHex.KeyDown += delegate(object s, KeyEventArgs e) { if (e.KeyCode == Keys.Enter) TxtHex_Leave(s, e); };
-            gbColor.Controls.Add(lblHex);
-            gbColor.Controls.Add(txtHex);
-
-            // Quick Preset Buttons (9 Presets, 53px width each, 4px spacing)
-            string[] presetNames = new string[] { "Lavender", "Purple", "Cyan", "Ice Blue", "Mint", "Green", "Gold", "Pink", "White" };
-            Color[] presetColors = new Color[] {
-                Color.FromArgb(190, 89, 255), Color.FromArgb(180, 0, 255), Color.FromArgb(0, 255, 255),
-                Color.FromArgb(64, 165, 255), Color.FromArgb(50, 255, 150), Color.FromArgb(0, 255, 0),
-                Color.FromArgb(255, 180, 0), Color.FromArgb(255, 50, 140), Color.FromArgb(255, 255, 255)
-            };
-
-            presetButtons = new Button[presetNames.Length];
-            int qx = 12;
-            for (int i = 0; i < presetNames.Length; i++)
+            txtHex.Bounds = new Rectangle(Ui.S(10), (Ui.S(36) - txtHex.PreferredHeight) / 2, Ui.S(112), txtHex.PreferredHeight);
+            txtHex.Leave += delegate { CommitHexEdit(true); };
+            txtHex.KeyDown += delegate(object s, KeyEventArgs e)
             {
-                Color pColor = presetColors[i];
-                bool isInitSelected = (currentColor.ToArgb() == pColor.ToArgb());
-                Button btnPreset = new Button
+                if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; CommitHexEdit(true); }
+            };
+            hexBox.Controls.Add(txtHex);
+            p.Controls.Add(hexBox);
+
+            UiButton btnPick = MakeButton(p, UiButtonKind.Secondary, "Custom colour", Glyphs.Color, Ui.R(176, 92, 150, 36), "Open the colour picker");
+            btnPick.Click += delegate { PickCustomColor(); };
+
+            Caption(p, "Brightness", 32, 156);
+            lblBrightnessVal = MakeLabel(p, "", Ui.BodyBold, Theme.Accent, Ui.R(348, 152, 100, 22));
+            lblBrightnessVal.TextAlign = ContentAlignment.MiddleRight;
+            lblBrightnessVal.BringToFront();
+            sliderBrightness = new UiSlider { Bounds = Ui.R(22, 178, 436, 36), Minimum = 5, Maximum = 100, AccessibleName = "Brightness" };
+            sliderBrightness.ValueChanged += delegate
+            {
+                lblBrightnessVal.Text = sliderBrightness.Value + "%";
+                if (suppressUiEvents) return;
+                draft.Brightness = sliderBrightness.Value;
+                OnDraftChanged();
+            };
+            p.Controls.Add(sliderBrightness);
+
+            Note(p, "Colour and brightness apply to all six DPI stages as a static light. Preview sends them to the mouse's RAM; Save Profile also restores them on replug and reboot.",
+                32, 232, 60, Theme.TextSecondary);
+        }
+
+        private void BuildDpiPage(Panel p)
+        {
+            tglDpi = new UiToggle("Send a DPI stage with this profile") { Bounds = Ui.R(32, 6, 416, 32) };
+            tglDpi.CheckedChanged += delegate
+            {
+                UpdateDpiEnabledState();
+                if (suppressUiEvents) return;
+                draft.EnableDpi = tglDpi.Checked;
+                OnDraftChanged();
+            };
+            p.Controls.Add(tglDpi);
+            Note(p, "Experimental: Cmd 0x09 is not verified on every firmware revision.", 32, 42, 20, Theme.TextSecondary);
+
+            Caption(p, "Active stage", 32, 82);
+            stageTiles = new StageTile[6];
+            for (int i = 0; i < 6; i++)
+            {
+                int stage = i;
+                StageTile t = new StageTile(StageDpi[i], StageColors[i])
                 {
-                    Text = presetNames[i],
-                    Location = new Point(qx, 76),
-                    Size = new Size(53, 24),
-                    BackColor = Theme.SurfaceElevated,
-                    ForeColor = isInitSelected ? Color.White : Theme.TextSecondary,
-                    Font = Theme.FontBadge,
-                    FlatStyle = FlatStyle.Flat,
-                    Tag = pColor,
-                    TabIndex = 4 + i,
-                    AccessibleName = presetNames[i] + " color preset"
+                    Bounds = Ui.R(32 + (i % 3) * 144, 106 + (i / 3) * 88, 128, 72),
+                    AccessibleName = "Stage " + i + ", " + StageDpi[i] + " DPI"
                 };
-                btnPreset.FlatAppearance.BorderColor = isInitSelected ? Theme.Accent : Theme.Border;
-                btnPreset.FlatAppearance.BorderSize = 1;
-                btnPreset.Click += delegate(object s, EventArgs e)
+                t.CheckedChanged += delegate
                 {
-                    Button b = (Button)s;
-                    OnPresetButtonClick(b, (Color)b.Tag);
+                    if (suppressUiEvents || !t.Checked) return;
+                    draft.ActiveDpiStage = stage;
+                    OnDraftChanged();
                 };
-                presetButtons[i] = btnPreset;
-                gbColor.Controls.Add(btnPreset);
-                qx += 57;
+                stageTiles[i] = t;
+                p.Controls.Add(t);
             }
-            body.Controls.Add(gbColor);
 
-            // ─── Group 2: Brightness Control ───
-            Panel gbBright = CreateSectionPanel(new Point(0, 123), new Size(535, 68), "2. Brightness Slider", "PWM Proportion Scaling", false);
-
-            tbBrightness = new TrackBar
-            {
-                Location = new Point(12, 30),
-                Size = new Size(445, 30),
-                Minimum = 5,
-                Maximum = 100,
-                Value = currentBrightness,
-                TickFrequency = 10,
-                TickStyle = TickStyle.None,
-                BackColor = Theme.Surface,
-                TabIndex = 13,
-                AccessibleName = "Brightness Percentage Slider"
-            };
-            tbBrightness.ValueChanged += delegate
-            {
-                currentBrightness = tbBrightness.Value;
-                lblBrightnessVal.Text = currentBrightness.ToString() + "%";
-                UpdateColorPreview();
-            };
-            gbBright.Controls.Add(tbBrightness);
-
-            lblBrightnessVal = new Label
-            {
-                Text = currentBrightness.ToString() + "%",
-                Location = new Point(462, 32),
-                Size = new Size(60, 24),
-                TextAlign = ContentAlignment.MiddleRight,
-                Font = Theme.FontHeading,
-                ForeColor = Theme.Accent
-            };
-            gbBright.Controls.Add(lblBrightnessVal);
-            body.Controls.Add(gbBright);
-
-            // ─── Action Buttons (Safe Decoupled Architecture) ───
-            Panel pnlActions = new Panel { Location = new Point(0, 199), Size = new Size(535, 36) };
-
-            btnApply = new Button
-            {
-                Text = "▶ Apply (RAM)",
-                Location = new Point(0, 0),
-                Size = new Size(155, 36),
-                BackColor = Theme.SurfaceElevated,
-                ForeColor = Theme.TextPrimary,
-                Font = Theme.FontBodyBold,
-                FlatStyle = FlatStyle.Flat,
-                TabIndex = 14,
-                AccessibleName = "Apply settings to mouse volatile RAM"
-            };
-            btnApply.FlatAppearance.BorderColor = Theme.Border;
-            btnApply.FlatAppearance.BorderSize = 1;
-            btnApply.Click += BtnApply_Click;
-            pnlActions.Controls.Add(btnApply);
-
-            btnSave = new Button
-            {
-                Text = "💾 Save Profile",
-                Location = new Point(163, 0),
-                Size = new Size(209, 36),
-                BackColor = Theme.Accent,
-                ForeColor = Theme.AccentText,
-                Font = Theme.FontBodyBold,
-                FlatStyle = FlatStyle.Flat,
-                TabIndex = 15,
-                AccessibleName = "Save profile and enable auto-apply persistence"
-            };
-            btnSave.FlatAppearance.BorderColor = Theme.AccentHover;
-            btnSave.FlatAppearance.BorderSize = 1;
-            btnSave.Click += BtnSave_Click;
-            pnlActions.Controls.Add(btnSave);
-
-            btnReset = new Button
-            {
-                Text = "↺ Reset Profile",
-                Location = new Point(380, 0),
-                Size = new Size(155, 36),
-                BackColor = Theme.Surface,
-                ForeColor = Theme.TextSecondary,
-                Font = Theme.FontBodyPrimary,
-                FlatStyle = FlatStyle.Flat,
-                TabIndex = 16,
-                AccessibleName = "Reset mouse to factory default profile"
-            };
-            btnReset.FlatAppearance.BorderColor = Theme.Border;
-            btnReset.FlatAppearance.BorderSize = 1;
-            btnReset.Click += BtnReset_Click;
-            pnlActions.Controls.Add(btnReset);
-
-            body.Controls.Add(pnlActions);
-
-            // ─── Group 3: Persistence Mode (Instant A704 Auto-Apply) ───
-            gbPersistence = CreateSectionPanel(new Point(0, 243), new Size(535, 96), "3. Persistence Mode", "Instant A704 Auto-Apply", false);
-
-            rbStealth = new RadioButton
-            {
-                Text = "Stealth Driver Watcher (Invisible, No Tray Icon, ~1.8 MB RAM — Recommended)",
-                Location = new Point(14, 28),
-                Size = new Size(505, 20),
-                ForeColor = Theme.TextPrimary,
-                Font = Theme.FontBodyBold,
-                Checked = currentProfile == null || currentProfile.Mode == PersistenceMode.StealthWatcher,
-                TabIndex = 17
-            };
-            gbPersistence.Controls.Add(rbStealth);
-
-            rbTrayAgent = new RadioButton
-            {
-                Text = "Tray Agent Mode (~2.7 MB RAM, quick access tray icon)",
-                Location = new Point(14, 49),
-                Size = new Size(505, 20),
-                ForeColor = Theme.TextSecondary,
-                Font = Theme.FontBodyPrimary,
-                Checked = currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent,
-                TabIndex = 18
-            };
-            gbPersistence.Controls.Add(rbTrayAgent);
-
-            rbDisabled = new RadioButton
-            {
-                Text = "Disabled (RAM only - profile resets when mouse is unplugged or PC restarts)",
-                Location = new Point(14, 70),
-                Size = new Size(505, 20),
-                ForeColor = Theme.TextMuted,
-                Font = Theme.FontBodySecondary,
-                Checked = currentProfile != null && currentProfile.Mode == PersistenceMode.Disabled,
-                TabIndex = 19
-            };
-            gbPersistence.Controls.Add(rbDisabled);
-            body.Controls.Add(gbPersistence);
-
-            // ─── Group 4: EXPERIMENTAL - DPI Controls ───
-            gbDpi = CreateSectionPanel(new Point(0, 347), new Size(535, 78), "4. Experimental DPI Stages", "Cmd 0x09", true);
-
-            cbEnableDpi = new CheckBox
-            {
-                Text = "Enable Experimental DPI Controls (unverified Cmd 0x09)",
-                Location = new Point(14, 25),
-                Size = new Size(505, 20),
-                ForeColor = Theme.Warning,
-                Font = Theme.FontBodyBold,
-                Checked = currentProfile != null && currentProfile.EnableDpi,
-                TabIndex = 20
-            };
-            cbEnableDpi.CheckedChanged += delegate
-            {
-                bool enabled = cbEnableDpi.Checked;
-                cmbDpiStages.Enabled = enabled;
-                btnTestDpi.Enabled = enabled;
-            };
-            gbDpi.Controls.Add(cbEnableDpi);
-
-            Label lblSelectDpi = new Label
-            {
-                Text = "Target Stage:",
-                Location = new Point(14, 48),
-                Size = new Size(85, 20),
-                ForeColor = Theme.TextSecondary,
-                Font = Theme.FontBodySecondary
-            };
-            cmbDpiStages = new ComboBox
-            {
-                Location = new Point(102, 46),
-                Size = new Size(278, 24),
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                BackColor = Theme.SurfaceElevated,
-                ForeColor = Theme.TextPrimary,
-                Font = Theme.FontBodyPrimary,
-                Enabled = currentProfile != null && currentProfile.EnableDpi,
-                TabIndex = 21
-            };
-            cmbDpiStages.Items.AddRange(new object[] {
-                "Stage 0: 600 DPI (Default Blue)",
-                "Stage 1: 1000 DPI (Default Yellow)",
-                "Stage 2: 1200 DPI (Default Green)",
-                "Stage 3: 1600 DPI (Default Purple)",
-                "Stage 4: 2400 DPI (Default Cyan)",
-                "Stage 5: 3200 DPI (Default White)"
-            });
-            cmbDpiStages.SelectedIndex = currentProfile != null ? Math.Max(0, Math.Min(5, currentProfile.ActiveDpiStage)) : 1;
-            try { SetWindowTheme(cmbDpiStages.Handle, "DarkMode_Explorer", null); } catch { }
-
-            gbDpi.Controls.Add(lblSelectDpi);
-            gbDpi.Controls.Add(cmbDpiStages);
-
-            btnTestDpi = new Button
-            {
-                Text = "Test DPI (RAM)",
-                Location = new Point(390, 44),
-                Size = new Size(133, 26),
-                BackColor = Color.FromArgb(48, 32, 12),
-                ForeColor = Theme.Warning,
-                Font = Theme.FontBodyBold,
-                FlatStyle = FlatStyle.Flat,
-                Enabled = currentProfile != null && currentProfile.EnableDpi,
-                TabIndex = 22,
-                AccessibleName = "Test selected DPI stage in volatile RAM"
-            };
-            btnTestDpi.FlatAppearance.BorderColor = Theme.WarningBorder;
-            btnTestDpi.FlatAppearance.BorderSize = 1;
+            btnTestDpi = MakeButton(p, UiButtonKind.Warning, "Test stage (RAM only)", Glyphs.Play, Ui.R(32, 284, 200, 36), "Send only the selected DPI stage to the mouse");
             btnTestDpi.Click += BtnTestDpi_Click;
-            gbDpi.Controls.Add(btnTestDpi);
+            Note(p, "Testing changes the mouse's RAM only. Unplugging the mouse restores its previous stage.", 32, 330, 40, Theme.Warning);
+        }
 
-            body.Controls.Add(gbDpi);
-
-            // ─── Group 5: Button Remapping (Cmd 0x10) ───
-            Panel gbRemap = CreateSectionPanel(new Point(0, 433), new Size(535, 62), "5. Button Remapping", "Experimental · Cmd 0x10", true);
-
-            lblRemapSummary = new Label
-            {
-                Location = new Point(14, 34),
-                Size = new Size(360, 20),
-                ForeColor = Theme.TextSecondary,
-                Font = Theme.FontBodySecondary,
-                AutoEllipsis = true
-            };
-            gbRemap.Controls.Add(lblRemapSummary);
-
-            btnOpenMapper = new Button
-            {
-                Text = "Open Button Mapper",
-                Location = new Point(383, 30),
-                Size = new Size(140, 26),
-                BackColor = Color.FromArgb(48, 32, 12),
-                ForeColor = Theme.Warning,
-                Font = Theme.FontBodyBold,
-                FlatStyle = FlatStyle.Flat,
-                TabIndex = 23,
-                AccessibleName = "Open the hardware button remapping window"
-            };
-            btnOpenMapper.FlatAppearance.BorderColor = Theme.WarningBorder;
-            btnOpenMapper.FlatAppearance.BorderSize = 1;
+        private void BuildButtonsPage(Panel p)
+        {
+            Note(p, "Side buttons, the wheel click and the DPI buttons can be remapped. Left and right click are locked so the mouse always stays usable.",
+                32, 4, 36, Theme.TextSecondary);
+            bindingList = new BindingListView { Bounds = Ui.R(32, 46, 416, 266), AccessibleName = "Current button bindings" };
+            p.Controls.Add(bindingList);
+            btnOpenMapper = MakeButton(p, UiButtonKind.Secondary, "Open Button Mapper", Glyphs.Buttons, Ui.R(32, 324, 200, 36), "Change what each button does");
             btnOpenMapper.Click += BtnOpenMapper_Click;
-            gbRemap.Controls.Add(btnOpenMapper);
+            Note(p, "Experimental · Cmd 0x10. Mapper changes are saved into this profile.", 32, 370, 40, Theme.Warning);
+        }
 
-            body.Controls.Add(gbRemap);
-            UpdateRemapSummary();
+        private void BuildSettingsPage(Panel p)
+        {
+            p.AutoScrollMargin = new Size(0, Ui.S(24));
 
-            // ─── Group 6: Live Diagnostic Log Panel ───
-            Panel gbLog = CreateSectionPanel(new Point(0, 503), new Size(535, 225), "6. Diagnostic USB Packet Log", "Report ID 0x07", false);
+            Caption(p, "Theme", 32, 8);
+            segTheme = new UiSegmented { Bounds = Ui.R(32, 32, 416, 40), AccessibleName = "Theme" };
+            segTheme.Items = new string[] { "Dark", "Light", "System" };
+            segTheme.SelectedIndexChanged += delegate
+            {
+                if (suppressUiEvents) return;
+                int[] prefs = { 1, 2, 0 };
+                SetThemePref(prefs[Math.Max(0, Math.Min(2, segTheme.SelectedIndex))]);
+            };
+            p.Controls.Add(segTheme);
 
+            Caption(p, "Background mode", 32, 96);
+            rbStealth = new OptionCard("Stealth watcher", "Invisible, no tray icon (~1.8 MB RAM). Re-applies your active profile on reboot, wake and replug.", "Recommended")
+            { Bounds = Ui.R(32, 120, 416, 76) };
+            rbTrayAgent = new OptionCard("Tray agent", "The same auto-apply, with a tray icon for quick access (~2.7 MB RAM).", null)
+            { Bounds = Ui.R(32, 204, 416, 76) };
+            rbDisabled = new OptionCard("Off", "Settings live in the mouse's RAM only and reset when it is unplugged or the PC restarts.", null)
+            { Bounds = Ui.R(32, 288, 416, 76) };
+            OptionCard[] cards = { rbStealth, rbTrayAgent, rbDisabled };
+            PersistenceMode[] modes = { PersistenceMode.StealthWatcher, PersistenceMode.TrayAgent, PersistenceMode.Disabled };
+            for (int i = 0; i < cards.Length; i++)
+            {
+                OptionCard c = cards[i];
+                PersistenceMode m = modes[i];
+                c.CheckedChanged += delegate { if (!suppressUiEvents && c.Checked) SetMode(m); };
+                p.Controls.Add(c);
+            }
+
+            Caption(p, "Updates", 32, 388);
+            lblUpdateStatus = MakeLabel(p, "", Ui.Body, Theme.TextSecondary, Ui.R(32, 410, 260, 40));
+            lblUpdateStatus.TextAlign = ContentAlignment.MiddleLeft;
+            btnCheckUpdates = MakeButton(p, UiButtonKind.Secondary, "Check for Updates", Glyphs.Refresh, Ui.R(288, 412, 160, 36), "Check GitHub for a newer stable version");
+            btnCheckUpdates.Click += async delegate { await CheckForUpdatesAsync(interactive: true); };
+
+            Caption(p, "Diagnostics · USB packet log", 32, 472);
+            RoundPanel term = new RoundPanel { Bounds = Ui.R(32, 496, 416, 200), Fill = Theme.TerminalBg, Stroke = Theme.Border, BackColor = Theme.TerminalBg };
             rtbLog = new RichTextBox
             {
-                Location = new Point(12, 32),
-                Size = new Size(511, 154),
+                Bounds = Ui.R(10, 10, 396, 180),
                 ReadOnly = true,
                 BackColor = Theme.TerminalBg,
                 ForeColor = Theme.TerminalText,
-                Font = Theme.FontMono,
+                Font = Ui.Mono,
                 BorderStyle = BorderStyle.None,
-                TabIndex = 24,
-                AccessibleName = "Diagnostic USB HID packet return code log"
+                DetectUrls = false,
+                AccessibleName = "Diagnostic USB packet log"
             };
-            gbLog.Controls.Add(rtbLog);
-
-            btnCopyLog = new Button
-            {
-                Text = "Copy Log",
-                Location = new Point(355, 192),
-                Size = new Size(80, 25),
-                BackColor = Theme.SurfaceElevated,
-                ForeColor = Theme.TextPrimary,
-                Font = Theme.FontBodySecondary,
-                FlatStyle = FlatStyle.Flat,
-                TabIndex = 25,
-                AccessibleName = "Copy diagnostic log to clipboard"
-            };
-            btnCopyLog.FlatAppearance.BorderColor = Theme.Border;
-            btnCopyLog.FlatAppearance.BorderSize = 1;
+            term.Controls.Add(rtbLog);
+            p.Controls.Add(term);
+            UiButton btnCopyLog = MakeButton(p, UiButtonKind.Secondary, "Copy", Glyphs.Copy, Ui.R(32, 706, 100, 32), "Copy the log to the clipboard");
             btnCopyLog.Click += delegate
             {
-                if (!string.IsNullOrEmpty(rtbLog.Text))
+                if (rtbLog == null || rtbLog.TextLength == 0) return;
+                try { Clipboard.SetText(rtbLog.Text); SetStatus("Log copied"); }
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        Clipboard.SetText(rtbLog.Text);
-                        MessageBox.Show("Diagnostic log copied to clipboard!", "Log Copied", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                    }
-                    catch (Exception ex)
-                    {
-                        MessageBox.Show("Could not copy the log to the clipboard:\n\n" + ex.Message,
-                            "Clipboard Busy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                    }
+                    MessageBox.Show("Could not copy the log to the clipboard:\n\n" + ex.Message, "Clipboard Busy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
             };
-            gbLog.Controls.Add(btnCopyLog);
-
-            btnClearLog = new Button
+            UiButton btnClearLog = MakeButton(p, UiButtonKind.Ghost, "Clear", Glyphs.Delete, Ui.R(140, 706, 92, 32), "Clear the log");
+            btnClearLog.Click += delegate
             {
-                Text = "Clear Log",
-                Location = new Point(443, 192),
-                Size = new Size(80, 25),
-                BackColor = Theme.Surface,
-                ForeColor = Theme.TextSecondary,
-                Font = Theme.FontBodySecondary,
-                FlatStyle = FlatStyle.Flat,
-                TabIndex = 26,
-                AccessibleName = "Clear diagnostic log text"
+                lock (logLines) logLines.Clear();
+                if (rtbLog != null) rtbLog.Clear();
             };
-            btnClearLog.FlatAppearance.BorderColor = Theme.Border;
-            btnClearLog.FlatAppearance.BorderSize = 1;
-            btnClearLog.Click += delegate { rtbLog.Clear(); };
-            gbLog.Controls.Add(btnClearLog);
 
-            btnCheckUpdates = new Button
+            Caption(p, "Device", 32, 762);
+            btnFactoryReset = MakeButton(p, UiButtonKind.Danger, "Factory reset mouse", Glyphs.Undo, Ui.R(32, 786, 200, 36), "Restore the stock breathing colours on the mouse");
+            btnFactoryReset.Click += BtnReset_Click;
+            UiButton btnExitDriver = MakeButton(p, UiButtonKind.Secondary, "Exit driver", Glyphs.Power, Ui.R(244, 786, 140, 36), "Stop the background driver completely");
+            btnExitDriver.Click += delegate { ConfirmExitDriver(); };
+            Note(p, "Factory reset keeps your saved profiles. Exit driver stops auto-apply until the Control Center is opened again; closing the window with [X] keeps it running.",
+                32, 830, 52, Theme.TextSecondary);
+
+            if (Theme.IsDark)
             {
-                Text = "Check for Updates",
-                Location = new Point(12, 192),
-                Size = new Size(125, 25),
-                BackColor = Theme.SurfaceElevated,
-                ForeColor = Theme.TextPrimary,
-                Font = Theme.FontBodySecondary,
-                FlatStyle = FlatStyle.Flat,
-                TabIndex = 27,
-                AccessibleName = "Check GitHub for a newer stable version"
-            };
-            btnCheckUpdates.FlatAppearance.BorderColor = Theme.Border;
-            btnCheckUpdates.FlatAppearance.BorderSize = 1;
-            btnCheckUpdates.Click += async delegate { await CheckForUpdatesAsync(interactive: true); };
-            gbLog.Controls.Add(btnCheckUpdates);
-
-            Label lblVersion = new Label
-            {
-                Text = "Installed " + UpdateManager.Display(UpdateManager.CurrentVersion),
-                Location = new Point(143, 192),
-                Size = new Size(120, 25),
-                TextAlign = ContentAlignment.MiddleLeft,
-                Font = Theme.FontBodySecondary,
-                ForeColor = Theme.TextMuted
-            };
-            gbLog.Controls.Add(lblVersion);
-
-            body.Controls.Add(gbLog);
-            this.Controls.Add(body);
+                try { SetWindowTheme(p.Handle, "DarkMode_Explorer", null); } catch { }
+                try { SetWindowTheme(rtbLog.Handle, "DarkMode_Explorer", null); } catch { }
+            }
         }
 
-        private void Log(string msg, Color col)
+        // ─── PAGES ───
+        private static readonly string[] PageTitles = { "Lighting", "DPI", "Buttons", "Settings" };
+        private static readonly string[] PageSubtitles = {
+            "Static LED colour and brightness",
+            "Sensor stage sent with the profile",
+            "Hardware button remapping",
+            "Appearance, background mode and updates"
+        };
+
+        private void ShowPage(int page)
         {
-            if (rtbLog == null) return;
+            if (!uiBuilt) return;
+            page = Math.Max(0, Math.Min(3, page));
+            if (page != 3) lastTabPage = page;
+            bool changed = page != currentPage;
+            currentPage = page;
+            SuspendLayout();
+            for (int i = 0; i < pages.Length; i++) pages[i].Visible = i == page;
+            pnlSettings.Visible = page == 3;
+            pnlActions.Visible = page != 3;
+            ResumeLayout(false);
+            tabBar.SelectedIndex = page == 3 ? -1 : page;
+            btnSettings.Active = page == 3;
+            btnSettings.Invalidate();
+            lblPageTitle.Text = PageTitles[page];
+            lblPageSubtitle.Text = PageSubtitles[page];
+            if (page == 3)
+            {
+                FillLog();
+                if (changed) pnlSettings.AutoScrollPosition = Point.Empty;
+            }
+        }
+
+        // ─── DRAFT <-> UI ───
+        private bool IsDirty()
+        {
+            return draft != null && currentProfile != null && !draft.SameSettings(currentProfile);
+        }
+
+        private void LoadDraftIntoUi()
+        {
+            if (!uiBuilt || draft == null) return;
+            suppressUiEvents = true;
             try
             {
-                if (rtbLog.InvokeRequired)
+                Color c = ParseColor(draft.HexColor);
+                swatches.SelectedColor = c;
+                txtHex.Text = FormatHexColor(c);
+                sliderBrightness.Value = Math.Max(5, Math.Min(100, draft.Brightness));
+                lblBrightnessVal.Text = sliderBrightness.Value + "%";
+                tglDpi.Checked = draft.EnableDpi;
+                int stage = Math.Max(0, Math.Min(5, draft.ActiveDpiStage));
+                for (int i = 0; i < stageTiles.Length; i++) stageTiles[i].Checked = i == stage;
+                UpdateDpiEnabledState();
+                bindingList.Profile = draft;
+                int pref = currentProfile.ThemePref;
+                segTheme.SelectedIndex = pref == 1 ? 0 : (pref == 2 ? 1 : 2);
+                rbStealth.Checked = currentProfile.Mode == PersistenceMode.StealthWatcher;
+                rbTrayAgent.Checked = currentProfile.Mode == PersistenceMode.TrayAgent;
+                rbDisabled.Checked = currentProfile.Mode == PersistenceMode.Disabled;
+            }
+            finally
+            {
+                suppressUiEvents = false;
+            }
+            RefreshDraftState();
+        }
+
+        private void UpdateDpiEnabledState()
+        {
+            if (tglDpi == null) return;
+            bool on = tglDpi.Checked;
+            for (int i = 0; i < stageTiles.Length; i++) stageTiles[i].Enabled = on;
+            btnTestDpi.Enabled = on && !isSavingInProgress;
+        }
+
+        private void RefreshDraftState()
+        {
+            if (!uiBuilt || draft == null) return;
+            bool dirty = IsDirty();
+            hero.Led = ParseColor(draft.HexColor);
+            hero.Brightness = draft.Brightness;
+            hero.ProfileName = currentProfile.Name;
+            hero.Readout = FormatHexColor(hero.Led) + " · " + ProfileListView.Describe(draft);
+            hero.Connected = !string.IsNullOrEmpty(cachedDevicePath);
+            hero.Invalidate(true);
+
+            profileList.Items = library.Items;
+            profileList.ActiveId = currentProfile.Id;
+            profileList.ActiveDirty = dirty;
+            profileList.ActiveDraft = draft;
+            profileList.RefreshItems();
+
+            if (dirty)
+            {
+                lblDirty.Text = mouseShowsDraft ? "● Previewing · not saved" : "● Unsaved changes";
+                lblDirty.ForeColor = Theme.Warning;
+            }
+            else
+            {
+                lblDirty.Text = statusText ?? "";
+                lblDirty.ForeColor = Theme.Accent;
+            }
+            bindingList.Invalidate();
+        }
+
+        private void OnDraftChanged()
+        {
+            statusText = null;
+            RefreshDraftState();
+        }
+
+        private void SetStatus(string text)
+        {
+            statusText = text;
+            RefreshDraftState();
+        }
+
+        private void SetUiBusy(bool busy)
+        {
+            if (!uiBuilt) return;
+            btnPreview.Enabled = btnSave.Enabled = btnOpenMapper.Enabled = btnFactoryReset.Enabled = !busy;
+            btnTestDpi.Enabled = !busy && tglDpi.Checked;
+            UseWaitCursor = busy;
+        }
+
+        private void SetConnected(bool connected)
+        {
+            if (hero == null) return;
+            hero.Connected = connected;
+            hero.Invalidate();
+        }
+
+        private static string FormatHexColor(Color c)
+        {
+            return string.Format("#{0:X2}{1:X2}{2:X2}", c.R, c.G, c.B);
+        }
+
+        private void SetDraftColor(Color c)
+        {
+            if (draft == null) return;
+            draft.HexColor = FormatHexColor(c);
+            if (uiBuilt)
+            {
+                suppressUiEvents = true;
+                try
                 {
-                    rtbLog.Invoke(new Action<string, Color>(Log), msg, col);
-                    return;
+                    swatches.SelectedColor = c;
+                    txtHex.Text = draft.HexColor;
                 }
-                if (rtbLog.IsDisposed) return;
-                if (rtbLog.TextLength > 50000) rtbLog.Clear();
-                rtbLog.SelectionStart = rtbLog.TextLength;
-                rtbLog.SelectionLength = 0;
-                rtbLog.SelectionColor = col;
-                rtbLog.AppendText(string.Format(CultureInfo.InvariantCulture, "[{0:HH:mm:ss.fff}] {1}\n", DateTime.Now, msg));
-                rtbLog.ScrollToCaret();
+                finally { suppressUiEvents = false; }
+            }
+            OnDraftChanged();
+        }
+
+        private void PickCustomColor()
+        {
+            if (draft == null) return;
+            using (ColorDialog cd = new ColorDialog())
+            {
+                cd.Color = ParseColor(draft.HexColor);
+                cd.FullOpen = true;
+                if (cd.ShowDialog(this) == DialogResult.OK) SetDraftColor(cd.Color);
+            }
+        }
+
+        // Validates the hex box. Returns false (and restores the box) when the text is not #RRGGBB.
+        private bool CommitHexEdit(bool showError)
+        {
+            if (!uiBuilt || txtHex == null || txtHex.IsDisposed || draft == null) return true;
+            string raw = txtHex.Text.Trim();
+            if (!raw.StartsWith("#")) raw = "#" + raw;
+            if (Regex.IsMatch(raw, "^#[0-9A-Fa-f]{6}$"))
+            {
+                raw = raw.ToUpperInvariant();
+                if (!string.Equals(raw, draft.HexColor, StringComparison.OrdinalIgnoreCase)) SetDraftColor(ParseColor(raw));
+                else txtHex.Text = raw;
+                return true;
+            }
+            txtHex.Text = FormatHexColor(ParseColor(draft.HexColor));
+            if (showError)
+                MessageBox.Show(this, "Use the #RRGGBB format, for example #BE59FF.", "Invalid Colour", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        // ─── LOG ───
+        private void Log(string msg, Color col)
+        {
+            LogLine line;
+            line.Text = string.Format(CultureInfo.InvariantCulture, "[{0:HH:mm:ss.fff}] {1}\n", DateTime.Now, msg);
+            line.Color = col;
+            lock (logLines)
+            {
+                logLines.Enqueue(line);
+                while (logLines.Count > LOG_CAPACITY) logLines.Dequeue();
+            }
+            RichTextBox box = rtbLog;
+            if (box == null) return;
+            try
+            {
+                if (box.IsHandleCreated && !box.IsDisposed)
+                    box.BeginInvoke(new Action(delegate { AppendLogLine(box, line); }));
             }
             catch
             {
                 // Logging must never take the app down (e.g. during shutdown).
             }
+        }
+
+        private static void AppendLogLine(RichTextBox box, LogLine line)
+        {
+            if (box.IsDisposed) return;
+            Color c = line.Color;
+            if (c.GetBrightness() < 0.5f) c = Theme.Blend(c, Color.White, 0.45f); // stay readable on the dark terminal
+            box.SelectionStart = box.TextLength;
+            box.SelectionLength = 0;
+            box.SelectionColor = c;
+            box.AppendText(line.Text);
+            box.ScrollToCaret();
+        }
+
+        private void FillLog()
+        {
+            if (rtbLog == null) return;
+            LogLine[] all;
+            lock (logLines) all = logLines.ToArray();
+            rtbLog.SuspendLayout();
+            rtbLog.Clear();
+            for (int i = 0; i < all.Length; i++) AppendLogLine(rtbLog, all[i]);
+            rtbLog.ResumeLayout();
         }
 
         private void RefreshDeviceConnection()
@@ -3133,78 +4873,316 @@ namespace RedgearA20ControlCenter
 
             if (cachedDevicePath != null)
             {
-                lblStatus.Text = string.Format("● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0x{0:X4})", cachedUsagePage);
-                lblStatus.ForeColor = Theme.Accent;
                 Log(string.Format("Hardware detected: {0} (UsagePage 0x{1:X4})", cachedDevicePath, cachedUsagePage), Theme.Accent);
             }
             else
             {
-                lblStatus.Text = "○ Device Not Found. Is USB Connected?";
-                lblStatus.ForeColor = Theme.Danger;
                 Log("Device search completed: Redgear A20 (18F8:0FC0) not currently enumerated.", Theme.Danger);
             }
+            SetConnected(cachedDevicePath != null);
             ShortcutEngine.Rebind(cachedDevicePath);
         }
 
-        private void UpdateColorPreview()
+        // ─── PROFILE LIBRARY ACTIONS ───
+        private bool SaveDraftToDisk()
         {
-            // Calculate scaled visual preview
-            float b = currentBrightness / 100.0f;
-            Color scaled = Color.FromArgb(
-                (int)Math.Round(currentColor.R * b),
-                (int)Math.Round(currentColor.G * b),
-                (int)Math.Round(currentColor.B * b)
-            );
-            pnlColorPreview.BackColor = scaled;
-        }
-
-        private void BtnPickColor_Click(object sender, EventArgs e)
-        {
-            using (ColorDialog cd = new ColorDialog())
+            if (draft == null) return true;
+            currentProfile.CopySettingsFrom(draft);
+            AppProfile entry = library != null ? library.Find(currentProfile.Id) : null;
+            string err = null;
+            bool ok = true;
+            if (library != null)
             {
-                cd.Color = currentColor;
-                cd.FullOpen = true;
-                if (cd.ShowDialog() == DialogResult.OK)
+                if (entry == null)
                 {
-                    currentColor = cd.Color;
-                    txtHex.Text = string.Format("#{0:X2}{1:X2}{2:X2}", currentColor.R, currentColor.G, currentColor.B);
-                    UpdateColorPreview();
+                    entry = currentProfile.Clone();
+                    library.Items.Add(entry);
                 }
+                else
+                {
+                    entry.CopySettingsFrom(currentProfile);
+                    entry.Name = currentProfile.Name;
+                }
+                ok = library.Write(entry, out err);
+                currentProfile.Id = entry.Id;
             }
-        }
-
-        private bool TrySyncHexColor(out string error)
-        {
-            error = null;
-            if (txtHex == null) return true;
-            string raw = txtHex.Text.Trim();
-            if (!raw.StartsWith("#")) raw = "#" + raw;
-
-            if (Regex.IsMatch(raw, "^#([0-9A-Fa-f]{6})$"))
+            if (ok) ok = currentProfile.Save(out err);
+            if (!ok)
             {
-                int r = Convert.ToInt32(raw.Substring(1, 2), 16);
-                int g = Convert.ToInt32(raw.Substring(3, 2), 16);
-                int b = Convert.ToInt32(raw.Substring(5, 2), 16);
-                currentColor = Color.FromArgb(r, g, b);
-                txtHex.Text = raw.ToUpper();
-                UpdateColorPreview();
-                return true;
-            }
-            else
-            {
-                error = "Invalid Hex Color format. Please use #RRGGBB (e.g. #BE59FF)";
+                Log("❌ Failed to save profile to disk: " + err, Color.FromArgb(255, 80, 80));
+                MessageBox.Show(this, "Failed to save the profile to disk:\n\n" + err, "Save Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
             }
+            Log(string.Format("Profile \"{0}\" saved to {1}", currentProfile.Name, AppProfile.GetProfilePath()), Color.FromArgb(140, 200, 255));
+            return true;
         }
 
-        private void TxtHex_Leave(object sender, EventArgs e)
+        // Returns false when the user cancels.
+        private bool ResolveUnsavedChanges()
         {
+            if (!CommitHexEdit(true)) return false;
+            if (!IsDirty()) return true;
+            DialogResult dr = MessageBox.Show(this,
+                string.Format("\"{0}\" has unsaved changes.\n\nSave them before switching?", currentProfile.Name),
+                "Unsaved Changes", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (dr == DialogResult.Cancel) return false;
+            if (dr == DialogResult.Yes) return SaveDraftToDisk();
+            return true;
+        }
+
+        private void ActivateProfile(string id)
+        {
+            if (isSavingInProgress || library == null || currentProfile == null) return;
+            if (id == currentProfile.Id) return;
+            AppProfile target = library.Find(id);
+            if (target == null) return;
+            if (!ResolveUnsavedChanges()) return;
+            ActivateProfileCore(target);
+        }
+
+        private async void ActivateProfileCore(AppProfile target)
+        {
+            currentProfile.CopySettingsFrom(target);
+            currentProfile.Id = target.Id;
+            currentProfile.Name = target.Name;
             string err;
-            if (!TrySyncHexColor(out err))
+            if (!currentProfile.Save(out err)) Log("❌ Failed to save the active profile: " + err, Color.FromArgb(255, 80, 80));
+            SetAutoStart(currentProfile.Mode);
+            draft = currentProfile.Clone();
+            mouseShowsDraft = false;
+            statusText = null;
+            LoadDraftIntoUi();
+            if (profileList != null) profileList.EnsureVisible(target.Id);
+            Log(string.Format("Active profile: \"{0}\"", currentProfile.Name), Theme.Accent);
+
+            if (string.IsNullOrEmpty(cachedDevicePath))
             {
-                MessageBox.Show(err, "Format Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                txtHex.Text = string.Format("#{0:X2}{1:X2}{2:X2}", currentColor.R, currentColor.G, currentColor.B);
+                SetStatus("Applies when the mouse is connected");
+                return;
             }
+            bool ok = await ApplyProfileAsync(currentProfile, false, true);
+            if (draft != null && draft.Id == target.Id) SetStatus(ok ? "Applied to mouse ✓" : "Could not apply · see Settings log");
+        }
+
+        private async void NewProfile()
+        {
+            if (isSavingInProgress || library == null) return;
+            if (profileList != null) profileList.CommitEdit();
+            CommitHexEdit(false);
+            AppProfile p = draft.Clone();
+            p.Id = ProfileLibrary.NewId();
+            p.Name = library.UniqueName("Profile");
+            string err;
+            library.Add(p, out err);
+            if (err != null) Log("❌ Failed to save the new profile: " + err, Color.FromArgb(255, 80, 80));
+
+            currentProfile.CopySettingsFrom(p);
+            currentProfile.Id = p.Id;
+            currentProfile.Name = p.Name;
+            if (!currentProfile.Save(out err)) Log("❌ Failed to save the active profile: " + err, Color.FromArgb(255, 80, 80));
+            SetAutoStart(currentProfile.Mode);
+            draft = currentProfile.Clone();
+            statusText = null;
+            LoadDraftIntoUi();
+            if (profileList != null) profileList.BeginRename(p.Id);
+            Log(string.Format("Created profile \"{0}\"", p.Name), Theme.Accent);
+
+            if (!string.IsNullOrEmpty(cachedDevicePath) && mouseShowsDraft == false)
+            {
+                if (await ApplyProfileAsync(currentProfile, true)) mouseShowsDraft = false;
+            }
+            else mouseShowsDraft = false;
+        }
+
+        private void DuplicateProfile(string id)
+        {
+            if (library == null) return;
+            AppProfile src = library.Find(id);
+            if (src == null) return;
+            AppProfile p = src.Clone();
+            p.Id = ProfileLibrary.NewId();
+            string baseName = AppProfile.SanitizeName(src.Name);
+            if (baseName.Length > AppProfile.MAX_NAME_LENGTH - 5) baseName = baseName.Substring(0, AppProfile.MAX_NAME_LENGTH - 5).Trim();
+            string name = baseName + " copy";
+            bool taken = false;
+            for (int i = 0; i < library.Items.Count; i++)
+                if (string.Equals(library.Items[i].Name, name, StringComparison.OrdinalIgnoreCase)) taken = true;
+            p.Name = taken ? library.UniqueName(name) : name;
+            string err;
+            library.Add(p, out err);
+            if (err != null) Log("❌ Failed to save the duplicate: " + err, Color.FromArgb(255, 80, 80));
+            RefreshDraftState();
+            if (profileList != null) profileList.EnsureVisible(p.Id);
+        }
+
+        private void DeleteProfile(string id)
+        {
+            if (isSavingInProgress || library == null) return;
+            AppProfile p = library.Find(id);
+            if (p == null) return;
+            if (library.Items.Count <= 1)
+            {
+                MessageBox.Show(this, "At least one profile is needed. Create another profile before deleting this one.", "Delete Profile", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            if (MessageBox.Show(this, string.Format("Delete \"{0}\"? This cannot be undone.", p.Name), "Delete Profile",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+
+            bool wasActive = id == currentProfile.Id;
+            int idx = library.IndexOf(id);
+            library.Delete(id);
+            Log(string.Format("Deleted profile \"{0}\"", p.Name), Theme.TextSecondary);
+            if (wasActive)
+            {
+                AppProfile next = library.Items[Math.Min(idx, library.Items.Count - 1)];
+                ActivateProfileCore(next);
+            }
+            else RefreshDraftState();
+        }
+
+        private void RenameProfile(string id, string text)
+        {
+            if (library == null) return;
+            string name = AppProfile.SanitizeName(text);
+            AppProfile p = library.Find(id);
+            if (p == null || name.Length == 0 || name == p.Name) { RefreshDraftState(); return; }
+            p.Name = name;
+            string err;
+            if (!library.Write(p, out err)) Log("❌ Failed to rename profile: " + err, Color.FromArgb(255, 80, 80));
+            if (currentProfile != null && id == currentProfile.Id)
+            {
+                currentProfile.Name = name;
+                if (draft != null) draft.Name = name;
+                currentProfile.Save(out err);
+            }
+            RefreshDraftState();
+        }
+
+        private void ShowProfileMenu(string id, Point screen)
+        {
+            if (library == null) return;
+            bool active = currentProfile != null && id == currentProfile.Id;
+            ContextMenuStrip m = UiMenuRenderer.Create();
+            UiMenuRenderer.Item(m, active ? "Re-apply to mouse" : "Apply", delegate
+            {
+                if (active) ReapplyActiveProfile();
+                else ActivateProfile(id);
+            }).Enabled = !isSavingInProgress;
+            UiMenuRenderer.Item(m, "Rename", delegate
+            {
+                BeginInvoke(new Action(delegate { if (profileList != null) profileList.BeginRename(id); }));
+            });
+            UiMenuRenderer.Item(m, "Duplicate", delegate { DuplicateProfile(id); });
+            m.Items.Add(new ToolStripSeparator());
+            ToolStripMenuItem del = UiMenuRenderer.Item(m, "Delete", delegate { DeleteProfile(id); });
+            del.Tag = "danger";
+            del.Enabled = library.Items.Count > 1 && !isSavingInProgress;
+            m.Closed += delegate { BeginInvoke(new Action(m.Dispose)); };
+            m.Show(screen);
+        }
+
+        private async void ReapplyActiveProfile()
+        {
+            if (isSavingInProgress) return;
+            bool ok = await ApplyProfileAsync(currentProfile, false);
+            if (ok)
+            {
+                mouseShowsDraft = false;
+                SetStatus("Applied to mouse ✓");
+            }
+        }
+
+        private void SetMode(PersistenceMode mode)
+        {
+            if (currentProfile.Mode == mode) return;
+            currentProfile.Mode = mode;
+            if (draft != null) draft.Mode = mode;
+            string err;
+            if (!currentProfile.Save(out err)) Log("❌ Failed to save background mode: " + err, Color.FromArgb(255, 80, 80));
+            string dummy;
+            TaskSchedulerHelper.RemoveTask(out dummy);
+            SetAutoStart(mode);
+            if (trayIcon != null) trayIcon.Visible = mode == PersistenceMode.TrayAgent && !this.Visible;
+            if (mode == PersistenceMode.StealthWatcher)
+                Log("🚀 Stealth Driver Watcher auto-start registered (Invisible, No Tray Icon, ~1.8 MB RAM).", Color.FromArgb(80, 230, 130));
+            else if (mode == PersistenceMode.TrayAgent)
+                Log("📌 Tray Agent startup registered in Windows Run key (~2.7 MB RAM).", Color.FromArgb(140, 200, 255));
+            else
+                Log("Auto-apply disabled. Mouse will use volatile RAM only.", Color.FromArgb(200, 200, 220));
+        }
+
+        private void SetThemePref(int pref)
+        {
+            if (currentProfile.ThemePref == pref) return;
+            currentProfile.ThemePref = pref;
+            if (draft != null) draft.ThemePref = pref;
+            string err;
+            currentProfile.Save(out err);
+            if (Theme.ResolveDark(pref) != Theme.IsDark) ScheduleRebuild();
+        }
+
+        private void ConfirmExitDriver()
+        {
+            DialogResult dr = MessageBox.Show(this,
+                "This shuts down the Control Center and the background driver.\n\n" +
+                "Your mouse settings will NOT be re-applied after a USB replug or restart until you open the Control Center again.\n\n" +
+                "To keep auto-apply running, close the window with [X] instead.\n\nExit the driver now?",
+                "Exit Driver",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (dr == DialogResult.Yes) RequestExit();
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == (Keys.Control | Keys.S) && uiBuilt && !isSavingInProgress)
+            {
+                BtnSave_Click(this, EventArgs.Empty);
+                return true;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
+
+        // ─── UPDATE PILL ───
+        private void RefreshUpdatePill()
+        {
+            if (lblUpdateStatus != null)
+            {
+                string installed = "Installed " + UpdateManager.Display(UpdateManager.CurrentVersion);
+                lblUpdateStatus.Text = pendingUpdate != null
+                    ? installed + " · " + UpdateManager.Display(pendingUpdate.Version) + " available"
+                    : installed + " · stable channel";
+                lblUpdateStatus.ForeColor = pendingUpdate != null ? Theme.Accent : Theme.TextSecondary;
+            }
+            if (btnUpdatePill == null) return;
+            bool show = pendingUpdate != null && (!updatePillHidden || isUpdating);
+            if (show)
+            {
+                string text = isUpdating && updateProgressText != null ? updateProgressText : UpdateManager.Display(pendingUpdate.Version) + " available";
+                if (text.Length > 28) text = text.Substring(0, 27) + "…";
+                btnUpdatePill.Text = text;
+                int w = TextRenderer.MeasureText(text, btnUpdatePill.Font, Size.Empty, TextFormatFlags.NoPadding).Width + Ui.S(48);
+                w = Math.Min(w, hero.Width - Ui.S(130));
+                btnUpdatePill.Bounds = new Rectangle(hero.Width - Ui.S(20) - w, Ui.S(22), w, Ui.S(30));
+                btnUpdatePill.Enabled = !isUpdating;
+            }
+            btnUpdatePill.Visible = show;
+        }
+
+        private void ShowUpdateMenu()
+        {
+            if (pendingUpdate == null || isUpdating) return;
+            ContextMenuStrip m = UiMenuRenderer.Create();
+            UiMenuRenderer.Item(m, pendingUpdate.DownloadUrl != null ? "Update now" : "Open download page", BtnUpdateNow_Click);
+            UiMenuRenderer.Item(m, "What's new", delegate
+            {
+                UpdateManager.OpenInBrowser(pendingUpdate != null ? pendingUpdate.PageUrl : UpdateManager.RELEASES_PAGE);
+            });
+            m.Items.Add(new ToolStripSeparator());
+            UiMenuRenderer.Item(m, "Hide until next start", delegate { HideUpdateBanner(); });
+            m.Closed += delegate { BeginInvoke(new Action(m.Dispose)); };
+            m.Show(btnUpdatePill, new Point(0, btnUpdatePill.Height + Ui.S(4)));
         }
 
         private static string TranslateWin32Error(int errCode)
@@ -3580,50 +5558,46 @@ namespace RedgearA20ControlCenter
         }
 
         // ─── SAFE PROFILE EXECUTION: APPLY TO MOUSE ───
-        private async Task<bool> ApplyCurrentProfileAsync(bool silent)
+        // silent: no UI and no logging (safe from background threads).
+        // quietErrors: log failures but don't pop a MessageBox.
+        private async Task<bool> ApplyProfileAsync(AppProfile profile, bool silent, bool quietErrors = false)
         {
-            if (isSavingInProgress) return false;
+            if (isSavingInProgress || profile == null) return false;
+            bool showErrors = !silent && !quietErrors;
 
             if (string.IsNullOrEmpty(cachedDevicePath))
             {
                 RefreshDeviceConnection();
                 if (string.IsNullOrEmpty(cachedDevicePath))
                 {
-                    if (!silent)
+                    if (showErrors)
                     {
-                        MessageBox.Show("Redgear A20 is not connected. Connect via USB and click Refresh.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        MessageBox.Show(this, "Redgear A20 is not connected. Connect it via USB and press Refresh.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     }
                     return false;
                 }
             }
 
-            byte activeDpi = (byte)Math.Max(0, Math.Min(5, currentProfile != null ? currentProfile.ActiveDpiStage : 1));
-            bool sendDpi = currentProfile != null && currentProfile.EnableDpi;
-
-            if (!silent && !this.InvokeRequired)
-            {
-                if (cmbDpiStages != null) activeDpi = (byte)Math.Max(0, Math.Min(5, cmbDpiStages.SelectedIndex));
-                if (cbEnableDpi != null) sendDpi = cbEnableDpi.Checked;
-            }
-
-            ButtonBinding[] binds = currentProfile != null ? currentProfile.GetBindingsToTransmit(true) : new ButtonBinding[0];
-            Dictionary<byte, KeyShortcut> shortcuts = currentProfile != null ? currentProfile.GetActiveShortcuts() : new Dictionary<byte, KeyShortcut>();
+            // Snapshot everything before the first await: the editor may keep changing the draft.
+            ButtonBinding[] binds = profile.GetBindingsToTransmit(true);
+            Dictionary<byte, KeyShortcut> shortcuts = profile.GetActiveShortcuts();
             binds = AddStaleShortcutResets(binds, shortcuts);
 
             SaveParameters p = new SaveParameters
             {
-                Color = currentColor,
-                Brightness = currentBrightness,
-                ActiveDpiIndex = activeDpi,
+                Color = ParseColor(profile.HexColor),
+                Brightness = Math.Max(5, Math.Min(100, profile.Brightness)),
+                ActiveDpiIndex = (byte)Math.Max(0, Math.Min(5, profile.ActiveDpiStage)),
                 DpiMask = 0x3F,
                 CommitToFlash = false, // Volatile RAM - Instant A704 registers
-                SendDpi = sendDpi,
+                SendDpi = profile.EnableDpi,
                 SendButtonBindings = binds.Length > 0,
                 ButtonBindings = binds
             };
 
             string targetPath = cachedDevicePath;
-            if (!silent) body.Enabled = false;
+            bool onUi = !silent && !this.InvokeRequired;
+            if (onUi) SetUiBusy(true);
             isSavingInProgress = true;
 
             try
@@ -3639,161 +5613,83 @@ namespace RedgearA20ControlCenter
                     }
                     return true;
                 }
-                else
+
+                string friendlyMsg = DescribePipelineFailure(res);
+                Log(string.Format("❌ Apply failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
+
+                if (res.Win32ErrorCode == 1167 || res.Win32ErrorCode == 2 || res.Win32ErrorCode == 6)
                 {
-                    string friendlyMsg = DescribePipelineFailure(res);
-                    Log(string.Format("❌ Apply failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
-
-                    if (res.Win32ErrorCode == 1167 || res.Win32ErrorCode == 2 || res.Win32ErrorCode == 6)
-                    {
-                        cachedDevicePath = null;
-                        if (!silent && !this.InvokeRequired && lblStatus != null)
-                        {
-                            lblStatus.Text = "○ Device Not Found. Is USB Connected?";
-                            lblStatus.ForeColor = Color.FromArgb(255, 100, 100);
-                        }
-                    }
-
-                    if (!silent)
-                    {
-                        MessageBox.Show(string.Format("Failed to apply settings at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    }
-                    return false;
+                    cachedDevicePath = null;
+                    if (!this.InvokeRequired) SetConnected(false);
                 }
+
+                if (showErrors)
+                {
+                    MessageBox.Show(this, string.Format("Failed to apply settings at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                return false;
             }
             catch (Exception ex)
             {
                 Log("❌ Apply failed with an unexpected error: " + ex.Message, Color.FromArgb(255, 80, 80));
-                if (!silent)
+                if (showErrors)
                 {
-                    MessageBox.Show("Failed to apply settings:\n\n" + ex.Message, "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show(this, "Failed to apply settings:\n\n" + ex.Message, "Apply Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
                 return false;
             }
             finally
             {
                 isSavingInProgress = false;
-                if (!silent) body.Enabled = true;
+                if (onUi) SetUiBusy(false);
             }
         }
 
         // ─── ACTION BUTTON HANDLERS ───
-        private async void BtnApply_Click(object sender, EventArgs e)
+        private async void BtnPreview_Click(object sender, EventArgs e)
         {
-            if (isSavingInProgress) return;
-            string err;
-            if (!TrySyncHexColor(out err))
-            {
-                MessageBox.Show(err, "Format Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                txtHex.Text = string.Format("#{0:X2}{1:X2}{2:X2}", currentColor.R, currentColor.G, currentColor.B);
-                return;
-            }
-            await ApplyCurrentProfileAsync(silent: false);
+            if (isSavingInProgress || draft == null) return;
+            if (!CommitHexEdit(true)) return;
+            bool ok = await ApplyProfileAsync(draft.Clone(), false);
+            if (!ok) return;
+            mouseShowsDraft = true;
+            SetStatus("Sent to mouse ✓");
         }
 
         private async void BtnSave_Click(object sender, EventArgs e)
         {
-            if (isSavingInProgress) return;
+            await SaveDraftAsync();
+        }
 
-            string hexErr;
-            if (!TrySyncHexColor(out hexErr))
-            {
-                MessageBox.Show(hexErr, "Format Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                txtHex.Text = string.Format("#{0:X2}{1:X2}{2:X2}", currentColor.R, currentColor.G, currentColor.B);
-                return;
-            }
-
-            if (string.IsNullOrEmpty(cachedDevicePath))
-            {
-                RefreshDeviceConnection();
-                if (string.IsNullOrEmpty(cachedDevicePath))
-                {
-                    MessageBox.Show("Redgear A20 is not connected. Connect via USB and click Refresh.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-            }
-
-            if (currentProfile == null) currentProfile = new AppProfile();
-            currentProfile.HexColor = txtHex.Text;
-            currentProfile.Brightness = currentBrightness;
-            currentProfile.ActiveDpiStage = cmbDpiStages != null ? cmbDpiStages.SelectedIndex : 1;
-            currentProfile.EnableDpi = cbEnableDpi != null && cbEnableDpi.Checked;
-
-            if (rbStealth != null && rbStealth.Checked)
-                currentProfile.Mode = PersistenceMode.StealthWatcher;
-            else if (rbTrayAgent != null && rbTrayAgent.Checked)
-                currentProfile.Mode = PersistenceMode.TrayAgent;
-            else
-                currentProfile.Mode = PersistenceMode.Disabled;
-
-            string saveErr;
-            if (!currentProfile.Save(out saveErr))
-            {
-                Log("❌ Failed to save profile to disk: " + saveErr, Color.FromArgb(255, 80, 80));
-                MessageBox.Show("Failed to save profile to disk:\n\n" + saveErr, "Save Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
+        // Saves the draft into the active profile (works offline), then applies it when the mouse is present.
+        private async Task<bool> SaveDraftAsync()
+        {
+            if (isSavingInProgress || draft == null) return false;
+            if (profileList != null) profileList.CommitEdit();
+            if (!CommitHexEdit(true)) return false;
+            if (!SaveDraftToDisk()) return false;
 
             // Clean up any legacy Task Scheduler task
             string dummy;
             TaskSchedulerHelper.RemoveTask(out dummy);
+            SetAutoStart(currentProfile.Mode);
+            if (trayIcon != null) trayIcon.Visible = currentProfile.Mode == PersistenceMode.TrayAgent && !this.Visible;
+            statusText = null;
+            RefreshDraftState();
 
-            if (currentProfile.Mode == PersistenceMode.StealthWatcher)
+            if (string.IsNullOrEmpty(cachedDevicePath)) RefreshDeviceConnection();
+            if (string.IsNullOrEmpty(cachedDevicePath))
             {
-                if (trayIcon != null) trayIcon.Visible = false;
-                SetAutoStart(PersistenceMode.StealthWatcher);
-                Log("🚀 Stealth Driver Watcher auto-start registered (Invisible, No Tray Icon, ~1.8 MB RAM).", Color.FromArgb(80, 230, 130));
-            }
-            else if (currentProfile.Mode == PersistenceMode.TrayAgent)
-            {
-                if (trayIcon != null) trayIcon.Visible = true;
-                SetAutoStart(PersistenceMode.TrayAgent);
-                Log("📌 Tray Agent startup registered in Windows Run key (~2.7 MB RAM).", Color.FromArgb(140, 200, 255));
+                SetStatus("Saved · applies when the mouse is connected");
             }
             else
             {
-                if (trayIcon != null) trayIcon.Visible = false;
-                SetAutoStart(PersistenceMode.Disabled);
-                Log("Auto-apply disabled. Mouse will use volatile RAM only.", Color.FromArgb(200, 200, 220));
-            }
-
-            Log(string.Format("Profile saved to {0} (Mode={1}, EnableDpi={2}, DpiStage={3})",
-                AppProfile.GetProfilePath(), currentProfile.Mode, currentProfile.EnableDpi, currentProfile.ActiveDpiStage),
-                Color.FromArgb(140, 200, 255));
-
-            bool ok = await ApplyCurrentProfileAsync(silent: false);
-            if (ok)
-            {
-                string msg;
-                if (currentProfile.Mode == PersistenceMode.StealthWatcher)
-                {
-                    msg = "Profile saved successfully!\n\n" +
-                          "✔ Color & Brightness applied to mouse.\n" +
-                          (currentProfile.EnableDpi ? string.Format("✔ DPI Stage {0} applied to mouse.\n", currentProfile.ActiveDpiStage) : "") +
-                          "✔ Stealth Driver Watcher active:\n" +
-                          "   • Completely invisible in background (~1.8 MB RAM, 0% CPU).\n" +
-                          "   • No taskbar or system tray icons.\n" +
-                          "   • Auto-applies your settings on reboot, wake, and USB replug on ANY port.\n\n" +
-                          "👉 You can safely close this window now using the Windows Close [X] button. Your settings will persist in the background!";
-                }
-                else if (currentProfile.Mode == PersistenceMode.TrayAgent)
-                {
-                    msg = "Profile saved successfully!\n\n" +
-                          "✔ Color & Brightness applied to mouse.\n" +
-                          (currentProfile.EnableDpi ? string.Format("✔ DPI Stage {0} applied to mouse.\n", currentProfile.ActiveDpiStage) : "") +
-                          "✔ Tray Agent Mode active: Redgear A20 Control Center will start in the system tray (~2.7 MB RAM).\n\n" +
-                          "👉 You can safely close this window using the Windows Close [X] button to minimize to tray.";
-                }
-                else
-                {
-                    msg = "Profile saved locally!\n\n" +
-                          "✔ Color & Brightness applied to mouse.\n\n" +
-                          "ℹ Note: Auto-apply is disabled. Lighting will reset upon mouse disconnect or PC restart.";
-                }
-
-                MessageBox.Show(msg, "Profile Saved", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                bool ok = await ApplyProfileAsync(currentProfile, false, true);
+                if (ok) mouseShowsDraft = false;
+                SetStatus(ok ? "Saved and applied ✓" : "Saved · could not apply, see Settings log");
             }
             TrimMemory();
+            return true;
         }
 
         private async void BtnReset_Click(object sender, EventArgs e)
@@ -3805,95 +5701,66 @@ namespace RedgearA20ControlCenter
                 RefreshDeviceConnection();
                 if (string.IsNullOrEmpty(cachedDevicePath))
                 {
-                    MessageBox.Show("Redgear A20 is not connected.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show(this, "Redgear A20 is not connected.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
             }
 
-            DialogResult dr = MessageBox.Show(
-                "This will restore the mouse to factory defaults (stock per-stage DPI colors and breathing mode) and reset the auto-start profile.\n\nProceed?",
+            DialogResult dr = MessageBox.Show(this,
+                "This restores the mouse to factory defaults (stock per-stage DPI colours and breathing mode) and turns auto-apply off.\n\nYour saved profiles are kept. Proceed?",
                 "Confirm Factory Reset",
                 MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning
-            );
-
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
             if (dr != DialogResult.Yes) return;
 
             string targetPath = cachedDevicePath;
-            body.Enabled = false;
+            SetUiBusy(true);
             isSavingInProgress = true;
-            lblStatus.Text = "⏳ Restoring factory defaults... Do not disconnect mouse.";
-            lblStatus.ForeColor = Color.FromArgb(255, 200, 80);
+            bool success = false;
+            PipelineResult res = null;
 
             try
             {
-                PipelineResult res = await Task.Run(() => ExecuteFactoryReset(targetPath, Log));
-                if (res.Success)
-                {
-                    currentColor = Color.FromArgb(255, 255, 0);
-                    currentBrightness = 100;
-                    tbBrightness.Value = 100;
-                    txtHex.Text = "#FFFF00";
-                    if (rbDisabled != null) rbDisabled.Checked = true;
-                    if (cbEnableDpi != null) cbEnableDpi.Checked = false;
-                    if (cmbDpiStages != null) cmbDpiStages.SelectedIndex = 1;
-                    UpdateColorPreview();
-
-                    if (currentProfile != null)
-                    {
-                        currentProfile.HexColor = "#FFFF00";
-                        currentProfile.Brightness = 100;
-                        currentProfile.ActiveDpiStage = 1;
-                        currentProfile.EnableDpi = false;
-                        currentProfile.Mode = PersistenceMode.Disabled;
-                        string saveErr;
-                        if (!currentProfile.Save(out saveErr))
-                        {
-                            Log("⚠️ Warning: Failed to save reset profile to disk: " + saveErr, Color.FromArgb(255, 120, 50));
-                        }
-                    }
-                    SetAutoStart(PersistenceMode.Disabled);
-
-                    string removeErr;
-                    TaskSchedulerHelper.RemoveTask(out removeErr);
-                    if (trayIcon != null) trayIcon.Visible = false;
-
-                    Log("✅ Factory profile restored!", Color.FromArgb(80, 230, 130));
-                    MessageBox.Show("Factory profile restored!\n\nThe mouse is now in default multi-stage breathing mode.", "Factory Reset Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                }
-                else
-                {
-                    string friendlyMsg = DescribePipelineFailure(res);
-                    Log(string.Format("❌ Factory reset failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
-                    if (res.Win32ErrorCode == 1167 || res.Win32ErrorCode == 2 || res.Win32ErrorCode == 6)
-                    {
-                        cachedDevicePath = null;
-                        if (lblStatus != null)
-                        {
-                            lblStatus.Text = "○ Device Not Found. Is USB Connected?";
-                            lblStatus.ForeColor = Color.FromArgb(255, 100, 100);
-                        }
-                    }
-                    MessageBox.Show(string.Format("Factory reset failed at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Reset Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
+                res = await Task.Run(() => ExecuteFactoryReset(targetPath, Log));
+                success = res.Success;
+            }
+            catch (Exception ex)
+            {
+                Log("❌ Factory reset failed with an unexpected error: " + ex.Message, Color.FromArgb(255, 80, 80));
             }
             finally
             {
                 isSavingInProgress = false;
-                body.Enabled = true;
-                if (!string.IsNullOrEmpty(cachedDevicePath) && lblStatus != null)
+                SetUiBusy(false);
+            }
+
+            if (success)
+            {
+                SetMode(PersistenceMode.Disabled);
+                LoadDraftIntoUi();
+                mouseShowsDraft = false;
+                Log("✅ Factory profile restored!", Color.FromArgb(80, 230, 130));
+                MessageBox.Show(this, "Factory profile restored.\n\nThe mouse is back in its default multi-stage breathing mode and auto-apply is off. Click a profile to apply it again.",
+                    "Factory Reset Complete", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else if (res != null)
+            {
+                string friendlyMsg = DescribePipelineFailure(res);
+                Log(string.Format("❌ Factory reset failed at packet #{0}: {1} (Win32 {2}: {3})", res.FailingPacketIndex, res.ErrorMessage, res.Win32ErrorCode, friendlyMsg), Color.FromArgb(255, 80, 80));
+                if (res.Win32ErrorCode == 1167 || res.Win32ErrorCode == 2 || res.Win32ErrorCode == 6)
                 {
-                    lblStatus.Text = string.Format("● Connected: Redgear A20 (VID:18F8 PID:0FC0 UsagePage:0x{0:X4})", cachedUsagePage);
-                    lblStatus.ForeColor = Color.FromArgb(80, 230, 130);
+                    cachedDevicePath = null;
+                    SetConnected(false);
                 }
+                MessageBox.Show(this, string.Format("Factory reset failed at packet #{0}.\n\nError: {1}\n{2}", res.FailingPacketIndex, res.ErrorMessage, friendlyMsg), "Reset Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
         // ─── UNVERIFIED / EXPERIMENTAL SECTION: DPI TESTING ───
         private async void BtnTestDpi_Click(object sender, EventArgs e)
         {
-            if (cbEnableDpi == null || !cbEnableDpi.Checked) return;
-            if (cmbDpiStages == null) return;
+            if (draft == null || !draft.EnableDpi) return;
             if (isSavingInProgress)
             {
                 Log("Another hardware operation is in progress. Please wait and retry.", Color.FromArgb(255, 200, 80));
@@ -3901,11 +5768,11 @@ namespace RedgearA20ControlCenter
             }
             if (string.IsNullOrEmpty(cachedDevicePath))
             {
-                MessageBox.Show("Redgear A20 is not connected.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show(this, "Redgear A20 is not connected.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
 
-            int selectedStage = cmbDpiStages.SelectedIndex;
+            int selectedStage = draft.ActiveDpiStage;
             if (selectedStage < 0 || selectedStage > 5) selectedStage = 0;
             string targetPath = cachedDevicePath;
 
@@ -3966,51 +5833,33 @@ namespace RedgearA20ControlCenter
 
                 if (ok)
                 {
+                    mouseShowsDraft = true;
                     Log(string.Format("Cmd 0x09 [Stage {0}]: {1} -> OK", selectedStage, FormatHex(dpiPacket)), Color.FromArgb(255, 200, 80));
                     Log("Test completed. Test mouse sensitivity now.", Color.FromArgb(200, 200, 220));
+                    SetStatus(string.Format("Stage {0} sent to mouse ✓", selectedStage));
                 }
                 else
                 {
                     Log(string.Format("Cmd 0x09 [Stage {0}]: {1} -> FAIL ({2})", selectedStage, FormatHex(dpiPacket), err), Color.FromArgb(255, 80, 80));
+                    SetStatus("DPI test failed · see Settings log");
                 }
             }
             finally
             {
-                if (btnTestDpi != null && !btnTestDpi.IsDisposed)
-                {
-                    // Respect the checkbox if the user disabled DPI testing mid-operation.
-                    btnTestDpi.Enabled = cbEnableDpi != null && cbEnableDpi.Checked;
-                }
+                // Respect the toggle if the user disabled DPI mid-operation (or the UI was rebuilt).
+                UpdateDpiEnabledState();
             }
         }
 
         // ─── BUTTON REMAPPING ───
-        private void UpdateRemapSummary()
-        {
-            if (lblRemapSummary == null) return;
-            List<string> parts = new List<string>();
-            ButtonMap.ButtonInfo[] all = ButtonMap.All;
-            for (int i = 0; i < all.Length; i++)
-            {
-                if (all[i].Locked || currentProfile == null) continue;
-                ButtonAction a = currentProfile.GetBinding(all[i].Id);
-                KeyShortcut ks;
-                if (a == ButtonAction.Shortcut && currentProfile.TryGetShortcut(all[i].Id, out ks)) parts.Add(all[i].DisplayName + " → " + KeyShortcuts.Describe(ks));
-                else if (a != all[i].FactoryAction) parts.Add(all[i].DisplayName + " → " + ButtonMap.Describe(a));
-            }
-            lblRemapSummary.Text = parts.Count == 0 ? "All buttons at factory defaults. Left / Right click are locked." : string.Join(" · ", parts.ToArray());
-            lblRemapSummary.ForeColor = parts.Count == 0 ? Theme.TextSecondary : Theme.TextPrimary;
-        }
-
         private void BtnOpenMapper_Click(object sender, EventArgs e)
         {
-            if (isSavingInProgress) return;
-            if (currentProfile == null) currentProfile = new AppProfile();
-            using (ButtonMapperForm mapper = new ButtonMapperForm(currentProfile, SendButtonBindingsAsync, PersistButtonBindings))
+            if (isSavingInProgress || draft == null) return;
+            using (ButtonMapperForm mapper = new ButtonMapperForm(draft, SendButtonBindingsAsync, PersistButtonBindings))
             {
                 mapper.ShowDialog(this);
             }
-            UpdateRemapSummary();
+            RefreshDraftState();
             TrimMemory();
         }
 
@@ -4038,7 +5887,7 @@ namespace RedgearA20ControlCenter
                 RefreshDeviceConnection();
                 if (string.IsNullOrEmpty(cachedDevicePath))
                 {
-                    MessageBox.Show("Redgear A20 is not connected. Connect via USB and click Refresh.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    MessageBox.Show("Redgear A20 is not connected. Connect it via USB and press Refresh.", "Connection Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return false;
                 }
             }
@@ -4051,6 +5900,7 @@ namespace RedgearA20ControlCenter
                 if (res.Success)
                 {
                     ShortcutEngine.Configure(shortcuts, targetPath);
+                    mouseShowsDraft = true;
                     Log("✅ Button bindings applied to mouse RAM. Unplugging the mouse restores factory buttons.", Color.FromArgb(140, 240, 255));
                     return true;
                 }
@@ -4060,11 +5910,7 @@ namespace RedgearA20ControlCenter
                 if (res.Win32ErrorCode == 1167 || res.Win32ErrorCode == 2 || res.Win32ErrorCode == 6)
                 {
                     cachedDevicePath = null;
-                    if (lblStatus != null)
-                    {
-                        lblStatus.Text = "○ Device Not Found. Is USB Connected?";
-                        lblStatus.ForeColor = Color.FromArgb(255, 100, 100);
-                    }
+                    SetConnected(false);
                 }
                 MessageBox.Show("Failed to apply button bindings.\n\n" + friendlyMsg, "Button Mapper", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
@@ -4080,27 +5926,39 @@ namespace RedgearA20ControlCenter
             }
         }
 
+        private static void ApplyBindingsTo(AppProfile p, Dictionary<byte, ButtonAction> bindings, Dictionary<byte, KeyShortcut> shortcuts)
+        {
+            if (p == null) return;
+            foreach (KeyValuePair<byte, KeyShortcut> kv in shortcuts) p.SetShortcut(kv.Key, kv.Value);
+            foreach (KeyValuePair<byte, ButtonAction> kv in bindings) p.SetBinding(kv.Key, kv.Value);
+        }
+
+        // Mapper "Save": bindings go straight into the active profile (other unsaved draft edits stay pending).
         private bool PersistButtonBindings(Dictionary<byte, ButtonAction> bindings, Dictionary<byte, KeyShortcut> shortcuts)
         {
             if (currentProfile == null) currentProfile = new AppProfile();
-            foreach (KeyValuePair<byte, KeyShortcut> kv in shortcuts)
-            {
-                currentProfile.SetShortcut(kv.Key, kv.Value);
-            }
-            foreach (KeyValuePair<byte, ButtonAction> kv in bindings)
-            {
-                currentProfile.SetBinding(kv.Key, kv.Value);
-            }
+            ApplyBindingsTo(draft, bindings, shortcuts);
+            ApplyBindingsTo(currentProfile, bindings, shortcuts);
 
             string err;
-            if (!currentProfile.Save(out err))
+            bool ok = currentProfile.Save(out err);
+            if (ok && library != null)
+            {
+                AppProfile entry = library.Find(currentProfile.Id);
+                if (entry != null)
+                {
+                    ApplyBindingsTo(entry, bindings, shortcuts);
+                    ok = library.Write(entry, out err);
+                }
+            }
+            if (!ok)
             {
                 Log("❌ Failed to save button bindings: " + err, Color.FromArgb(255, 80, 80));
-                MessageBox.Show("Failed to save profile to disk:\n\n" + err, "Save Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("Failed to save the profile to disk:\n\n" + err, "Save Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
             }
-            Log("Button bindings saved to " + AppProfile.GetProfilePath(), Color.FromArgb(140, 200, 255));
-            UpdateRemapSummary();
+            Log("Button bindings saved to profile \"" + currentProfile.Name + "\"", Color.FromArgb(140, 200, 255));
+            RefreshDraftState();
             return true;
         }
 
@@ -4278,6 +6136,16 @@ namespace RedgearA20ControlCenter
                 for (int i = 0; i < args.Length; i++)
                 {
                     string a = args[i].ToLowerInvariant();
+                    if (a == "--shutdown" || a == "/shutdown")
+                    {
+                        Environment.Exit(MainForm.SignalShutdown());
+                        return;
+                    }
+                }
+
+                for (int i = 0; i < args.Length; i++)
+                {
+                    string a = args[i].ToLowerInvariant();
                     if (a == "--stealth" || a == "-stealth" || a == "/stealth" ||
                         a == "--silent" || a == "-silent" || a == "/silent" ||
                         a == "--watcher" || a == "-watcher" || a == "/watcher")
@@ -4385,7 +6253,7 @@ namespace RedgearA20ControlCenter
             bool createdNew = false;
             try
             {
-                appMutex = new Mutex(true, "RedgearA20ControlCenter_SingleInstance", out createdNew);
+                appMutex = new Mutex(true, MainForm.SINGLE_INSTANCE_MUTEX, out createdNew);
             }
             catch (AbandonedMutexException)
             {
@@ -4578,7 +6446,7 @@ namespace RedgearA20ControlCenter
                         cmb.Items.Add(new ActionItem(ButtonMap.Selectable[a]));
                     }
                     SelectAction(cmb, savedBindings[info.Id]);
-                    try { MainForm.SetWindowTheme(cmb.Handle, "DarkMode_Explorer", null); } catch { }
+                    if (Theme.IsDark) { try { MainForm.SetWindowTheme(cmb.Handle, "DarkMode_Explorer", null); } catch { } }
                     combos[info.Id] = cmb;
                     lastIndex[info.Id] = cmb.SelectedIndex;
                     Controls.Add(cmb);
@@ -4618,7 +6486,7 @@ namespace RedgearA20ControlCenter
             });
 
             int barY = y + 28;
-            btnTest = CreateActionButton("Test on Mouse (RAM)", 12, barY, Color.FromArgb(48, 32, 12), Theme.Warning, Theme.WarningBorder);
+            btnTest = CreateActionButton("Test on Mouse (RAM)", 12, barY, Theme.WarningSurface, Theme.Warning, Theme.WarningBorder);
             btnTest.Click += BtnTest_Click;
             btnSaveBinds = CreateActionButton("Save to Profile", 165, barY, Theme.Accent, Theme.AccentText, Theme.Accent);
             btnSaveBinds.Click += BtnSaveBinds_Click;

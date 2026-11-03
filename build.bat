@@ -1,6 +1,6 @@
 @echo off
 echo ===================================================================
-echo   Building Redgear A20 Control Center v0.3.0 (64-bit Windows)
+echo   Building Redgear A20 Control Center v0.4.0 (64-bit Windows)
 echo ===================================================================
 echo.
 
@@ -18,22 +18,44 @@ if not exist "%CSC%" (
 )
 
 echo Compiling src\Program.cs for x64 architecture...
-"%CSC%" /target:winexe /platform:x64 /debug- /optimize /nowarn:169,649 /win32manifest:"src\app.manifest" /out:"release\RedgearA20-win-x64.exe" /reference:System.dll,System.Drawing.dll,System.Windows.Forms.dll "src\Program.cs"
-
-if %ERRORLEVEL% equ 0 (
-    echo.
-    echo [OK] Executable created: release\RedgearA20-win-x64.exe
-    echo.
-    echo Generating SHA-256 checksum...
-    certutil -hashfile "release\RedgearA20-win-x64.exe" SHA256 > "release\RedgearA20-win-x64.sha256"
-    echo [OK] Checksum saved: release\RedgearA20-win-x64.sha256
-    echo.
-    echo ===================================================================
-    echo   [SUCCESS] Build Complete! Artifacts ready in release\ folder.
-    echo ===================================================================
-    exit /b 0
-) else (
+"%CSC%" /target:winexe /platform:x64 /debug- /optimize /nowarn:169,649 /win32manifest:"src\app.manifest" /resource:"assets\mouse-ui.png",RedgearA20.mouse.png /out:"release\RedgearA20-win-x64.exe" /reference:System.dll,System.Drawing.dll,System.Windows.Forms.dll "src\Program.cs"
+if %ERRORLEVEL% neq 0 (
     echo.
     echo [ERROR] Compilation failed.
     exit /b 1
 )
+
+echo.
+echo [OK] Executable created: release\RedgearA20-win-x64.exe
+echo.
+echo Generating SHA-256 checksum...
+certutil -hashfile "release\RedgearA20-win-x64.exe" SHA256 > "release\RedgearA20-win-x64.sha256"
+echo [OK] Checksum saved: release\RedgearA20-win-x64.sha256
+
+rem --- Optional: Setup.exe (same binary, installed per-user) via Inno Setup 6 ---
+set "ISCC="
+if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
+if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"
+if exist "%LocalAppData%\Programs\Inno Setup 6\ISCC.exe" set "ISCC=%LocalAppData%\Programs\Inno Setup 6\ISCC.exe"
+if not defined ISCC (
+    echo.
+    echo [SKIP] Inno Setup 6 not found - Setup.exe not built. Portable exe is complete.
+    goto DONE
+)
+
+echo.
+echo Building installer with Inno Setup...
+"%ISCC%" /Q "installer\RedgearA20.iss"
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] Installer build failed.
+    exit /b 1
+)
+certutil -hashfile "release\RedgearA20-win-x64-setup.exe" SHA256 > "release\RedgearA20-win-x64-setup.sha256"
+echo [OK] Installer created: release\RedgearA20-win-x64-setup.exe
+
+:DONE
+echo.
+echo ===================================================================
+echo   [SUCCESS] Build Complete! Artifacts ready in release\ folder.
+echo ===================================================================
+exit /b 0
