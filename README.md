@@ -41,7 +41,7 @@ It talks directly to the **Redgear A20 RGB Gaming Mouse** (`VID: 0x18F8 & PID: 0
 4. Pick a colour and brightness on the **Lighting** tab (and a DPI stage on **DPI**), then click **Save Profile**. Use **+** in the Profiles column to add more profiles.
 5. Open **Settings** (gear icon) and choose **Stealth watcher** as the background mode.
 6. Close the window. Your active profile now persists silently across reboots and USB replugs.
-7. *(Optional)* On the **Buttons** tab, open the Button Mapper to remap buttons or assign keyboard shortcuts. Shortcuts need the app running in the background, so keep **Stealth watcher** or **Tray agent** enabled.
+7. *(Optional)* On the **Buttons** tab, click a button to pick a new action or assign a keyboard shortcut (**Restore defaults** puts every button back), then Preview or Save Profile. Shortcuts need the app running in the background, so keep **Stealth watcher** or **Tray agent** enabled.
 
 ## Updating
 
