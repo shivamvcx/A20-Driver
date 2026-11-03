@@ -3297,7 +3297,7 @@ namespace RedgearA20ControlCenter
         private ToolTip tips;
         private Bitmap heroImage;
         private HeroPanel hero;
-        private UiButton btnGitHub, btnSettings, btnRefresh, btnUpdatePill;
+        private UiButton btnGitHub, btnSettings, btnHeroUpdate, btnUpdatePill;
         private Panel pnlProfiles, pnlRight, pnlActions, pnlSettings;
         private Panel[] pages;
         private ProfileListView profileList;
@@ -3831,6 +3831,7 @@ namespace RedgearA20ControlCenter
             if (isCheckingUpdate || isUpdating) return;
             isCheckingUpdate = true;
             if (btnCheckUpdates != null) { btnCheckUpdates.Enabled = false; btnCheckUpdates.Text = "Checking..."; }
+            if (btnHeroUpdate != null) btnHeroUpdate.Enabled = false;
             try
             {
                 UpdateInfo info = await Task.Run(() => UpdateManager.CheckLatest());
@@ -3870,6 +3871,7 @@ namespace RedgearA20ControlCenter
             {
                 isCheckingUpdate = false;
                 if (btnCheckUpdates != null && !btnCheckUpdates.IsDisposed) { btnCheckUpdates.Enabled = true; btnCheckUpdates.Text = "Check for Updates"; }
+                if (btnHeroUpdate != null && !btnHeroUpdate.IsDisposed) btnHeroUpdate.Enabled = true;
                 if (!this.Visible) TrimMemory();
             }
         }
@@ -4389,7 +4391,7 @@ namespace RedgearA20ControlCenter
             if (tips != null) { tips.Dispose(); tips = null; }
             if (heroImage != null) { heroImage.Dispose(); heroImage = null; }
 
-            hero = null; btnGitHub = btnSettings = btnRefresh = btnUpdatePill = null;
+            hero = null; btnGitHub = btnSettings = btnHeroUpdate = btnUpdatePill = null;
             pnlProfiles = pnlRight = pnlActions = pnlSettings = null; pages = null;
             profileList = null; btnNewProfile = null;
             lblPageTitle = lblPageSubtitle = lblDirty = null;
@@ -4501,8 +4503,8 @@ namespace RedgearA20ControlCenter
             btnSettings = MakeButton(hero, UiButtonKind.HeroIcon, "", Glyphs.Settings, Ui.R(66, 580, 40, 40), "Settings");
             btnSettings.Click += delegate { ShowPage(currentPage == 3 ? lastTabPage : 3); };
 
-            btnRefresh = MakeButton(hero, UiButtonKind.HeroIcon, "", Glyphs.Refresh, Ui.R(112, 580, 40, 40), "Refresh mouse connection");
-            btnRefresh.Click += delegate { RefreshDeviceConnection(); };
+            btnHeroUpdate = MakeButton(hero, UiButtonKind.HeroIcon, "", Glyphs.Refresh, Ui.R(112, 580, 40, 40), "Check for updates");
+            btnHeroUpdate.Click += async delegate { await CheckForUpdatesAsync(interactive: true); };
 
             btnUpdatePill = MakeButton(hero, UiButtonKind.HeroChip, "", Glyphs.Download, Ui.R(150, 22, 142, 30), "A new version is available");
             btnUpdatePill.Font = Ui.Small;
