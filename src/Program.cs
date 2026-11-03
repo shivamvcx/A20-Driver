@@ -4,8 +4,10 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -1242,6 +1244,255 @@ namespace RedgearA20ControlCenter
         }
     }
 
+    public class UpdateInfo
+    {
+        public Version Version;
+        public string Tag;
+        public string PageUrl;
+        public string DownloadUrl;  // null when the release has no exe asset (manual download only)
+        public string Sha256;       // GitHub-computed asset digest, if published
+        public string ChecksumUrl;  // fallback: the .sha256 asset produced by build.bat
+    }
+
+    public class UpdateResult
+    {
+        public string RelaunchPath;
+        public string Warning;
+    }
+
+    // Stable-channel updater backed by GitHub Releases. /releases/latest never returns drafts or
+    // pre-releases, and tags with a suffix (e.g. v0.5.0-beta) are ignored, so only stable builds
+    // are ever offered.
+    public static class UpdateManager
+    {
+        public const string REPO = "shivamvcx/A20-Driver";
+        public const string ASSET_EXE = "RedgearA20-win-x64.exe";
+        public const string ASSET_SHA = "RedgearA20-win-x64.sha256";
+        public const string RELEASES_PAGE = "https://github.com/" + REPO + "/releases/latest";
+        private const string API_LATEST = "https://api.github.com/repos/" + REPO + "/releases/latest";
+        private const string DOWNLOAD_PREFIX = "https://github.com/" + REPO + "/releases/download/";
+        private const long MAX_DOWNLOAD_BYTES = 20L * 1024 * 1024;
+
+        public static Version CurrentVersion
+        {
+            get { return Normalize(typeof(UpdateManager).Assembly.GetName().Version); }
+        }
+
+        public static string Display(Version v)
+        {
+            return string.Format(CultureInfo.InvariantCulture, "v{0}.{1}.{2}", v.Major, v.Minor, v.Build);
+        }
+
+        private static Version Normalize(Version v)
+        {
+            return new Version(v.Major, v.Minor, Math.Max(0, v.Build), Math.Max(0, v.Revision));
+        }
+
+        private static void EnableTls12()
+        {
+            // .NET 4.x defaults can exclude TLS 1.2, which GitHub requires.
+            try { ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; } catch { }
+        }
+
+        private static HttpWebRequest CreateRequest(string url, int timeoutMs)
+        {
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.UserAgent = "RedgearA20-Updater/" + Display(CurrentVersion);
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            req.AllowAutoRedirect = true;
+            return req;
+        }
+
+        private static string GetString(string url, string accept)
+        {
+            HttpWebRequest req = CreateRequest(url, 15000);
+            if (accept != null) req.Accept = accept;
+            using (WebResponse resp = req.GetResponse())
+            using (StreamReader sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+            {
+                return sr.ReadToEnd();
+            }
+        }
+
+        // Returns null when the running build is already the newest stable release.
+        public static UpdateInfo CheckLatest()
+        {
+            EnableTls12();
+            string json = GetString(API_LATEST, "application/vnd.github+json");
+
+            if (Regex.IsMatch(json, "\"(?:draft|prerelease)\"\\s*:\\s*true")) return null;
+            Match mTag = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"v?(\\d+)\\.(\\d+)\\.(\\d+)\"");
+            if (!mTag.Success) return null;
+
+            Version latest = new Version(
+                int.Parse(mTag.Groups[1].Value, CultureInfo.InvariantCulture),
+                int.Parse(mTag.Groups[2].Value, CultureInfo.InvariantCulture),
+                int.Parse(mTag.Groups[3].Value, CultureInfo.InvariantCulture), 0);
+            if (latest <= CurrentVersion) return null;
+
+            string tag = Regex.Match(json, "\"tag_name\"\\s*:\\s*\"([^\"]+)\"").Groups[1].Value;
+            UpdateInfo info = new UpdateInfo { Version = latest, Tag = tag, PageUrl = RELEASES_PAGE };
+
+            Match mPage = Regex.Match(json, "\"html_url\"\\s*:\\s*\"(https://github\\.com/" + Regex.Escape(REPO) + "/releases/tag/[^\"]+)\"");
+            if (mPage.Success) info.PageUrl = mPage.Groups[1].Value;
+
+            string sha;
+            info.DownloadUrl = FindAssetUrl(json, ASSET_EXE, tag, out sha);
+            info.Sha256 = sha;
+            string ignored;
+            info.ChecksumUrl = FindAssetUrl(json, ASSET_SHA, tag, out ignored);
+            return info;
+        }
+
+        // Asset objects end with browser_download_url, so the digest between the asset's name and
+        // its URL belongs to that asset. URLs outside this repo's release downloads are rejected.
+        private static string FindAssetUrl(string json, string assetName, string tag, out string sha256)
+        {
+            sha256 = null;
+            Match mName = Regex.Match(json, "\"name\"\\s*:\\s*\"" + Regex.Escape(assetName) + "\"");
+            if (!mName.Success) return null;
+            Match mUrl = new Regex("\"browser_download_url\"\\s*:\\s*\"([^\"]+)\"").Match(json, mName.Index);
+            if (!mUrl.Success) return null;
+
+            string url = mUrl.Groups[1].Value;
+            if (!url.StartsWith(DOWNLOAD_PREFIX + tag + "/", StringComparison.Ordinal)) return null;
+
+            string segment = json.Substring(mName.Index, mUrl.Index - mName.Index);
+            Match mDigest = Regex.Match(segment, "\"digest\"\\s*:\\s*\"sha256:([0-9A-Fa-f]{64})\"");
+            if (mDigest.Success) sha256 = mDigest.Groups[1].Value;
+            return url;
+        }
+
+        // Downloads, verifies and swaps in the new build. Nothing on disk is touched until the
+        // download has passed both the checksum and the embedded version check.
+        public static UpdateResult Install(UpdateInfo info, Action<string> progress)
+        {
+            if (info == null || info.DownloadUrl == null) throw new InvalidOperationException("This release has no downloadable executable.");
+            EnableTls12();
+
+            string expected = info.Sha256;
+            if (expected == null && info.ChecksumUrl != null)
+            {
+                Match m = Regex.Match(GetString(info.ChecksumUrl, null), "\\b[0-9A-Fa-f]{64}\\b");
+                if (m.Success) expected = m.Value;
+            }
+            if (expected == null) throw new InvalidOperationException("The release has no published SHA-256 checksum, so the download cannot be verified.");
+
+            string tmp = Path.Combine(Path.GetTempPath(), "RedgearA20-" + info.Tag + "-" + Guid.NewGuid().ToString("N") + ".exe");
+            try
+            {
+                progress("Downloading " + Display(info.Version) + "...");
+                Download(info.DownloadUrl, tmp);
+
+                progress("Verifying download...");
+                string actual = Sha256Of(tmp);
+                if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Checksum mismatch: the download is corrupted or was tampered with.");
+
+                Version fileVersion = Normalize(AssemblyName.GetAssemblyName(tmp).Version);
+                if (fileVersion != info.Version)
+                    throw new InvalidOperationException(string.Format("The downloaded build reports version {0}, expected {1}.", Display(fileVersion), Display(info.Version)));
+
+                progress("Installing " + Display(info.Version) + "...");
+                UpdateResult result = new UpdateResult();
+                string running = Application.ExecutablePath;
+                ReplaceFile(running, tmp);
+                result.RelaunchPath = running;
+
+                // The auto-start copy is what Windows launches at sign-in; keep it in step too.
+                string installed = TaskSchedulerHelper.GetInstalledExePath();
+                if (!string.Equals(Path.GetFullPath(installed), Path.GetFullPath(running), StringComparison.OrdinalIgnoreCase) && File.Exists(installed))
+                {
+                    try { ReplaceFile(installed, tmp); }
+                    catch (Exception ex) { result.Warning = "Could not update the auto-start copy at " + installed + ": " + ex.Message; }
+                }
+                return result;
+            }
+            finally
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            }
+        }
+
+        private static void Download(string url, string dest)
+        {
+            HttpWebRequest req = CreateRequest(url, 30000);
+            using (WebResponse resp = req.GetResponse())
+            {
+                if (!string.Equals(resp.ResponseUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Refusing a non-HTTPS download.");
+                using (Stream s = resp.GetResponseStream())
+                using (FileStream fs = new FileStream(dest, FileMode.CreateNew, FileAccess.Write))
+                {
+                    byte[] buf = new byte[81920];
+                    long total = 0;
+                    int n;
+                    while ((n = s.Read(buf, 0, buf.Length)) > 0)
+                    {
+                        total += n;
+                        if (total > MAX_DOWNLOAD_BYTES) throw new InvalidOperationException("The download is larger than expected.");
+                        fs.Write(buf, 0, n);
+                    }
+                }
+            }
+        }
+
+        private static string Sha256Of(string path)
+        {
+            using (SHA256 sha = SHA256.Create())
+            using (FileStream fs = File.OpenRead(path))
+            {
+                byte[] hash = sha.ComputeHash(fs);
+                StringBuilder sb = new StringBuilder(64);
+                for (int i = 0; i < hash.Length; i++) sb.Append(hash[i].ToString("x2"));
+                return sb.ToString();
+            }
+        }
+
+        // A running image cannot be overwritten, but it can be renamed out of the way.
+        private static void ReplaceFile(string target, string source)
+        {
+            if (!File.Exists(target))
+            {
+                File.Copy(source, target, false);
+                return;
+            }
+            string old = target + "." + DateTime.UtcNow.Ticks.ToString(CultureInfo.InvariantCulture) + ".old";
+            File.Move(target, old);
+            try
+            {
+                File.Copy(source, target, false);
+            }
+            catch
+            {
+                try { File.Move(old, target); } catch { }
+                throw;
+            }
+            try { File.Delete(old); } catch { } // fails while the old image is still running; cleaned up on next start
+        }
+
+        // Removes "<exe>.<ticks>.old" leftovers from a previous update.
+        public static void CleanupOldBinaries()
+        {
+            try
+            {
+                string exe = Application.ExecutablePath;
+                string dir = Path.GetDirectoryName(exe);
+                foreach (string f in Directory.GetFiles(dir, Path.GetFileName(exe) + ".*.old"))
+                {
+                    try { File.Delete(f); } catch { }
+                }
+            }
+            catch { }
+        }
+
+        public static void OpenInBrowser(string url)
+        {
+            try { Process.Start(url); } catch { }
+        }
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
     //  UI Design System Tokens (Zero-Allocation GDI+ Theme)
     // ═════════════════════════════════════════════════════════════════════════
@@ -1352,6 +1603,23 @@ namespace RedgearA20ControlCenter
         private Button btnRefresh;
         private Button btnExit;
         private Button[] presetButtons;
+
+        // Updates (stable channel via GitHub Releases)
+        private Panel pnlHeader;
+        private Panel pnlUpdateBanner;
+        private Label lblUpdate;
+        private Button btnUpdateNow;
+        private Button btnUpdateNotes;
+        private Button btnUpdateLater;
+        private Button btnCheckUpdates;
+        private System.Windows.Forms.Timer updateTimer;
+        private UpdateInfo pendingUpdate;
+        private Version balloonNotifiedVersion;
+        private bool updateBalloonActive = false;
+        private bool isCheckingUpdate = false;
+        private bool isUpdating = false;
+        private bool justUpdated = false;
+        private const int UPDATE_RECHECK_MS = 24 * 60 * 60 * 1000;
 
         // System Tray & Background Watcher
         private NotifyIcon trayIcon;
@@ -1533,6 +1801,12 @@ namespace RedgearA20ControlCenter
                     usbDebounceTimer.Dispose();
                     usbDebounceTimer = null;
                 }
+                if (updateTimer != null)
+                {
+                    updateTimer.Stop();
+                    updateTimer.Dispose();
+                    updateTimer = null;
+                }
                 if (showSignalWait != null)
                 {
                     try { showSignalWait.Unregister(null); } catch { }
@@ -1657,6 +1931,14 @@ namespace RedgearA20ControlCenter
             miApply.Click += async delegate { await ApplyCurrentProfileAsync(silent: false); };
             trayMenu.Items.Add(miApply);
 
+            ToolStripMenuItem miUpdates = new ToolStripMenuItem("Check for Updates");
+            miUpdates.Click += async delegate
+            {
+                RestoreGui();
+                await CheckForUpdatesAsync(interactive: true);
+            };
+            trayMenu.Items.Add(miUpdates);
+
             trayMenu.Items.Add(new ToolStripSeparator());
 
             ToolStripMenuItem miExit = new ToolStripMenuItem("Exit Driver (Stop Persistence)");
@@ -1687,6 +1969,220 @@ namespace RedgearA20ControlCenter
             };
 
             trayIcon.DoubleClick += delegate { RestoreGui(); };
+            trayIcon.BalloonTipClicked += delegate
+            {
+                if (!updateBalloonActive) return;
+                EndUpdateBalloon();
+                RestoreGui();
+            };
+            trayIcon.BalloonTipClosed += delegate { if (updateBalloonActive) EndUpdateBalloon(); };
+        }
+
+        // ─── UPDATES ───
+        private void InitUpdateChecker()
+        {
+            updateTimer = new System.Windows.Forms.Timer();
+            // Background starts wait for sign-in networking to settle; the GUI checks almost at once.
+            updateTimer.Interval = startHidden ? 60 * 1000 : 3000;
+            updateTimer.Tick += async delegate
+            {
+                updateTimer.Interval = UPDATE_RECHECK_MS;
+                await CheckForUpdatesAsync(interactive: false);
+            };
+            updateTimer.Start();
+        }
+
+        private async Task CheckForUpdatesAsync(bool interactive)
+        {
+            if (isCheckingUpdate || isUpdating) return;
+            isCheckingUpdate = true;
+            if (btnCheckUpdates != null) { btnCheckUpdates.Enabled = false; btnCheckUpdates.Text = "Checking..."; }
+            try
+            {
+                UpdateInfo info = await Task.Run(() => UpdateManager.CheckLatest());
+                if (info == null)
+                {
+                    if (interactive)
+                    {
+                        Log("Update check: you are on the latest stable version.", Theme.TextSecondary);
+                        MessageBox.Show(string.Format("You're on the latest stable version ({0}).", UpdateManager.Display(UpdateManager.CurrentVersion)),
+                            "No Updates", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                    return;
+                }
+
+                Log(string.Format("Update available: {0} (installed {1}).", UpdateManager.Display(info.Version), UpdateManager.Display(UpdateManager.CurrentVersion)), Theme.Accent);
+                ShowUpdateBanner(info);
+                if (!this.Visible)
+                {
+                    NotifyUpdateInBackground(info);
+                }
+                else if (interactive)
+                {
+                    await PromptAndInstallUpdateAsync(info);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine("Update check failed: " + ex.Message);
+                if (interactive)
+                {
+                    Log("Update check failed: " + ex.Message, Theme.Danger);
+                    MessageBox.Show("Could not check for updates:\n\n" + ex.Message + "\n\nCheck your internet connection and try again.",
+                        "Update Check Failed", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
+            finally
+            {
+                isCheckingUpdate = false;
+                if (btnCheckUpdates != null && !btnCheckUpdates.IsDisposed) { btnCheckUpdates.Enabled = true; btnCheckUpdates.Text = "Check for Updates"; }
+                if (!this.Visible) TrimMemory();
+            }
+        }
+
+        private void ShowUpdateBanner(UpdateInfo info)
+        {
+            pendingUpdate = info;
+            lblUpdate.Text = string.Format("⬆  {0} is available", UpdateManager.Display(info.Version));
+            btnUpdateNow.Text = info.DownloadUrl != null ? "Update Now" : "Download";
+            btnUpdateNow.Enabled = btnUpdateLater.Enabled = true;
+            if (pnlUpdateBanner.Visible) return;
+
+            int shift = pnlUpdateBanner.Height + (pnlUpdateBanner.Top - pnlHeader.Bottom);
+            pnlUpdateBanner.Visible = true;
+            body.Top += shift;
+            this.ClientSize = new Size(this.ClientSize.Width, this.ClientSize.Height + shift);
+        }
+
+        private void HideUpdateBanner()
+        {
+            if (!pnlUpdateBanner.Visible) return;
+            int shift = pnlUpdateBanner.Height + (pnlUpdateBanner.Top - pnlHeader.Bottom);
+            pnlUpdateBanner.Visible = false;
+            body.Top -= shift;
+            this.ClientSize = new Size(this.ClientSize.Width, this.ClientSize.Height - shift);
+        }
+
+        // Stealth mode has no tray icon, so it is shown just long enough to carry the notification.
+        private void NotifyUpdateInBackground(UpdateInfo info)
+        {
+            if (trayIcon == null || info.Version.Equals(balloonNotifiedVersion)) return;
+            balloonNotifiedVersion = info.Version;
+            updateBalloonActive = true;
+            trayIcon.Visible = true;
+            trayIcon.ShowBalloonTip(15000, "Redgear A20 Control Center",
+                string.Format("{0} is available. Click here to update.", UpdateManager.Display(info.Version)), ToolTipIcon.Info);
+        }
+
+        private void EndUpdateBalloon()
+        {
+            updateBalloonActive = false;
+            if (trayIcon != null) trayIcon.Visible = currentProfile != null && currentProfile.Mode == PersistenceMode.TrayAgent;
+        }
+
+        private async void BtnUpdateNow_Click(object sender, EventArgs e)
+        {
+            if (pendingUpdate != null) await PromptAndInstallUpdateAsync(pendingUpdate);
+        }
+
+        private async Task PromptAndInstallUpdateAsync(UpdateInfo info)
+        {
+            if (isUpdating) return;
+            if (info.DownloadUrl == null)
+            {
+                UpdateManager.OpenInBrowser(info.PageUrl);
+                return;
+            }
+            if (isSavingInProgress)
+            {
+                MessageBox.Show("Please wait until the current operation completes, then try again.", "Busy", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            DialogResult dr = MessageBox.Show(
+                string.Format("Download and install {0} now?\n\nThe Control Center will restart automatically. Your saved profile and settings are kept.",
+                    UpdateManager.Display(info.Version)),
+                "Update to " + UpdateManager.Display(info.Version),
+                MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (dr != DialogResult.Yes) return;
+
+            await InstallUpdateAsync(info);
+        }
+
+        private async Task InstallUpdateAsync(UpdateInfo info)
+        {
+            // isSavingInProgress blocks hardware operations and exit while files are being swapped.
+            isUpdating = true;
+            isSavingInProgress = true;
+            body.Enabled = false;
+            btnUpdateNow.Enabled = btnUpdateLater.Enabled = false;
+            bool restarting = false;
+
+            try
+            {
+                Action<string> progress = delegate(string s)
+                {
+                    try { BeginInvoke(new Action(delegate { lblUpdate.Text = s; Log(s, Theme.TextSecondary); })); } catch { }
+                };
+
+                UpdateResult result;
+                try
+                {
+                    result = await Task.Run(() => UpdateManager.Install(info, progress));
+                }
+                catch (Exception ex)
+                {
+                    Log("❌ Update failed: " + ex.Message, Theme.Danger);
+                    ShowUpdateBanner(info);
+                    DialogResult dr = MessageBox.Show(
+                        "The update could not be installed:\n\n" + ex.Message +
+                        "\n\nYour current version was not changed. Open the download page to update manually?",
+                        "Update Failed", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    if (dr == DialogResult.Yes) UpdateManager.OpenInBrowser(info.PageUrl);
+                    return;
+                }
+
+                if (result.Warning != null) Log("⚠️ " + result.Warning, Theme.Warning);
+                Log(string.Format("✅ {0} installed. Restarting...", UpdateManager.Display(info.Version)), Theme.Accent);
+
+                string args = "--updated";
+                if (!this.Visible && currentProfile != null)
+                {
+                    if (currentProfile.Mode == PersistenceMode.StealthWatcher) args = "--stealth " + args;
+                    else if (currentProfile.Mode == PersistenceMode.TrayAgent) args = "--tray " + args;
+                }
+
+                try
+                {
+                    Process.Start(new ProcessStartInfo(result.RelaunchPath, args)
+                    {
+                        WorkingDirectory = Path.GetDirectoryName(result.RelaunchPath)
+                    });
+                }
+                catch (Exception ex)
+                {
+                    Log("Could not restart automatically: " + ex.Message, Theme.Warning);
+                    MessageBox.Show(string.Format("{0} was installed, but the app could not restart automatically.\n\nPlease close and reopen the Control Center.", UpdateManager.Display(info.Version)),
+                        "Update Installed", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                // The new process waits for this one to release the single-instance lock.
+                restarting = true;
+                isSavingInProgress = false;
+                isExiting = true;
+                Application.Exit();
+            }
+            finally
+            {
+                isUpdating = false;
+                if (!restarting)
+                {
+                    isSavingInProgress = false;
+                    if (!body.IsDisposed) body.Enabled = true;
+                    if (!btnUpdateNow.IsDisposed) btnUpdateNow.Enabled = btnUpdateLater.Enabled = true;
+                }
+            }
         }
 
         private void RequestExit()
@@ -1829,14 +2325,15 @@ namespace RedgearA20ControlCenter
             }
         }
 
-        public MainForm() : this(false, false)
+        public MainForm() : this(false, false, false)
         {
         }
 
-        public MainForm(bool hidden, bool stealth)
+        public MainForm(bool hidden, bool stealth, bool updated)
         {
             this.startHidden = hidden;
             this.isStealth = stealth;
+            this.justUpdated = updated;
             this.currentProfile = AppProfile.Load();
             this.currentColor = ParseColor(currentProfile.HexColor);
             this.currentBrightness = Math.Max(5, Math.Min(100, currentProfile.Brightness));
@@ -1846,9 +2343,28 @@ namespace RedgearA20ControlCenter
             InitTrayIcon();
             InitUsbWatcher();
             InitShowSignal();
+            InitUpdateChecker();
 
             RefreshDeviceConnection();
             UpdateColorPreview();
+
+            if (justUpdated)
+            {
+                Log(string.Format("✅ Updated to {0}.", UpdateManager.Display(UpdateManager.CurrentVersion)), Theme.Accent);
+            }
+
+            // After an in-app update the visible GUI restarts; restore the saved profile (and the
+            // shortcut listener) the way a background watcher start would.
+            if (justUpdated && !startHidden)
+            {
+                this.Shown += async delegate
+                {
+                    if (currentProfile != null && currentProfile.Mode != PersistenceMode.Disabled)
+                    {
+                        await ApplyCurrentProfileAsync(silent: true);
+                    }
+                };
+            }
 
             if (startHidden)
             {
@@ -1954,7 +2470,7 @@ namespace RedgearA20ControlCenter
 
         private void InitForm()
         {
-            this.Text = "Redgear A20 Control Center v0.3.0";
+            this.Text = "Redgear A20 Control Center " + UpdateManager.Display(UpdateManager.CurrentVersion);
             this.Size = new Size(580, 835);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormBorderStyle = FormBorderStyle.FixedSingle;
@@ -1965,7 +2481,7 @@ namespace RedgearA20ControlCenter
             this.AutoScaleMode = AutoScaleMode.Dpi;
 
             // 1. Connection Header Banner
-            Panel pnlHeader = new Panel
+            pnlHeader = new Panel
             {
                 Dock = DockStyle.Top,
                 Height = 44,
@@ -2048,6 +2564,84 @@ namespace RedgearA20ControlCenter
             pnlHeader.Controls.Add(btnExit);
             pnlHeader.Controls.Add(lblStatus);
             this.Controls.Add(pnlHeader);
+
+            // Update banner: hidden until a newer stable release is found; pushes the body down.
+            pnlUpdateBanner = new Panel
+            {
+                Location = new Point(15, 52),
+                Size = new Size(535, 36),
+                BackColor = Theme.AccentDim,
+                Visible = false
+            };
+            pnlUpdateBanner.Paint += delegate(object s, PaintEventArgs e)
+            {
+                e.Graphics.DrawRectangle(Theme.PenAccent, 0, 0, pnlUpdateBanner.Width - 1, pnlUpdateBanner.Height - 1);
+            };
+
+            lblUpdate = new Label
+            {
+                Location = new Point(12, 0),
+                Size = new Size(250, 36),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = Theme.FontBodyBold,
+                ForeColor = Theme.TextPrimary,
+                AutoEllipsis = true,
+                BackColor = Color.Transparent
+            };
+            pnlUpdateBanner.Controls.Add(lblUpdate);
+
+            btnUpdateNotes = new Button
+            {
+                Text = "What's New",
+                Location = new Point(267, 5),
+                Size = new Size(90, 26),
+                BackColor = Theme.SurfaceElevated,
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.FontBodySecondary,
+                FlatStyle = FlatStyle.Flat,
+                AccessibleName = "Open the release notes for the new version"
+            };
+            btnUpdateNotes.FlatAppearance.BorderColor = Theme.Border;
+            btnUpdateNotes.FlatAppearance.BorderSize = 1;
+            btnUpdateNotes.Click += delegate
+            {
+                UpdateManager.OpenInBrowser(pendingUpdate != null ? pendingUpdate.PageUrl : UpdateManager.RELEASES_PAGE);
+            };
+            pnlUpdateBanner.Controls.Add(btnUpdateNotes);
+
+            btnUpdateNow = new Button
+            {
+                Text = "Update Now",
+                Location = new Point(363, 5),
+                Size = new Size(100, 26),
+                BackColor = Theme.Accent,
+                ForeColor = Theme.AccentText,
+                Font = Theme.FontBodyBold,
+                FlatStyle = FlatStyle.Flat,
+                AccessibleName = "Download and install the newest stable version"
+            };
+            btnUpdateNow.FlatAppearance.BorderColor = Theme.AccentHover;
+            btnUpdateNow.FlatAppearance.BorderSize = 1;
+            btnUpdateNow.Click += BtnUpdateNow_Click;
+            pnlUpdateBanner.Controls.Add(btnUpdateNow);
+
+            btnUpdateLater = new Button
+            {
+                Text = "Later",
+                Location = new Point(469, 5),
+                Size = new Size(54, 26),
+                BackColor = Theme.Surface,
+                ForeColor = Theme.TextSecondary,
+                Font = Theme.FontBodySecondary,
+                FlatStyle = FlatStyle.Flat,
+                AccessibleName = "Hide the update notice for now"
+            };
+            btnUpdateLater.FlatAppearance.BorderColor = Theme.Border;
+            btnUpdateLater.FlatAppearance.BorderSize = 1;
+            btnUpdateLater.Click += delegate { HideUpdateBanner(); };
+            pnlUpdateBanner.Controls.Add(btnUpdateLater);
+
+            this.Controls.Add(pnlUpdateBanner);
 
             // Container Panel
             body = new Panel { Location = new Point(15, 52), Size = new Size(535, 735) };
@@ -2457,6 +3051,34 @@ namespace RedgearA20ControlCenter
             btnClearLog.FlatAppearance.BorderSize = 1;
             btnClearLog.Click += delegate { rtbLog.Clear(); };
             gbLog.Controls.Add(btnClearLog);
+
+            btnCheckUpdates = new Button
+            {
+                Text = "Check for Updates",
+                Location = new Point(12, 192),
+                Size = new Size(125, 25),
+                BackColor = Theme.SurfaceElevated,
+                ForeColor = Theme.TextPrimary,
+                Font = Theme.FontBodySecondary,
+                FlatStyle = FlatStyle.Flat,
+                TabIndex = 27,
+                AccessibleName = "Check GitHub for a newer stable version"
+            };
+            btnCheckUpdates.FlatAppearance.BorderColor = Theme.Border;
+            btnCheckUpdates.FlatAppearance.BorderSize = 1;
+            btnCheckUpdates.Click += async delegate { await CheckForUpdatesAsync(interactive: true); };
+            gbLog.Controls.Add(btnCheckUpdates);
+
+            Label lblVersion = new Label
+            {
+                Text = "Installed " + UpdateManager.Display(UpdateManager.CurrentVersion),
+                Location = new Point(143, 192),
+                Size = new Size(120, 25),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = Theme.FontBodySecondary,
+                ForeColor = Theme.TextMuted
+            };
+            gbLog.Controls.Add(lblVersion);
 
             body.Controls.Add(gbLog);
             this.Controls.Add(body);
@@ -3646,6 +4268,7 @@ namespace RedgearA20ControlCenter
             bool startHidden = false;
             bool isStealth = false;
             bool applyAndExit = false;
+            bool justUpdated = false;
 
             bool installTask = false;
             bool removeTask = false;
@@ -3670,6 +4293,10 @@ namespace RedgearA20ControlCenter
                     else if (a == "--apply-and-exit" || a == "-apply" || a == "/apply")
                     {
                         applyAndExit = true;
+                    }
+                    else if (a == "--updated")
+                    {
+                        justUpdated = true;
                     }
                     else if (a == "--install-task" || a == "-install-task" || a == "/install-task" || a == "--install")
                     {
@@ -3766,6 +4393,13 @@ namespace RedgearA20ControlCenter
                 createdNew = true;
             }
 
+            if (!createdNew && justUpdated)
+            {
+                // The previous version is still shutting down; take over once it releases the lock.
+                try { createdNew = appMutex.WaitOne(15000, false); }
+                catch (AbandonedMutexException) { createdNew = true; }
+            }
+
             if (!createdNew)
             {
                 if (!startHidden)
@@ -3781,7 +4415,8 @@ namespace RedgearA20ControlCenter
             {
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new MainForm(startHidden, isStealth));
+                UpdateManager.CleanupOldBinaries();
+                Application.Run(new MainForm(startHidden, isStealth, justUpdated));
             }
             finally
             {

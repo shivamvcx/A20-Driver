@@ -1,6 +1,6 @@
 # Redgear A20 Control Center
 
-[![Download Executable](https://img.shields.io/github/v/release/shivamvcx/A20-Driver?include_prereleases&label=Download%20.exe&color=success)](https://github.com/shivamvcx/A20-Driver/releases)
+[![Download Executable](https://img.shields.io/badge/Download%20.exe-v0.2.1-success)](https://github.com/shivamvcx/A20-Driver/releases)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform: Windows x64](https://img.shields.io/badge/Platform-Windows%2010%20%2F%2011%20(64--bit)-0078D6.svg)](https://microsoft.com)
 [![Architecture: C# WinForms](https://img.shields.io/badge/Architecture-C%23%20WinForms-239120.svg)](src/Program.cs)
@@ -41,6 +41,10 @@ It talks directly to the **Redgear A20 RGB Gaming Mouse** (`VID: 0x18F8 & PID: 0
 5. Under **Persistence Mode**, select **Stealth Driver Watcher**, then click **Save Profile**.
 6. Close the window. Your settings now persist silently across reboots and USB replugs.
 7. *(Optional)* Open the **Button Mapper** to remap buttons or assign keyboard shortcuts. Shortcuts need the app running in the background, so keep **Stealth Watcher** or **Tray Agent** enabled.
+
+## Updating
+
+The app checks GitHub Releases for a newer **stable** version (drafts and pre-releases are never offered) — at launch, then once a day while running in the background. When one is found, an **Update available** banner appears; in Stealth or Tray mode a Windows notification is shown instead. Click **Update Now** and the new build is downloaded, verified against its published SHA-256 checksum, installed in place, and the app restarts with your profile intact. You can also check manually with **Check for Updates** (bottom of the log panel or the tray menu). If an update can't be installed — for example, the exe lives in a protected folder — your current version is left untouched and you're offered the download page instead.
 
 ## How Persistence Works
 
