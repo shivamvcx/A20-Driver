@@ -10,8 +10,9 @@ Security and stability updates are provided for the following versions:
 
 | Version | Supported | Notes |
 | :---: | :---: | :--- |
-| `0.1.x` | ✅ Yes | Current active release |
-| `< 0.1.0` | ❌ No | Exploratory reverse-engineering builds |
+| `0.4.x` | ✅ Yes | Current release line |
+| `0.3.x` | ⚠️ Critical fixes only | Please update; the in-app updater installs the latest stable build |
+| `< 0.3.0` | ❌ No | Older releases and exploratory reverse-engineering builds |
 
 ---
 
@@ -21,6 +22,8 @@ We welcome reports regarding:
 1. **Hardware Communication Safety**: USB Feature Reports or parameters that could induce microcontroller buffer overflows, MCU deadlocks, or GPIO scan loop starvation.
 2. **Win32 P/Invoke Memory Safety**: Unhandled pointer dereferences, buffer overflows, or handle leaks in `hid.dll` or `setupapi.dll` calls.
 3. **Privilege & Execution Safety**: Any vector allowing unauthorized privilege escalation, persistence, or malicious payload execution.
+4. **Update & Installer Integrity**: Ways to make the in-app updater install a binary that doesn't match its published SHA-256 checksum, or to tamper with the per-user Setup installer or uninstaller.
+5. **Keyboard Shortcut Safety**: Ways for a profile to make the mouse send blocked combinations (such as Ctrl + Alt + Del) or keys outside the allow-list.
 
 *(Note: Third-party physical hardware damage resulting from modifying source code to bypass safety delays or send arbitrary unknown opcodes to the device is outside project liability; please see our [DISCLAIMER](README.md#disclaimer).)*
 
@@ -51,4 +54,4 @@ Please include:
 
 * **Acknowledgment**: We aim to acknowledge receipt within **48 hours**.
 * **Assessment & Fix**: A patch or mitigation will be developed and validated in a private branch before public disclosure.
-* **Public Release**: A patched release (`v0.1.x`) and security advisory will be published simultaneously with credit to the reporter.
+* **Public Release**: A patched release (`v0.4.x`) and security advisory will be published simultaneously with credit to the reporter.
