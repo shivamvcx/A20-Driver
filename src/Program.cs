@@ -845,6 +845,25 @@ namespace RedgearA20ControlCenter
         // Global UI preference stored in profile.json only: 0 = System, 1 = Dark, 2 = Light.
         public int ThemePref = 0;
 
+        // Global list of recently applied custom colours ("#RRGGBB,..."), newest first.
+        public const int MAX_RECENT_COLORS = 8;
+        public string RecentColors = "";
+
+        public static string NormalizeRecentColors(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            List<string> list = new List<string>();
+            foreach (string part in text.Split(','))
+            {
+                string hex = part.Trim().TrimStart('#').ToUpperInvariant();
+                if (!Regex.IsMatch(hex, "^[0-9A-F]{6}$")) continue;
+                hex = "#" + hex;
+                if (!list.Contains(hex)) list.Add(hex);
+                if (list.Count >= MAX_RECENT_COLORS) break;
+            }
+            return string.Join(",", list.ToArray());
+        }
+
         // Button remapping (Cmd 0x10). Absent/unparsable entries fall back to the factory
         // action, so an older or hand-edited profile can never put an unknown byte on the wire.
         public Dictionary<byte, ButtonAction> ButtonBindings = new Dictionary<byte, ButtonAction>();
@@ -992,6 +1011,9 @@ namespace RedgearA20ControlCenter
                     Match mTheme = Regex.Match(json, "\"Theme\"\\s*:\\s*(\\d+)");
                     if (mTheme.Success) p.ThemePref = ParseClampedInt(mTheme.Groups[1].Value, 0, 2, 0);
 
+                    Match mRecent = Regex.Match(json, "\"RecentColors\"\\s*:\\s*\"([^\"]*)\"");
+                    if (mRecent.Success) p.RecentColors = NormalizeRecentColors(mRecent.Groups[1].Value);
+
                     Match mHex = Regex.Match(json, "\"HexColor\"\\s*:\\s*\"([^\"]+)\"");
                     if (mHex.Success)
                     {
@@ -1075,6 +1097,7 @@ namespace RedgearA20ControlCenter
             c.Name = Name;
             c.Mode = Mode;
             c.ThemePref = ThemePref;
+            c.RecentColors = RecentColors;
             c.CopySettingsFrom(this);
             return c;
         }
@@ -1162,9 +1185,11 @@ namespace RedgearA20ControlCenter
                 if (name.Length == 0) name = "Profile";
                 string idPart = (!string.IsNullOrEmpty(Id) && Regex.IsMatch(Id, "^[0-9a-fA-F]{8,32}$"))
                     ? string.Format("  \"ProfileId\": \"{0}\",\n", Id) : "";
+                string recent = NormalizeRecentColors(RecentColors);
+                string recentPart = recent.Length > 0 ? string.Format(",\n  \"RecentColors\": \"{0}\"", recent) : "";
 
-                string json = string.Format("{{\n  \"ProfileName\": \"{6}\",\n{7}  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"ActiveDpiStage\": {2},\n  \"EnableDpi\": {3},\n  \"PersistenceMode\": {4},\n  \"Theme\": {8}{5}\n}}\n",
-                    HexColor, bri, dpi, EnableDpi.ToString().ToLower(), (int)Mode, sbBinds.ToString(), name, idPart, Math.Max(0, Math.Min(2, ThemePref)));
+                string json = string.Format("{{\n  \"ProfileName\": \"{6}\",\n{7}  \"HexColor\": \"{0}\",\n  \"Brightness\": {1},\n  \"ActiveDpiStage\": {2},\n  \"EnableDpi\": {3},\n  \"PersistenceMode\": {4},\n  \"Theme\": {8}{9}{5}\n}}\n",
+                    HexColor, bri, dpi, EnableDpi.ToString().ToLower(), (int)Mode, sbBinds.ToString(), name, idPart, Math.Max(0, Math.Min(2, ThemePref)), recentPart);
 
                 tmpFile = file + ".tmp";
                 File.WriteAllText(tmpFile, json, Encoding.UTF8);
@@ -4899,12 +4924,38 @@ namespace RedgearA20ControlCenter
         private void PickCustomColor()
         {
             if (draft == null) return;
-            using (ColorDialog cd = new ColorDialog())
+            List<Color> recent = new List<Color>();
+            foreach (string part in AppProfile.NormalizeRecentColors(currentProfile.RecentColors).Split(','))
             {
-                cd.Color = ParseColor(draft.HexColor);
-                cd.FullOpen = true;
-                if (cd.ShowDialog(this) == DialogResult.OK) SetDraftColor(cd.Color);
+                if (part.Length == 7) recent.Add(ParseColor(part));
             }
+            using (ColorPickerForm f = new ColorPickerForm(ParseColor(draft.HexColor), recent))
+            {
+                // Live preview on the hero only; nothing reaches the mouse until Preview / Save.
+                f.LivePreview = delegate(Color c)
+                {
+                    if (!uiBuilt || hero == null) return;
+                    hero.Led = c;
+                    hero.Readout = FormatHexColor(c) + " · " + ProfileListView.Describe(draft);
+                    hero.Invalidate(true);
+                };
+                if (f.ShowDialog(this) == DialogResult.OK)
+                {
+                    SetDraftColor(f.Result);
+                    RememberRecentColor(f.Result);
+                }
+                else RefreshDraftState();
+            }
+        }
+
+        private void RememberRecentColor(Color c)
+        {
+            string joined = AppProfile.NormalizeRecentColors(FormatHexColor(c) + "," + currentProfile.RecentColors);
+            if (joined == currentProfile.RecentColors) return;
+            currentProfile.RecentColors = joined;
+            if (draft != null) draft.RecentColors = joined;
+            string err;
+            currentProfile.Save(out err);
         }
 
         // Validates the hex box. Returns false (and restores the box) when the text is not #RRGGBB.
@@ -6686,6 +6737,657 @@ namespace RedgearA20ControlCenter
             }
             Result = ks;
             DialogResult = DialogResult.OK;
+        }
+    }
+
+    // ─── Colour picker ───
+    public static class ColorMath
+    {
+        public static Color FromHsv(float h, float s, float v)
+        {
+            h = h % 360f;
+            if (h < 0) h += 360f;
+            s = Math.Max(0f, Math.Min(1f, s));
+            v = Math.Max(0f, Math.Min(1f, v));
+            float c = v * s, x = c * (1f - Math.Abs((h / 60f) % 2f - 1f)), m = v - c;
+            float r, g, b;
+            if (h < 60) { r = c; g = x; b = 0; }
+            else if (h < 120) { r = x; g = c; b = 0; }
+            else if (h < 180) { r = 0; g = c; b = x; }
+            else if (h < 240) { r = 0; g = x; b = c; }
+            else if (h < 300) { r = x; g = 0; b = c; }
+            else { r = c; g = 0; b = x; }
+            return Color.FromArgb(To255(r + m), To255(g + m), To255(b + m));
+        }
+
+        private static int To255(float f) { return Math.Max(0, Math.Min(255, (int)Math.Round(f * 255f))); }
+
+        public static void ToHsv(Color c, out float h, out float s, out float v)
+        {
+            float r = c.R / 255f, g = c.G / 255f, b = c.B / 255f;
+            float max = Math.Max(r, Math.Max(g, b)), min = Math.Min(r, Math.Min(g, b)), d = max - min;
+            v = max;
+            s = max <= 0 ? 0 : d / max;
+            if (d <= 0) h = 0;
+            else if (max == r) h = 60f * (((g - b) / d) % 6f);
+            else if (max == g) h = 60f * ((b - r) / d + 2f);
+            else h = 60f * ((r - g) / d + 4f);
+            if (h < 0) h += 360f;
+        }
+
+        public static string Hex(Color c) { return string.Format("#{0:X2}{1:X2}{2:X2}", c.R, c.G, c.B); }
+
+        public static bool TryParseHex(string text, out Color c)
+        {
+            c = Color.Empty;
+            if (text == null) return false;
+            string t = text.Trim().TrimStart('#');
+            if (!Regex.IsMatch(t, "^[0-9A-Fa-f]{6}$")) return false;
+            int v = int.Parse(t, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+            c = Color.FromArgb((v >> 16) & 255, (v >> 8) & 255, v & 255);
+            return true;
+        }
+
+        public static bool IsLight(Color c) { return c.R * 299 + c.G * 587 + c.B * 114 > 150000; }
+
+        public static void DrawMarkerRing(Graphics g, RectangleF r, float radius)
+        {
+            Ui.DrawRound(g, Color.FromArgb(110, 0, 0, 0), new RectangleF(r.X - Ui.Sf(1), r.Y - Ui.Sf(1), r.Width + Ui.Sf(2), r.Height + Ui.Sf(2)), radius + Ui.Sf(1), Ui.Sf(1));
+            Ui.DrawRound(g, Color.White, r, radius, Math.Max(2f, Ui.Sf(2)));
+        }
+    }
+
+    // Saturation (x) / value (y) square. The gradient is a cached bitmap rebuilt only when the hue or size changes.
+    public class SvPlane : Control
+    {
+        public float Hue, Sat = 1f, Val = 1f;
+        public event EventHandler ValueChanged;
+        private Bitmap plane;
+        private TextureBrush planeBrush;
+        private int[] pixels;
+        private float builtHue = -1f;
+        private bool dragging;
+
+        public SvPlane()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            TabStop = true;
+            Cursor = Cursors.Cross;
+            AccessibleRole = AccessibleRole.Slider;
+        }
+
+        private Rectangle Plane
+        {
+            get { int p = Ui.S(8); return new Rectangle(p, p, Math.Max(2, Width - 2 * p), Math.Max(2, Height - 2 * p)); }
+        }
+
+        private void Build(Rectangle r)
+        {
+            if (planeBrush != null) { planeBrush.Dispose(); planeBrush = null; }
+            int w = r.Width, h = r.Height;
+            if (plane == null || plane.Width != w || plane.Height != h)
+            {
+                if (plane != null) plane.Dispose();
+                plane = new Bitmap(w, h, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+                pixels = new int[w * h];
+            }
+            Color pure = ColorMath.FromHsv(Hue, 1f, 1f);
+            float pr = pure.R / 255f, pg = pure.G / 255f, pb = pure.B / 255f;
+            float wd = w - 1, hd = h - 1;
+            for (int y = 0; y < h; y++)
+            {
+                float v = (1f - y / hd) * 255f;
+                int row = y * w;
+                for (int x = 0; x < w; x++)
+                {
+                    float s = x / wd, k = 1f - s;
+                    int rr = (int)(v * (k + s * pr) + 0.5f);
+                    int gg = (int)(v * (k + s * pg) + 0.5f);
+                    int bb = (int)(v * (k + s * pb) + 0.5f);
+                    pixels[row + x] = unchecked((int)0xFF000000) | (rr << 16) | (gg << 8) | bb;
+                }
+            }
+            System.Drawing.Imaging.BitmapData bd = plane.LockBits(new Rectangle(0, 0, w, h), System.Drawing.Imaging.ImageLockMode.WriteOnly, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+            try
+            {
+                for (int y = 0; y < h; y++) Marshal.Copy(pixels, y * w, new IntPtr(bd.Scan0.ToInt64() + (long)y * bd.Stride), w);
+            }
+            finally { plane.UnlockBits(bd); }
+            builtHue = Hue;
+            planeBrush = new TextureBrush(plane, WrapMode.Clamp);
+            planeBrush.TranslateTransform(r.X, r.Y);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            Rectangle r = Plane;
+            if (plane == null || planeBrush == null || builtHue != Hue || plane.Width != r.Width || plane.Height != r.Height) Build(r);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float radius = Ui.Sf(8);
+            RectangleF rf = new RectangleF(r.X, r.Y, r.Width, r.Height);
+            using (GraphicsPath p = Ui.RoundRect(rf, radius)) g.FillPath(planeBrush, p);
+            Ui.DrawRound(g, Color.FromArgb(40, Theme.TextPrimary), rf, radius, 1f);
+            if (Focused && ShowFocusCues)
+                Ui.DrawRound(g, Theme.Accent, new RectangleF(rf.X - Ui.Sf(3), rf.Y - Ui.Sf(3), rf.Width + Ui.Sf(6), rf.Height + Ui.Sf(6)), radius + Ui.Sf(3), Math.Max(1.5f, Ui.Sf(1.5f)));
+
+            float mx = r.X + Sat * (r.Width - 1), my = r.Y + (1f - Val) * (r.Height - 1), mr = Ui.Sf(7);
+            RectangleF m = new RectangleF(mx - mr, my - mr, mr * 2, mr * 2);
+            using (SolidBrush b = new SolidBrush(ColorMath.FromHsv(Hue, Sat, Val))) g.FillEllipse(b, m);
+            using (Pen outer = new Pen(Color.FromArgb(110, 0, 0, 0), Ui.Sf(1)))
+                g.DrawEllipse(outer, mx - mr - Ui.Sf(1), my - mr - Ui.Sf(1), mr * 2 + Ui.Sf(2), mr * 2 + Ui.Sf(2));
+            using (Pen ring = new Pen(Color.White, Math.Max(2f, Ui.Sf(2)))) g.DrawEllipse(ring, m);
+        }
+
+        private void SetFrom(Point pt)
+        {
+            Rectangle r = Plane;
+            Sat = Math.Max(0f, Math.Min(1f, (pt.X - r.X) / (float)(r.Width - 1)));
+            Val = 1f - Math.Max(0f, Math.Min(1f, (pt.Y - r.Y) / (float)(r.Height - 1)));
+            Changed();
+        }
+
+        private void Changed()
+        {
+            Invalidate();
+            if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            Focus();
+            if (e.Button == MouseButtons.Left) { dragging = true; Capture = true; SetFrom(e.Location); }
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            if (dragging) SetFrom(e.Location);
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            dragging = false;
+            Capture = false;
+            base.OnMouseUp(e);
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            Keys k = keyData & Keys.KeyCode;
+            return k == Keys.Left || k == Keys.Right || k == Keys.Up || k == Keys.Down || base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            float step = e.Shift ? 0.1f : 0.01f;
+            bool hit = true;
+            if (e.KeyCode == Keys.Left) Sat = Math.Max(0f, Sat - step);
+            else if (e.KeyCode == Keys.Right) Sat = Math.Min(1f, Sat + step);
+            else if (e.KeyCode == Keys.Up) Val = Math.Min(1f, Val + step);
+            else if (e.KeyCode == Keys.Down) Val = Math.Max(0f, Val - step);
+            else hit = false;
+            if (hit) { e.Handled = true; Changed(); }
+            base.OnKeyDown(e);
+        }
+
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (planeBrush != null) { planeBrush.Dispose(); planeBrush = null; }
+                if (plane != null) { plane.Dispose(); plane = null; }
+                pixels = null;
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    // Vertical hue strip (0° top to 360° bottom). The strip is built once per size.
+    public class HueBar : Control
+    {
+        public float Hue;
+        public event EventHandler ValueChanged;
+        private Bitmap strip;
+        private TextureBrush stripBrush;
+        private bool dragging;
+
+        public HueBar()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            TabStop = true;
+            Cursor = Cursors.Hand;
+            AccessibleRole = AccessibleRole.Slider;
+        }
+
+        private Rectangle Bar
+        {
+            get { int px = Ui.S(6), py = Ui.S(8); return new Rectangle(px, py, Math.Max(2, Width - 2 * px), Math.Max(2, Height - 2 * py)); }
+        }
+
+        private void Build(Rectangle r)
+        {
+            if (stripBrush != null) stripBrush.Dispose();
+            if (strip != null) strip.Dispose();
+            strip = new Bitmap(r.Width, r.Height, System.Drawing.Imaging.PixelFormat.Format32bppRgb);
+            using (Graphics g = Graphics.FromImage(strip))
+            {
+                for (int y = 0; y < r.Height; y++)
+                {
+                    using (Pen p = new Pen(ColorMath.FromHsv(360f * y / (r.Height - 1), 1f, 1f)))
+                        g.DrawLine(p, 0, y, r.Width, y);
+                }
+            }
+            stripBrush = new TextureBrush(strip, WrapMode.Clamp);
+            stripBrush.TranslateTransform(r.X, r.Y);
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            Rectangle r = Bar;
+            if (strip == null || strip.Width != r.Width || strip.Height != r.Height) Build(r);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float radius = Ui.Sf(6);
+            RectangleF rf = new RectangleF(r.X, r.Y, r.Width, r.Height);
+            using (GraphicsPath p = Ui.RoundRect(rf, radius)) g.FillPath(stripBrush, p);
+            if (Focused && ShowFocusCues)
+                Ui.DrawRound(g, Theme.Accent, new RectangleF(rf.X - Ui.Sf(3), rf.Y - Ui.Sf(3), rf.Width + Ui.Sf(6), rf.Height + Ui.Sf(6)), radius + Ui.Sf(3), Math.Max(1.5f, Ui.Sf(1.5f)));
+
+            float y = r.Y + Hue / 360f * (r.Height - 1), th = Ui.Sf(10), ov = Ui.Sf(3);
+            RectangleF thumb = new RectangleF(r.X - ov, y - th / 2f, r.Width + ov * 2, th);
+            Ui.FillRound(g, ColorMath.FromHsv(Hue, 1f, 1f), thumb, th / 2f);
+            ColorMath.DrawMarkerRing(g, thumb, th / 2f);
+        }
+
+        private void SetFrom(int y)
+        {
+            Rectangle r = Bar;
+            Hue = 360f * Math.Max(0f, Math.Min(1f, (y - r.Y) / (float)(r.Height - 1)));
+            Changed();
+        }
+
+        private void Changed()
+        {
+            Invalidate();
+            if (ValueChanged != null) ValueChanged(this, EventArgs.Empty);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            Focus();
+            if (e.Button == MouseButtons.Left) { dragging = true; Capture = true; SetFrom(e.Y); }
+            base.OnMouseDown(e);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            if (dragging) SetFrom(e.Y);
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            dragging = false;
+            Capture = false;
+            base.OnMouseUp(e);
+        }
+
+        protected override bool IsInputKey(Keys keyData)
+        {
+            Keys k = keyData & Keys.KeyCode;
+            return k == Keys.Up || k == Keys.Down || base.IsInputKey(keyData);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            float step = e.Shift ? 10f : 1f;
+            if (e.KeyCode == Keys.Up || e.KeyCode == Keys.Down)
+            {
+                Hue = Math.Max(0f, Math.Min(360f, Hue + (e.KeyCode == Keys.Up ? -step : step)));
+                e.Handled = true;
+                Changed();
+            }
+            base.OnKeyDown(e);
+        }
+
+        protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+        protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                if (stripBrush != null) { stripBrush.Dispose(); stripBrush = null; }
+                if (strip != null) { strip.Dispose(); strip = null; }
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    // New colour on top, current colour below. Clicking the lower half reverts.
+    public class ColorCompare : Control
+    {
+        public Color NewColor, OldColor;
+        public event EventHandler Revert;
+
+        public ColorCompare()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            AccessibleRole = AccessibleRole.Graphic;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            RectangleF r = new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f);
+            float radius = Ui.Sf(8);
+            int half = Height / 2;
+            Ui.FillRound(g, NewColor, r, radius);
+            GraphicsState st = g.Save();
+            g.SetClip(new Rectangle(0, half, Width, Height - half));
+            Ui.FillRound(g, OldColor, r, radius);
+            g.Restore(st);
+            Ui.DrawRound(g, Theme.Border, r, radius, 1f);
+
+            TextFormatFlags f = TextFormatFlags.HorizontalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding;
+            Ui.Text(g, "NEW", Ui.Caption, new Rectangle(0, Ui.S(8), Width, Ui.S(16)), ColorMath.IsLight(NewColor) ? Color.FromArgb(160, 0, 0, 0) : Color.FromArgb(220, 255, 255, 255), f);
+            Ui.Text(g, "CURRENT", Ui.Caption, new Rectangle(0, Height - Ui.S(24), Width, Ui.S(16)), ColorMath.IsLight(OldColor) ? Color.FromArgb(160, 0, 0, 0) : Color.FromArgb(220, 255, 255, 255), f);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            Cursor = e.Y >= Height / 2 ? Cursors.Hand : Cursors.Default;
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left && e.Y >= Height / 2 && Revert != null) Revert(this, EventArgs.Empty);
+            base.OnMouseClick(e);
+        }
+    }
+
+    // Row of recently applied colours.
+    public class RecentColorRow : Control
+    {
+        public List<Color> Colors = new List<Color>();
+        public Color Current;
+        public event EventHandler<ColorEventArgs> Picked;
+        private int hover = -1;
+
+        public RecentColorRow()
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            AccessibleRole = AccessibleRole.List;
+        }
+
+        private Rectangle Swatch(int i)
+        {
+            int pad = Ui.S(3), size = Height - pad * 2, gap = Ui.S(8);
+            return new Rectangle(pad + i * (size + gap), pad, size, size);
+        }
+
+        private int HitTest(Point p)
+        {
+            for (int i = 0; i < Colors.Count; i++) if (Swatch(i).Contains(p)) return i;
+            return -1;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Ui.PaintParentBackground(this, g);
+            if (Colors.Count == 0)
+            {
+                Ui.Text(g, "Colours you apply from this picker will show up here.", Ui.Small, new Rectangle(Ui.S(3), 0, Width, Height), Theme.TextMuted,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+                return;
+            }
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            float radius = Ui.Sf(6);
+            for (int i = 0; i < Colors.Count; i++)
+            {
+                Rectangle s = Swatch(i);
+                RectangleF rf = new RectangleF(s.X + 0.5f, s.Y + 0.5f, s.Width - 1f, s.Height - 1f);
+                Ui.FillRound(g, Colors[i], rf, radius);
+                Ui.DrawRound(g, Color.FromArgb(50, Theme.TextPrimary), rf, radius, 1f);
+                bool selected = Colors[i].ToArgb() == Current.ToArgb();
+                if (selected || i == hover)
+                {
+                    float o = Ui.Sf(2.5f);
+                    Ui.DrawRound(g, selected ? Theme.Accent : Theme.TextMuted, new RectangleF(rf.X - o, rf.Y - o, rf.Width + o * 2, rf.Height + o * 2), radius + o, Math.Max(1.5f, Ui.Sf(1.5f)));
+                }
+            }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            int h = HitTest(e.Location);
+            if (h != hover) { hover = h; Cursor = h >= 0 ? Cursors.Hand : Cursors.Default; Invalidate(); }
+            base.OnMouseMove(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            if (hover != -1) { hover = -1; Invalidate(); }
+            base.OnMouseLeave(e);
+        }
+
+        protected override void OnMouseClick(MouseEventArgs e)
+        {
+            int h = HitTest(e.Location);
+            if (e.Button == MouseButtons.Left && h >= 0 && Picked != null) Picked(this, new ColorEventArgs(Colors[h]));
+            base.OnMouseClick(e);
+        }
+    }
+
+    public class ColorEventArgs : EventArgs
+    {
+        public readonly Color Color;
+        public ColorEventArgs(Color c) { Color = c; }
+    }
+
+    public class ColorPickerForm : Form
+    {
+        private readonly SvPlane plane;
+        private readonly HueBar hueBar;
+        private readonly ColorCompare compare;
+        private readonly RecentColorRow recent;
+        private readonly TextBox txtHex, txtR, txtG, txtB;
+        private readonly Color initial;
+        private float hue, sat, val;
+        private Color color;
+        private bool suppress;
+
+        public Color Result;
+        public Action<Color> LivePreview;
+
+        public ColorPickerForm(Color start, List<Color> recentColors)
+        {
+            Text = "Custom colour";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+            AutoScaleMode = AutoScaleMode.None;
+            ClientSize = new Size(Ui.S(460), Ui.S(492));
+            BackColor = Theme.Canvas;
+            ForeColor = Theme.TextPrimary;
+            Font = Ui.Body;
+            initial = Color.FromArgb(start.R, start.G, start.B);
+
+            AddLabel("Custom colour", Ui.Big, Theme.TextPrimary, Ui.R(24, 20, 412, 26));
+            AddLabel("Drag to choose. The mouse only changes when you Preview or Save.", Ui.Small, Theme.TextSecondary, Ui.R(24, 48, 412, 18));
+
+            plane = new SvPlane { Bounds = Ui.R(16, 72, 312, 216), AccessibleName = "Saturation and brightness" };
+            plane.ValueChanged += delegate { sat = plane.Sat; val = plane.Val; color = ColorMath.FromHsv(hue, sat, val); Sync(plane); };
+            Controls.Add(plane);
+
+            hueBar = new HueBar { Bounds = Ui.R(326, 72, 36, 216), AccessibleName = "Hue" };
+            hueBar.ValueChanged += delegate { hue = hueBar.Hue; color = ColorMath.FromHsv(hue, sat, val); Sync(hueBar); };
+            Controls.Add(hueBar);
+
+            compare = new ColorCompare { Bounds = Ui.R(368, 80, 68, 200), OldColor = initial, AccessibleName = "Colour preview. Click the lower half to revert." };
+            compare.Revert += delegate { SetFromRgb(initial, null); };
+            Controls.Add(compare);
+
+            AddLabel("HEX", Ui.Caption, Theme.TextMuted, Ui.R(24, 296, 124, 16));
+            AddLabel("R", Ui.Caption, Theme.TextMuted, Ui.R(160, 296, 84, 16));
+            AddLabel("G", Ui.Caption, Theme.TextMuted, Ui.R(256, 296, 84, 16));
+            AddLabel("B", Ui.Caption, Theme.TextMuted, Ui.R(352, 296, 84, 16));
+
+            txtHex = AddInput(Ui.R(24, 316, 124, 36), 7, "Hex colour code");
+            txtHex.TextChanged += delegate
+            {
+                Color c;
+                if (!suppress && ColorMath.TryParseHex(txtHex.Text, out c)) SetFromRgb(c, txtHex);
+            };
+            txtR = AddChannel(Ui.R(160, 316, 84, 36), "Red");
+            txtG = AddChannel(Ui.R(256, 316, 84, 36), "Green");
+            txtB = AddChannel(Ui.R(352, 316, 84, 36), "Blue");
+
+            AddLabel("RECENT", Ui.Caption, Theme.TextMuted, Ui.R(24, 364, 412, 16));
+            recent = new RecentColorRow { Bounds = Ui.R(21, 381, 418, 34), AccessibleName = "Recent colours" };
+            if (recentColors != null) recent.Colors.AddRange(recentColors);
+            recent.Picked += delegate(object s, ColorEventArgs e) { SetFromRgb(e.Color, null); };
+            Controls.Add(recent);
+
+            Panel footer = new Panel { Bounds = new Rectangle(0, Ui.S(428), ClientSize.Width, ClientSize.Height - Ui.S(428)), BackColor = Theme.Surface };
+            footer.Paint += delegate(object s, PaintEventArgs e)
+            {
+                using (Pen p = new Pen(Theme.Border)) e.Graphics.DrawLine(p, 0, 0, footer.Width, 0);
+            };
+            Controls.Add(footer);
+
+            UiButton btnCancel = new UiButton(UiButtonKind.Secondary, "Cancel", null) { Bounds = Ui.R(224, 14, 100, 36), DialogResult = DialogResult.Cancel };
+            footer.Controls.Add(btnCancel);
+            UiButton btnOk = new UiButton(UiButtonKind.Primary, "Apply", Glyphs.Check) { Bounds = Ui.R(336, 14, 100, 36) };
+            btnOk.Click += delegate { Result = color; DialogResult = DialogResult.OK; };
+            footer.Controls.Add(btnOk);
+            AcceptButton = btnOk;
+            CancelButton = btnCancel;
+
+            SetFromRgb(initial, null);
+        }
+
+        private Label AddLabel(string text, Font font, Color c, Rectangle bounds)
+        {
+            Label l = new Label { Text = text, Font = font, ForeColor = c, Bounds = bounds, AutoSize = false, UseMnemonic = false, BackColor = BackColor };
+            Controls.Add(l);
+            return l;
+        }
+
+        private TextBox AddInput(Rectangle bounds, int maxLength, string name)
+        {
+            RoundPanel box = new RoundPanel { Bounds = bounds, Fill = Theme.SurfaceElevated, Stroke = Theme.Border, BackColor = Theme.SurfaceElevated };
+            TextBox t = new TextBox
+            {
+                BorderStyle = BorderStyle.None,
+                Font = Ui.Body,
+                BackColor = Theme.SurfaceElevated,
+                ForeColor = Theme.TextPrimary,
+                MaxLength = maxLength,
+                TextAlign = HorizontalAlignment.Center,
+                AccessibleName = name
+            };
+            t.Bounds = new Rectangle(Ui.S(8), (bounds.Height - t.PreferredHeight) / 2, bounds.Width - Ui.S(16), t.PreferredHeight);
+            t.Enter += delegate { box.Stroke = Theme.Accent; box.Invalidate(); };
+            t.Leave += delegate { box.Stroke = Theme.Border; box.Invalidate(); Sync(null); };
+            box.Controls.Add(t);
+            Controls.Add(box);
+            return t;
+        }
+
+        private TextBox AddChannel(Rectangle bounds, string name)
+        {
+            TextBox t = AddInput(bounds, 3, name);
+            t.KeyPress += delegate(object s, KeyPressEventArgs e)
+            {
+                if (!char.IsDigit(e.KeyChar) && !char.IsControl(e.KeyChar)) e.Handled = true;
+            };
+            t.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode != Keys.Up && e.KeyCode != Keys.Down) return;
+                int v;
+                if (!int.TryParse(t.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out v)) v = 0;
+                v = Math.Max(0, Math.Min(255, v + (e.KeyCode == Keys.Up ? 1 : -1) * (e.Shift ? 10 : 1)));
+                t.Text = v.ToString(CultureInfo.InvariantCulture);
+                t.SelectionStart = t.Text.Length;
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+            };
+            t.TextChanged += delegate
+            {
+                if (suppress) return;
+                int r, g, b;
+                if (TryChannel(txtR, out r) && TryChannel(txtG, out g) && TryChannel(txtB, out b))
+                    SetFromRgb(Color.FromArgb(r, g, b), t);
+            };
+            return t;
+        }
+
+        private static bool TryChannel(TextBox t, out int v)
+        {
+            return int.TryParse(t.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out v) && v >= 0 && v <= 255;
+        }
+
+        // Greys and black carry no hue (or saturation), so the previous ones are kept for the sliders.
+        private void SetFromRgb(Color c, Control source)
+        {
+            float h, s, v;
+            ColorMath.ToHsv(c, out h, out s, out v);
+            if (s > 0 && v > 0) hue = h;
+            if (v > 0) sat = s;
+            val = v;
+            color = c;
+            Sync(source);
+        }
+
+        private void Sync(Control source)
+        {
+            suppress = true;
+            try
+            {
+                plane.Hue = hue; plane.Sat = sat; plane.Val = val; plane.Invalidate();
+                if (source != hueBar) { hueBar.Hue = hue; hueBar.Invalidate(); }
+                compare.NewColor = color;
+                compare.Invalidate();
+                recent.Current = color;
+                recent.Invalidate();
+                if (source != txtHex) SetText(txtHex, ColorMath.Hex(color));
+                if (source != txtR) SetText(txtR, color.R.ToString(CultureInfo.InvariantCulture));
+                if (source != txtG) SetText(txtG, color.G.ToString(CultureInfo.InvariantCulture));
+                if (source != txtB) SetText(txtB, color.B.ToString(CultureInfo.InvariantCulture));
+            }
+            finally { suppress = false; }
+            if (LivePreview != null) LivePreview(color);
+        }
+
+        private static void SetText(TextBox t, string s)
+        {
+            if (t.Text != s) t.Text = s;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            MainForm.ApplyDarkTitleBar(this.Handle);
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            plane.Focus();
         }
     }
 }
