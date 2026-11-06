@@ -13,9 +13,7 @@ It talks directly to the **Redgear A20 RGB Gaming Mouse** (`VID: 0x18F8 & PID: 0
 
 > **Latest version: [v0.4.0](https://github.com/shivamvcx/A20-Driver/releases/latest)** — complete UI redesign, multiple saved profiles, light/dark themes, a new colour picker and a Setup installer ([details](#whats-new-in-v040)).
 
-<p align="center">
-  <img src="assets/control-center-ui.png" alt="Redgear A20 Control Center UI" width="460">
-</p>
+![edgear A20 Control Center UI](https://cdn.hackclub.com/01a1b1a4-d798-720f-a4fd-eed85d236736/Screenshot%202026-11-06%20213407.png)
 
 ## Key Features
 
